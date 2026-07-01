@@ -626,7 +626,61 @@ public static class PrgParser
             string args = rest.Substring(setting.Length).Trim();
             if (setting == "ORDER")
                 return BuildSetOrder(args);
+            if (setting == "RELATION")
+                return BuildSetRelation(args);
+            if (setting == "SKIP")
+                return BuildSetSkip(args);
             return new SetStmt(setting, args);
+        }
+
+        /// <summary><c>SET RELATION [OFF] [TO [eExpr INTO area [, …]] [ADDITIVE]]</c>. The clear forms
+        /// (<c>SET RELATION TO</c> / <c>SET RELATION OFF [INTO area]</c>) yield empty-target /
+        /// <see cref="SetRelationOffStmt"/> nodes; each <c>eExpr INTO area</c> pair becomes a
+        /// <see cref="RelationTarget"/>. Trailing top-level ADDITIVE sets the additive flag.</summary>
+        private static PrgStatement BuildSetRelation(string args)
+        {
+            if (PrgScan.FirstWord(args) == "OFF")
+            {
+                string rest = PrgScan.AfterFirstWord(args);
+                var (_, offSegs) = Carve(rest, "INTO");
+                NameRef? into = offSegs.Count > 0 ? ToNameRef(FirstToken(offSegs[0].Body)) : null;
+                return new SetRelationOffStmt(into);
+            }
+            if (PrgScan.FirstWord(args) == "TO") args = PrgScan.AfterFirstWord(args);
+            args = args.Trim();
+
+            // A trailing top-level ADDITIVE keyword adds to (rather than replaces) the prior relations.
+            bool additive = false;
+            var words = PrgScan.TopWords(args);
+            if (words.Count > 0 && words[^1].Upper == "ADDITIVE")
+            {
+                additive = true;
+                args = args.Substring(0, words[^1].Start).TrimEnd();
+            }
+
+            var targets = new List<RelationTarget>();
+            foreach (var piece in PrgScan.SplitTopCommas(args))
+            {
+                if (piece.Trim().Length == 0) continue;
+                var (key, segs) = Carve(piece, "INTO");
+                if (segs.Count == 0 || key.Trim().Length == 0) continue;   // malformed pair — skip.
+                targets.Add(new RelationTarget(PrgExpr.Parse(key), ToNameRef(FirstToken(segs[0].Body))));
+            }
+            return new SetRelationStmt(targets, additive);
+        }
+
+        /// <summary><c>SET SKIP TO [alias [, …]]</c> — a comma-list of already-related child aliases to
+        /// mark one-to-many; an empty list clears all marks.</summary>
+        private static SetSkipStmt BuildSetSkip(string args)
+        {
+            if (PrgScan.FirstWord(args) == "TO") args = PrgScan.AfterFirstWord(args);
+            var aliases = new List<NameRef>();
+            foreach (var piece in PrgScan.SplitTopCommas(args))
+            {
+                string tok = FirstToken(piece);
+                if (tok.Length > 0) aliases.Add(ToNameRef(tok));
+            }
+            return new SetSkipStmt(aliases);
         }
 
         private static SetOrderStmt BuildSetOrder(string args)

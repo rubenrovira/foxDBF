@@ -208,6 +208,28 @@ public sealed record ReindexStmt(NameRef? In) : PrgStatement;
 /// <see cref="SetOrderStmt"/>.</summary>
 public sealed record SetStmt(string Setting, string Arguments) : PrgStatement;
 
+// ── relations (microVFP P1 gap #2 — SET RELATION / SET SKIP) ──────────────────
+
+/// <summary>One <c>eExpr INTO area</c> pair of a <c>SET RELATION</c> statement: the relation KEY
+/// expression (evaluated in the PARENT area on each parent move) and the child work-area / alias.</summary>
+public sealed record RelationTarget(PrgExpr Key, NameRef Into);
+
+/// <summary><c>SET RELATION TO [eExpr INTO area [, …]] [ADDITIVE]</c> — link the CURRENT (parent) work
+/// area to child area(s); on every parent record move an automatic SEEK repositions each child on its
+/// active order (a miss leaves the child at EOF). An EMPTY <see cref="Targets"/> list is the clear form
+/// (<c>SET RELATION TO</c> with no arguments). <see cref="Additive"/> ADDS to the existing relations
+/// instead of replacing them. microVFP P1 gap #2 — the MULTI-TABLE RELATION model.</summary>
+public sealed record SetRelationStmt(IReadOnlyList<RelationTarget> Targets, bool Additive) : PrgStatement;
+
+/// <summary><c>SET RELATION OFF [INTO area]</c> — remove ONE child relation of the current area
+/// (<see cref="Into"/>), or ALL relations of the current area when <see cref="Into"/> is
+/// <see langword="null"/>. microVFP P1 gap #2.</summary>
+public sealed record SetRelationOffStmt(NameRef? Into) : PrgStatement;
+
+/// <summary><c>SET SKIP TO [alias [, …]]</c> — mark already-related child area(s) of the current area as
+/// one-to-many; an EMPTY <see cref="Aliases"/> list clears all one-to-many marks. microVFP P1 gap #2.</summary>
+public sealed record SetSkipStmt(IReadOnlyList<NameRef> Aliases) : PrgStatement;
+
 public enum OnErrorKind { Clear, Command, Macro }
 
 /// <summary><c>ON ERROR [command]</c>: clear (bare), a command (parsed sub-statement, with its raw

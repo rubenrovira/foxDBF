@@ -105,7 +105,17 @@ public sealed class CdxTag
     /// returns the record number, or <see cref="NotFound"/> (<see langword="null"/>)
     /// when no key shares the prefix. Never throws.
     /// </summary>
-    public uint? Seek(ReadOnlySpan<byte> keyBytes)
+    public uint? Seek(ReadOnlySpan<byte> keyBytes) => Seek(keyBytes, exact: false);
+
+    /// <summary>
+    /// Raw-byte seek. With <paramref name="exact"/> <c>false</c> (the default) this is a PREFIX seek: the
+    /// first key that carries <paramref name="keyBytes"/> as a prefix wins (VFP SET EXACT OFF). With
+    /// <paramref name="exact"/> <c>true</c> it is an EXACT seek matching VFP SET EXACT ON: the key must
+    /// equal the needle padded with trailing BLANKS to the key length — so a short value still matches a
+    /// single-field key (the pad-blanks fill the field width) but a PREFIX of a COMPOSITE key does NOT
+    /// (the following key bytes are non-blank), landing the caller at EOF.
+    /// </summary>
+    public uint? Seek(ReadOnlySpan<byte> keyBytes, bool exact)
     {
         // An empty prefix would match everything → treat as "not found".
         if (keyBytes.Length == 0)
@@ -119,9 +129,9 @@ public sealed class CdxTag
         foreach (var (recno, key) in IndexTraversal.EnumerateCompact(
                      _index, RootPageOffset, KeyLength, IsCharacterKey))
         {
-            int cmp = ComparePrefix(needle, key);
+            int cmp = ComparePrefix(needle, key, exact);
             if (cmp == 0)
-                return recno;     // prefix match → first matching record
+                return recno;     // (prefix) match → first matching record
             if (cmp < 0)
                 break;            // passed where the key would sort: absent
         }
@@ -131,10 +141,12 @@ public sealed class CdxTag
 
     /// <summary>
     /// Unsigned byte comparison of <paramref name="needle"/> against the start of
-    /// <paramref name="key"/>: returns 0 when <paramref name="needle"/> is a prefix
-    /// of <paramref name="key"/>, negative when it sorts before, positive after.
+    /// <paramref name="key"/>: returns 0 when they match, negative when the needle sorts
+    /// before the key, positive after. When <paramref name="exact"/> is false a plain
+    /// prefix is a match; when true, any key bytes beyond the needle must all be BLANKS
+    /// (VFP EXACT-ON blank-padded equality), otherwise the needle sorts by that blank.
     /// </summary>
-    private static int ComparePrefix(byte[] needle, byte[] key)
+    private static int ComparePrefix(byte[] needle, byte[] key, bool exact = false)
     {
         int n = Math.Min(needle.Length, key.Length);
         for (int i = 0; i < n; i++)
@@ -143,8 +155,16 @@ public sealed class CdxTag
             if (diff != 0)
                 return diff;
         }
-        // All compared bytes equal: a prefix iff the needle is no longer than the key.
-        return needle.Length <= key.Length ? 0 : 1;
+        if (needle.Length > key.Length)
+            return 1;             // key is a prefix of needle → needle sorts after.
+        if (!exact)
+            return 0;             // prefix seek: needle ⊑ key is a match.
+        // Exact seek: the needle is blank-padded to the key length, so the trailing key
+        // bytes must all be spaces to be equal; otherwise compare that blank vs the byte.
+        for (int i = needle.Length; i < key.Length; i++)
+            if (key[i] != (byte)' ')
+                return (byte)' ' - key[i];
+        return 0;
     }
 
     /// <summary>
