@@ -1,3 +1,4 @@
+using CrossVault.FoxDbf.Expressions;
 using CrossVault.FoxDbf.Index;
 
 namespace CrossVault.FoxDbf.Write;
@@ -15,7 +16,7 @@ public sealed partial class DbfWriter
     /// <paramref name="definition"/> (plan §D7): compute the KEY for every non-deleted record via
     /// the expression engine, apply the FOR filter, sort, and bulk-load a balanced compact B-tree.
     /// </summary>
-    public void CreateTag(CdxTagDefinition definition)
+    public void CreateTag(CdxTagDefinition definition, EvaluationContext? evalContext = null, bool includeDeleted = false)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(definition);
@@ -23,21 +24,21 @@ public sealed partial class DbfWriter
         var tags = ReadExistingTagDefinitions();
         tags.RemoveAll(t => string.Equals(t.Name, definition.Name, StringComparison.OrdinalIgnoreCase));
         tags.Add(definition);
-        RebuildStructuralCdx(tags);
+        RebuildStructuralCdx(tags, evalContext, includeDeleted);
     }
 
     /// <summary>
     /// REINDEX — rebuild every tag of the structural <c>.cdx</c> from the live table data
     /// (plan §D7). A no-op when the table has no structural index.
     /// </summary>
-    public void Reindex()
+    public void Reindex(EvaluationContext? evalContext = null, bool includeDeleted = false)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         var tags = ReadExistingTagDefinitions();
         if (tags.Count == 0)
             return;
-        RebuildStructuralCdx(tags);
+        RebuildStructuralCdx(tags, evalContext, includeDeleted);
     }
 
     /// <summary>The structural <c>.cdx</c> path beside the table (same stem, <c>.cdx</c> extension).</summary>
@@ -133,11 +134,11 @@ public sealed partial class DbfWriter
     }
 
     /// <summary>Bulk-build the structural <c>.cdx</c> for <paramref name="tags"/> over the live table.</summary>
-    private void RebuildStructuralCdx(IReadOnlyList<CdxTagDefinition> tags)
+    private void RebuildStructuralCdx(IReadOnlyList<CdxTagDefinition> tags, EvaluationContext? evalContext = null, bool includeDeleted = false)
     {
         Flush();
         var rows = MaterializeRows();
-        CdxIndexBuilder.Build(StructuralCdxPath(), _schema, rows, tags);
+        CdxIndexBuilder.Build(StructuralCdxPath(), _schema, rows, tags, evalContext, includeDeleted);
 
         // The sidecar VFP just wrote is a STRUCTURAL compound .cdx (options 0xE0). Advertise it in the
         // DBF header (byte 28 bit 0) so a real VFP runtime auto-opens it on USE, and flip the writer's

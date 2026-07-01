@@ -19,17 +19,21 @@ the rest of this project (byte-compatible reads/writes, the same Rushmore-optimi
   vs. by-reference (`DO ... WITH`) parameter passing.
 - **Procedures/functions**: `PROCEDURE`/`FUNCTION` definitions, `DO proc [WITH args]` and
   `=func(args)` call forms, loading stored procedures straight from a `.dbc`.
-- **Data access**: `USE`/`SELECT` work areas, `SEEK`/`LOCATE`/`GO`/`SKIP`, `REPLACE`/`DELETE`/
-  `RECALL`/`INSERT`, `BEGIN`/`END TRANSACTION`/`ROLLBACK` (copy-on-write), `RLOCK`/`FLOCK`
-  (byte-range-compatible with real VFP9).
+- **Data access**: `USE`/`SELECT` work areas, `SEEK`/`GO`/`SKIP`, `REPLACE`/`DELETE`/
+  `RECALL`/`INSERT`, `BEGIN`/`END TRANSACTION`/`ROLLBACK` (copy-on-write), `INDEX ON … TAG`
+  (structural `.cdx`).
 - **Error handling**: `ON ERROR`, `AERROR()` (full result-array contract), `MESSAGE()`/`ERROR()`/`LINENO()`.
-- Runtime state functions: `RECNO()`, `RECCOUNT()`, `ALIAS()`, `SELECT()`, `EOF()`/`BOF()`,
-  `TYPE()`, `EVALUATE()`, and more — see the source for the full dispatch list, it grows with real
-  `.prg` corpora exercised against it.
+- ~90 runtime functions: string/date/math built-ins plus session-aware state functions
+  (`RECNO()`, `RECCOUNT()`, `ALIAS()`, `SELECT()`, `EOF()`/`BOF()`, `TYPE()`, `EVALUATE()`, …).
 
-Referential-integrity trigger execution and the full VFP9 command surface (arrays, low-level file
-I/O, indexing commands, relations, …) are being built out incrementally — this targets running
-real-world VFP9 business-logic stored procedures correctly, not 100% language coverage on day one.
+See **[the full function reference and VFP deviations](https://github.com/crossvault/foxDBF/blob/main/docs/04-microvfp-runtime.md)**
+in `docs/04-microvfp-runtime.md` — notably, `LOCATE`/`CONTINUE` currently parse but don't move the
+record pointer (use `SCAN`/`ENDSCAN` instead), and locking (`RLOCK()`/`FLOCK()`) is modelled for a
+single-session interpreter rather than contested.
+
+Referential-integrity trigger execution and the rest of the VFP9 command surface (low-level file
+I/O, `SET RELATION`, …) are being built out incrementally — this targets running real-world VFP9
+business-logic stored procedures correctly, not 100% language coverage on day one.
 
 ## Quick start
 

@@ -469,6 +469,8 @@ public sealed class VfpInterpreter
             case GoStmt go: ExecGo(go); break;
             case SkipStmt sp: ExecSkip(sp); break;
             case SetOrderStmt so: ExecSetOrder(so); break;
+            case IndexStmt ix: ExecIndex(ix); break;
+            case ReindexStmt rix: ExecReindex(rix); break;
             case SetStmt set: ExecSet(set); break;
             case OnErrorStmt oe: ExecOnError(oe); break;
             case ReplaceStmt rp: ExecReplace(rp); break;
@@ -787,7 +789,427 @@ public sealed class VfpInterpreter
         int area = so.In is not null ? ResolveAreaRef(so.In) : Session.CurrentArea;
         if (area <= 0) return;
         var m = Meta(area);
-        m.Order = so.Order is null ? null : NameOf(so.Order);
+        string? name = so.Order is null ? null : NameOf(so.Order).Trim();
+        m.Order = ResolveOrderName(area, name);
+        // Changing the controlling order turns off any active SET KEY range (hackfox s4g704) and
+        // re-bases the cached index sequence so a following GO TOP / SKIP walks the NEW order.
+        m.KeySet = false; m.KeyRange = false; m.KeyLow = null; m.KeyHigh = null; m.KeyVisible = null;
+        m.Ordered = null; m.OrderedFor = null; m.OrderPos = -1;
+        // Per-call ASCENDING|DESCENDING override (task scope): the explicit clause selects the ABSOLUTE
+        // traversal direction for this order, overriding the tag's own stored Descending. We track it as
+        // an OrderReversed flag = (explicit direction) XOR (tag's stored direction); ActiveOrder reverses
+        // the cached recno sequence when set, so GO TOP/BOTTOM/SKIP all follow the requested direction.
+        // (NB: hackfox s4g093 per-tag direction PERSISTENCE across a later clause-less SET ORDER is a
+        // separate, out-of-scope refinement — here the override lasts until the next SET ORDER.)
+        if (so.Direction is bool wantDescending)
+        {
+            bool tagDescending = MasterTag(area)?.Descending ?? false;
+            m.OrderReversed = wantDescending != tagDescending;
+        }
+        else
+        {
+            m.OrderReversed = false;
+        }
+    }
+
+    /// <summary>Resolve a SET ORDER operand to a tag NAME (case-insensitively matched at use):
+    /// a blank / <c>"0"</c> ⇒ natural (record) order (<see langword="null"/>); a positive number ⇒ the
+    /// n-th tag (1-based) of the area's structural <c>.cdx</c>; otherwise the named tag. An UNKNOWN tag
+    /// name or an OUT-OF-RANGE index number raises a catchable error (VFP 1683 "Tag … not found" /
+    /// index-number-out-of-range) instead of silently degrading to natural order.</summary>
+    private string? ResolveOrderName(int area, string? name)
+    {
+        if (string.IsNullOrEmpty(name)) return null;
+        var names = Session.AreaAt(area)?.Cdx?.TagNames;
+        if (int.TryParse(name, out int n))
+        {
+            if (n <= 0) return null;   // SET ORDER TO 0 ⇒ natural/record order.
+            if (names is not null && n <= names.Count) return names[n - 1];
+            throw new MicroVfpRuntimeException(
+                $"SET ORDER TO {n}: index number is out of range (the work area has " +
+                $"{(names?.Count ?? 0)} tag(s)).");
+        }
+        if (names is not null)
+            foreach (var tagName in names)
+                if (string.Equals(tagName, name, StringComparison.OrdinalIgnoreCase))
+                    return tagName;
+        throw new MicroVfpRuntimeException($"SET ORDER TO {name}: tag not found in the current work area.");
+    }
+
+    // ─────────────────────────── INDEX / REINDEX (microVFP P1 gap #1) ───────────────────────────
+    //
+    // INDEX ON eKey TAG cTag [FOR lExpr] [ASCENDING|DESCENDING] [UNIQUE|CANDIDATE] [ADDITIVE] builds (or
+    // replaces) a tag in the STRUCTURAL .cdx via the byte-exact CDX builder (DbfWriter.CreateTag), then
+    // makes it the controlling order. TO <idx> (standalone) and TAG … OF <cdx> (non-structural) are
+    // explicit, catchable refusals — there is no .idx writer / multi-CDX-per-area model yet. CANDIDATE
+    // builds the tag then verifies key-uniqueness, rolling the files back + raising on a duplicate.
+    //
+    // Deleted records: the build honours the LIVE SET DELETED — SET DELETED ON (the microVFP default)
+    // excludes deleted rows; SET DELETED OFF indexes them too (VFP keeps their CDX entries until PACK).
+    // The live SET EXACT / SET ANSI ride along into the KEY/FOR expression evaluation (via _ctx) so a
+    // character `=` in a FOR/KEY filters exactly as a VFP run would. A FOR clause is honoured by the
+    // builder. SET FILTER is not modelled in microVFP, so it cannot narrow the build set — FLAG if a
+    // corpus case ever needs it.
+    private void ExecIndex(IndexStmt ix)
+    {
+        int area = Session.CurrentArea;
+        var wa = Session.AreaAt(area);
+        if (wa is null)
+            throw new MicroVfpRuntimeException("INDEX ON: no table is open in the current work area.");
+
+        // Unsupported forms → an explicit, catchable refusal (never a silent no-op).
+        if (ix.ToIdx is not null || ix.Tag is null)
+            throw new MicroVfpRuntimeException(
+                "INDEX ON … TO <idx>: standalone .idx indexes are not supported — use INDEX ON … TAG <name> " +
+                "(into the structural .cdx).");
+        if (ix.OfCdx is not null)
+            throw new MicroVfpRuntimeException(
+                "INDEX ON … TAG … OF <cdx>: non-structural .cdx files are not supported — only the structural .cdx.");
+
+        // VFP UPPERCASES the tag name in the .cdx directory (verified byte-for-byte vs VFP9); the KEY /
+        // FOR expression case is PRESERVED as typed (matches the reverse-engineered DBC .dcx).
+        string tagName = NameOf(ix.Tag).Trim().ToUpperInvariant();
+        if (tagName.Length == 0)
+            throw new MicroVfpRuntimeException("INDEX ON: a TAG name is required.");
+        if (wa.Table.SourcePath is not string path)
+            throw new MicroVfpRuntimeException("INDEX ON: the current table has no file on disk.");
+
+        string keyExpr = ix.Key.Text.Trim();
+        string? forExpr = ix.For?.Text is { } f && f.Trim().Length > 0 ? f.Trim() : null;
+        bool candidate = ix.Candidate;
+        // UNIQUE clause OR the SET UNIQUE session default (candidate is a distinct constraint, not UNIQUE).
+        bool unique = ix.Unique || (Runtime.Unique && !candidate);
+        string collation = _ctx.Collation?.Name ?? "MACHINE";
+        var def = new CdxTagDefinition(tagName, keyExpr, forExpr, ix.Descending, collation, unique);
+
+        // CANDIDATE: capture the pre-image so a uniqueness violation rolls the .cdx/.dbf back (VFP does not
+        // create the tag on a duplicate).
+        FileSnapshot? pre = candidate ? CaptureSnapshot(path) : null;
+
+        BuildTagOnDisk(path, w => w.CreateTag(def, _ctx, includeDeleted: !_ctx.Deleted));
+
+        if (candidate)
+        {
+            var built = Session.AreaAt(area)?.Cdx;
+            var tag = built?.Tag(tagName) ?? built?.Tag(tagName.ToUpperInvariant());
+            if (tag is not null && HasDuplicateKeys(tag))
+            {
+                RollbackFiles(pre!, path);
+                throw new MicroVfpRuntimeException(
+                    $"INDEX ON … TAG {tagName} CANDIDATE: uniqueness violated — a duplicate key value exists.");
+            }
+        }
+
+        // The new tag becomes the controlling order (VFP behaviour) and the pointer goes to its top.
+        var m = Meta(area);
+        m.Order = tagName;
+        m.OrderReversed = false;   // a fresh INDEX ON resets any prior SET ORDER … DESCENDING override.
+        m.Ordered = null; m.OrderedFor = null; m.OrderPos = -1;
+        m.KeySet = false; m.KeyRange = false; m.KeyLow = null; m.KeyHigh = null; m.KeyVisible = null;
+        GoTop(area);
+    }
+
+    private void ExecReindex(ReindexStmt rix)
+    {
+        int area = rix.In is not null ? ResolveAreaRef(rix.In) : Session.CurrentArea;
+        var wa = Session.AreaAt(area);
+        if (wa?.Table.SourcePath is not string path)
+            return;   // no open table / no file — REINDEX is a no-op (nothing to rebuild).
+        BuildTagOnDisk(path, w => w.Reindex(_ctx, includeDeleted: !_ctx.Deleted));
+        var m = Meta(area);
+        m.Ordered = null; m.OrderedFor = null; m.OrderPos = -1; m.KeyVisible = null;
+    }
+
+    /// <summary>Run an index-mutating writer action against <paramref name="path"/>: release every work
+    /// area riding the file (so the exclusive writer + the .cdx rewrite never hit a sharing conflict),
+    /// perform <paramref name="action"/>, re-open the areas in place, and drop their record/order caches.</summary>
+    private void BuildTagOnDisk(string path, Action<DbfWriter> action)
+    {
+        string full = Path.GetFullPath(path);
+        var reopen = Session.CloseAreasForPath(full);
+        try
+        {
+            using var writer = DbfWriter.Open(path, new DbfOptions { LockMode = LockMode.Exclusive });
+            action(writer);
+        }
+        finally
+        {
+            Session.ReopenAreas(reopen);
+        }
+        ResetMetaCachesForPath(path);
+    }
+
+    /// <summary>Drop the cached record / index-order / key-range state of every open area riding
+    /// <paramref name="path"/> (after its files were rewritten out-of-band by an INDEX/REINDEX).</summary>
+    private void ResetMetaCachesForPath(string path)
+    {
+        foreach (var w in Session.OpenAreas)
+            if (SamePath(w.Table.SourcePath, path) && _meta.TryGetValue(w.Area, out var mm))
+            {
+                mm.Cached = null; mm.Ordered = null; mm.OrderedFor = null; mm.OrderPos = -1; mm.KeyVisible = null;
+            }
+    }
+
+    /// <summary>True when <paramref name="tag"/> has two entries with identical key bytes — a CANDIDATE
+    /// violation. The tag stores entries in key order, so any duplicate keys are adjacent.</summary>
+    private static bool HasDuplicateKeys(CdxTag tag)
+    {
+        byte[]? prev = null;
+        foreach (var e in tag.EnumerateEntries())
+        {
+            if (prev is not null && prev.AsSpan().SequenceEqual(e.Key))
+                return true;
+            prev = e.Key;
+        }
+        return false;
+    }
+
+    /// <summary>Roll a table's <c>.dbf</c>/<c>.cdx</c> back to <paramref name="pre"/> (used when a CANDIDATE
+    /// INDEX must not persist): close the areas, restore/delete the sidecars, then re-open. When the
+    /// pre-image had NO <c>.cdx</c> the freshly written one is DELETED (not left orphaned on disk).</summary>
+    private void RollbackFiles(FileSnapshot pre, string path)
+    {
+        var reopen = Session.CloseAreasForPath(Path.GetFullPath(path));
+        try
+        {
+            try { if (pre.Dbf is not null) File.WriteAllBytes(pre.Path, pre.Dbf); } catch { }
+            string cdx = Path.ChangeExtension(pre.Path, ".cdx");
+            if (pre.Cdx is not null) { try { File.WriteAllBytes(cdx, pre.Cdx); } catch { } }
+            else { try { if (File.Exists(cdx)) File.Delete(cdx); } catch { } }
+        }
+        finally
+        {
+            Session.ReopenAreas(reopen);
+        }
+        ResetMetaCachesForPath(path);
+    }
+
+    // ─────────────────────────── SET COLLATE / SET KEY (microVFP P1 gap #1) ───────────────────────────
+
+    /// <summary>SET COLLATE TO cSeq — set the session collation baked into the next INDEX tag. Only
+    /// MACHINE + GENERAL are supported; any other sequence is a catchable error (never a silent fallback).
+    /// <c>SET COLLATE TO</c> (no arg) resets to MACHINE. Read back by <c>SET("COLLATE")</c>.</summary>
+    private void SetCollate(string arg)
+    {
+        string rest = arg;
+        if (PrgScan.FirstWord(rest).Equals("TO", StringComparison.OrdinalIgnoreCase))
+            rest = PrgScan.AfterFirstWord(rest);
+        string seq = rest.Trim().Trim('"', '\'').Trim();
+        if (seq.Length == 0) { _ctx.Collation = VfpCollations.Machine; return; }
+        _ctx.Collation = seq.ToUpperInvariant() switch
+        {
+            "MACHINE" => VfpCollations.Machine,
+            "GENERAL" => VfpCollations.General,
+            _ => throw new MicroVfpRuntimeException(
+                $"SET COLLATE TO {seq}: collating sequence not supported (only MACHINE and GENERAL)."),
+        };
+    }
+
+    /// <summary>SET KEY TO [eLow [, eHigh]] | RANGE eLow, eHigh — limit the current work area's visible
+    /// records to those whose MASTER-index key equals eLow (single) or lies in [eLow, eHigh] (range).
+    /// Requires a controlling index. <c>SET KEY TO</c> (no arg) clears the range.</summary>
+    private void SetKey(string arg)
+    {
+        string rest = arg;
+        if (PrgScan.FirstWord(rest).Equals("TO", StringComparison.OrdinalIgnoreCase))
+            rest = PrgScan.AfterFirstWord(rest);
+        rest = rest.Trim();
+
+        // Optional trailing IN <area> clause selects a different work area than the current one.
+        int area = Session.CurrentArea;
+        int inPos = PrgScan.IndexOfKeyword(rest, "IN");
+        if (inPos >= 0)
+        {
+            string areaTok = PrgScan.AfterFirstWord(rest.Substring(inPos)).Trim();
+            rest = rest.Substring(0, inPos).Trim();
+            int resolved = int.TryParse(areaTok, out var n) ? n : (Session.FindAreaByAlias(areaTok)?.Area ?? 0);
+            if (resolved > 0) area = resolved;
+        }
+        var m = Meta(area);
+
+        if (rest.Length == 0)   // SET KEY TO → clear.
+        {
+            m.KeySet = false; m.KeyRange = false; m.KeyLow = null; m.KeyHigh = null; m.KeyVisible = null;
+            return;
+        }
+
+        if (MasterTag(area) is not { } master)
+            throw new MicroVfpRuntimeException(
+                "SET KEY TO: no controlling index is active in the current work area (SET ORDER first).");
+
+        // A NON-character key whose logical type cannot be resolved (a composite expression that isn't a
+        // bare numeric/date field) cannot be decoded into a comparable value, so a range over it would
+        // silently mismatch. Refuse LOUDLY rather than produce a wrong (empty / full) visible set.
+        // Character keys are always handled byte-wise (below) — including UPPER(name)-style expressions
+        // and GENERAL-collated weights — so they never hit this guard.
+        if (!master.IsCharacterKey && master.KeyType == IndexKeyType.Unknown)
+            throw new MicroVfpRuntimeException(
+                "SET KEY TO: the controlling index key type cannot be decoded for a range restriction.");
+
+        bool rangeKw = PrgScan.FirstWord(rest).Equals("RANGE", StringComparison.OrdinalIgnoreCase);
+        if (rangeKw) rest = PrgScan.AfterFirstWord(rest).Trim();
+        var parts = PrgScan.SplitTopCommas(rest).ToList();
+
+        if (rangeKw || parts.Count > 1)
+        {
+            string lo = parts.Count > 0 ? parts[0].Trim() : string.Empty;
+            string hi = parts.Count > 1 ? parts[1].Trim() : string.Empty;
+            m.KeyRange = true;
+            m.KeyLow = lo.Length > 0 ? EvalText(lo) : null;
+            m.KeyHigh = hi.Length > 0 ? EvalText(hi) : null;
+        }
+        else
+        {
+            m.KeyRange = false;
+            m.KeyLow = EvalText(rest);
+            m.KeyHigh = null;
+        }
+        m.KeySet = true;
+        m.KeyVisible = null;   // rebuilt lazily by Visible().
+    }
+
+    /// <summary>The controlling (master) tag of <paramref name="area"/>, or null when none is active.</summary>
+    private CdxTag? MasterTag(int area)
+    {
+        var wa = Session.AreaAt(area);
+        var m = Meta(area);
+        if (wa?.Cdx is null || string.IsNullOrEmpty(m.Order)) return null;
+        return wa.Cdx.Tag(m.Order!) ?? wa.Cdx.Tag(m.Order!.ToUpperInvariant());
+    }
+
+    /// <summary>Build the set of recnos whose master-index key falls in the area's active SET KEY range.
+    /// A missing tag ⇒ no restriction (every record). CHARACTER keys are compared on the SAME collated key
+    /// bytes the tag STORES (so MACHINE, GENERAL weights and UPPER()-style expression keys all compare
+    /// correctly instead of against decoded weight-garbage); other keys decode to a value and compare by
+    /// value order.</summary>
+    private HashSet<int> BuildKeyVisible(VfpSession.WorkArea wa, AreaMeta m)
+    {
+        var set = new HashSet<int>();
+        var tag = MasterTag(wa.Area);
+        if (tag is null)
+        {
+            for (int r = 1; r <= wa.Table.RecordCount; r++) set.Add(r);
+            return set;
+        }
+
+        if (tag.IsCharacterKey)
+        {
+            var coll = VfpCollations.FromSortSequence(tag.Collation);
+            // Encode each bound the SAME way the tag stores keys: collated weights padded (0x20) to the
+            // tag key length. Comparing bytes then mirrors the on-disk sort order exactly (this is what
+            // SEEK does), so a GENERAL tag's weight keys and a MACHINE tag's raw bytes both match.
+            byte[]? loBytes = m.KeyLow is { } lo ? CollatedBoundKey(coll, lo, tag.KeyLength) : null;
+            byte[]? hiBytes = m.KeyRange && m.KeyHigh is { } hi ? CollatedBoundKey(coll, hi, tag.KeyLength) : null;
+            byte[]? loNatural = !m.KeyRange && m.KeyLow is { } lo1 ? coll.GetCollatedKey((lo1.AsString ?? string.Empty).AsSpan()) : null;
+            foreach (var e in tag.EnumerateEntries())
+            {
+                if (CharKeyInRange(m, e.Key, loBytes, hiBytes, loNatural))
+                    set.Add((int)e.RecordNumber);
+            }
+            return set;
+        }
+
+        foreach (var e in tag.EnumerateEntries())
+        {
+            var key = tag.DecodeKey(e.Key);
+            if (KeyInRange(m, key)) set.Add((int)e.RecordNumber);
+        }
+        return set;
+    }
+
+    /// <summary>The stored-key bytes for a SET KEY bound over a CHARACTER tag: the bound's collated
+    /// weights, right-padded with spaces (0x20) to (or truncated at) the tag key length — byte-identical
+    /// to how the CDX builder laid the tag's own keys down.</summary>
+    private static byte[] CollatedBoundKey(IVfpCollation coll, VfpValue bound, int keyLen)
+    {
+        var natural = coll.GetCollatedKey((bound.AsString ?? string.Empty).AsSpan());
+        var key = new byte[keyLen];
+        Array.Fill(key, (byte)0x20);
+        int copy = Math.Min(natural.Length, keyLen);
+        natural.AsSpan(0, copy).CopyTo(key);
+        return key;
+    }
+
+    /// <summary>Whether one stored CHARACTER key falls in the active SET KEY range, compared on collated
+    /// key bytes. Single-value: SET EXACT ON ⇒ full byte-equality against the padded bound; SET EXACT OFF ⇒
+    /// the (unpadded) bound weights are a byte PREFIX of the stored key (SEEK semantics).</summary>
+    private bool CharKeyInRange(AreaMeta m, byte[] storedKey, byte[]? loBytes, byte[]? hiBytes, byte[]? loNatural)
+    {
+        if (!m.KeyRange)
+        {
+            if (loBytes is null) return false;   // no bound value ⇒ nothing matches (never fail-open).
+            return _ctx.Exact
+                ? CompareBytesUnsigned(storedKey, loBytes) == 0
+                : IsBytePrefix(loNatural ?? Array.Empty<byte>(), storedKey);
+        }
+        if (loBytes is not null && CompareBytesUnsigned(storedKey, loBytes) < 0) return false;
+        if (hiBytes is not null && CompareBytesUnsigned(storedKey, hiBytes) > 0) return false;
+        return true;
+    }
+
+    /// <summary>Unsigned, shorter-sorts-first byte comparison (the CDX key sort order).</summary>
+    private static int CompareBytesUnsigned(byte[] a, byte[] b)
+    {
+        int n = Math.Min(a.Length, b.Length);
+        for (int i = 0; i < n; i++)
+        {
+            int d = a[i] - b[i];
+            if (d != 0) return d < 0 ? -1 : 1;
+        }
+        return a.Length.CompareTo(b.Length);
+    }
+
+    /// <summary>True when <paramref name="needle"/> is an unsigned byte prefix of <paramref name="key"/>.</summary>
+    private static bool IsBytePrefix(byte[] needle, byte[] key)
+    {
+        if (needle.Length > key.Length) return false;
+        for (int i = 0; i < needle.Length; i++)
+            if (needle[i] != key[i]) return false;
+        return true;
+    }
+
+    private bool KeyInRange(AreaMeta m, IndexKey key)
+    {
+        // An undecodable key (Value null / KeyType Unknown) must fail CLOSED — never admit every record.
+        if (key.Value is null) return false;
+        if (!m.KeyRange)
+            return m.KeyLow is { } single && KeyMatchesSingle(key, single);
+        if (m.KeyLow is { } lo && CompareKeyToBound(key, lo) < 0) return false;
+        if (m.KeyHigh is { } hi && CompareKeyToBound(key, hi) > 0) return false;
+        return true;
+    }
+
+    private bool KeyMatchesSingle(IndexKey key, VfpValue bound)
+        // Non-character keys only (character keys are compared byte-wise in CharKeyInRange); a numeric /
+        // date single-value SET KEY is exact value equality.
+        => key.Value is not null && CompareKeyToBound(key, bound) == 0;
+
+    /// <summary>Three-way compare a decoded (non-character) index key against a SET KEY bound value in
+    /// numeric/date value order. Undecodable/mismatched types compare equal.</summary>
+    private int CompareKeyToBound(IndexKey key, VfpValue bound)
+    {
+        object? kv = key.Value;
+        switch (kv)
+        {
+            case string ks:
+                return _ctx.Collation.Compare(ks, bound.AsString ?? string.Empty);
+            case int or long or double or decimal:
+                return Convert.ToDouble(kv, CultureInfo.InvariantCulture).CompareTo((double)bound.AsNumber);
+            case DateOnly kdo:
+            {
+                var b = bound.ToClr();
+                DateOnly? bo = b as DateOnly? ?? (b is DateTime bt ? DateOnly.FromDateTime(bt) : null);
+                return bo is { } bb ? kdo.CompareTo(bb) : 0;
+            }
+            case DateTime kdt:
+            {
+                var b = bound.ToClr();
+                DateTime? bo = b as DateTime? ?? (b is DateOnly bd ? bd.ToDateTime(TimeOnly.MinValue) : null);
+                return bo is { } bb ? kdt.CompareTo(bb) : 0;
+            }
+            default:
+                return 0;
+        }
     }
 
     private void ExecSet(SetStmt set)
@@ -799,6 +1221,9 @@ public sealed class VfpInterpreter
             case "DELETED": _ctx.Deleted = OnOff(arg); break;
             case "EXACT": _ctx.Exact = OnOff(arg); break;
             case "ANSI": _ctx.Ansi = OnOff(arg); break;
+            case "COLLATE": SetCollate(arg); break;             // baked into the next INDEX tag; SET("COLLATE").
+            case "UNIQUE": Runtime.Unique = OnOff(arg); break;  // session default for a clause-less INDEX; SET("UNIQUE").
+            case "KEY": SetKey(arg); break;                     // master-index visible key range; feeds Visible().
             default: break; // TALK / COMPATIBLE / DATA / PROCEDURE / … — irrelevant to results.
         }
     }
@@ -1145,7 +1570,15 @@ public sealed class VfpInterpreter
         public List<int>? Ordered;  // recnos in the active index order (null ⇒ physical order).
         public string? OrderedFor;  // the tag name the Ordered cache was built for.
         public int OrderPos = -1;   // current position within Ordered (when index-ordered).
+        public bool OrderReversed;  // SET ORDER … DESCENDING|ASCENDING override: traverse the tag reversed.
         public Dictionary<string, object?>? OldVals; // OLDVAL() per field (pre-change buffer values).
+
+        // ── SET KEY (master-index key-range scope; microVFP P1 gap #1) ──
+        public bool KeySet;             // a SET KEY range is active on this area's master index.
+        public bool KeyRange;           // true ⇒ [KeyLow, KeyHigh] range; false ⇒ single-value match.
+        public VfpValue? KeyLow;        // the single value / range low bound (null ⇒ open low).
+        public VfpValue? KeyHigh;       // the range high bound (null ⇒ open high / single-value mode).
+        public HashSet<int>? KeyVisible; // cached recnos within the key range (null ⇒ rebuild lazily).
     }
 
     private AreaMeta Meta(int area)
@@ -1158,7 +1591,21 @@ public sealed class VfpInterpreter
     }
 
     private bool Visible(VfpSession.WorkArea wa, int rec)
-        => !_ctx.Deleted || !wa.Table.IsRecordDeleted(rec - 1);
+    {
+        if (_ctx.Deleted && wa.Table.IsRecordDeleted(rec - 1))
+            return false;
+        // SET KEY: only records whose MASTER-index key falls in the active key range are visible.
+        // The visible set is derived from the controlling tag's entries once, then cached (invalidated
+        // on a data change / order change / SET KEY change). Use TryGetValue — never Meta() — to avoid
+        // re-entering GoTop while a navigation loop is already inside Visible().
+        if (_meta.TryGetValue(wa.Area, out var m) && m.KeySet)
+        {
+            m.KeyVisible ??= BuildKeyVisible(wa, m);
+            if (!m.KeyVisible.Contains(rec))
+                return false;
+        }
+        return true;
+    }
 
     /// <summary>Resolve the active index tag for <paramref name="area"/> (from <see cref="AreaMeta.Order"/>),
     /// building/refreshing the cached recno sequence in index order; null ⇒ navigate physically.</summary>
@@ -1171,7 +1618,10 @@ public sealed class VfpInterpreter
         if (tag is null) return null;
         if (m.Ordered is null || m.OrderedFor != tag.Name)
         {
-            m.Ordered = tag.EnumerateEntries().Select(e => (int)e.RecordNumber).ToList();
+            var ordered = tag.EnumerateEntries().Select(e => (int)e.RecordNumber).ToList();
+            // A SET ORDER … DESCENDING|ASCENDING override reverses the tag's own traversal direction.
+            if (m.OrderReversed) ordered.Reverse();
+            m.Ordered = ordered;
             m.OrderedFor = tag.Name;
             m.OrderPos = -1;
         }
@@ -1508,6 +1958,8 @@ public sealed class VfpInterpreter
             "EXACT" => VfpValue.Character(_ctx.Exact ? "ON" : "OFF"),
             "DELETED" => VfpValue.Character(_ctx.Deleted ? "ON" : "OFF"),
             "ANSI" => VfpValue.Character(_ctx.Ansi ? "ON" : "OFF"),
+            "COLLATE" => VfpValue.Character(_ctx.Collation?.Name ?? "MACHINE"),
+            "UNIQUE" => VfpValue.Character(Runtime.Unique ? "ON" : "OFF"),
             "TALK" => VfpValue.Character("OFF"),
             "COMPATIBLE" => VfpValue.Character("OFF"),
             _ => VfpValue.Character(string.Empty),

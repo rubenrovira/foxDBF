@@ -176,7 +176,32 @@ public sealed record ContinueStmt : PrgStatement;
 public sealed record GoStmt(string? Keyword, PrgExpr? Record, NameRef? In) : PrgStatement;
 
 public sealed record SkipStmt(PrgExpr? Count, NameRef? In) : PrgStatement;
-public sealed record SetOrderStmt(NameRef? Order, NameRef? In, bool Descending) : PrgStatement;
+/// <summary><c>SET ORDER TO [n | cTag [OF cCdx]] [IN area] [ASCENDING|DESCENDING]</c>. A per-call
+/// <see cref="Direction"/> override (VFP: the explicit clause wins for this order): <see langword="null"/> =
+/// no clause (traverse in the tag's own stored direction), <see langword="true"/> = DESCENDING,
+/// <see langword="false"/> = ASCENDING. microVFP P1 gap #1 — INDEX/ORDER WRITE model.</summary>
+public sealed record SetOrderStmt(NameRef? Order, NameRef? In, bool? Direction) : PrgStatement;
+
+/// <summary><c>INDEX ON eKey [TAG cTag [OF cCdx] | TO cIdx] [FOR lExpr] [ASCENDING|DESCENDING]
+/// [UNIQUE|CANDIDATE] [ADDITIVE] [COMPACT]</c> — build/replace an index. <see cref="Tag"/> targets a
+/// CDX tag (structural when <see cref="OfCdx"/> is null); <see cref="ToIdx"/> targets a standalone
+/// <c>.idx</c> (unsupported — the interpreter throws). <see cref="Candidate"/> is CANDIDATE (a
+/// duplicate-key is an error), <see cref="Unique"/> is UNIQUE (keep first per key).
+/// microVFP P1 gap #1 — INDEX/ORDER WRITE model.</summary>
+public sealed record IndexStmt(
+    PrgExpr Key,
+    NameRef? Tag,
+    NameRef? OfCdx,
+    NameRef? ToIdx,
+    PrgExpr? For,
+    bool Descending,
+    bool Unique,
+    bool Candidate,
+    bool Additive) : PrgStatement;
+
+/// <summary><c>REINDEX [IN area]</c> — rebuild every open tag of a work area from live data.
+/// microVFP P1 gap #1 — INDEX/ORDER WRITE model.</summary>
+public sealed record ReindexStmt(NameRef? In) : PrgStatement;
 
 /// <summary>Generic <c>SET &lt;setting&gt; …</c>. <see cref="Arguments"/> is the raw remainder
 /// (<c>ON</c>/<c>OFF</c>/<c>TO …</c>). SET ORDER is modelled separately as

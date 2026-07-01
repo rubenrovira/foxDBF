@@ -41,8 +41,17 @@ internal static class CdxIndexBuilder
     /// definition in <paramref name="tags"/> over <paramref name="rows"/> (the live,
     /// non-deleted-aware record set of <paramref name="schema"/>). Overwrites any existing
     /// file at the path.
+    /// <para>
+    /// <paramref name="evalContext"/> supplies the AMBIENT expression settings (SET EXACT / SET ANSI /
+    /// culture / code page) the KEY and FOR expressions are compiled+evaluated with; the per-tag
+    /// <see cref="CdxTagDefinition.Collation"/> always overrides the context's collation. Passing
+    /// <see langword="null"/> keeps the VFP-neutral defaults (EXACT OFF) so an existing byte-exact golden
+    /// stays identical. <paramref name="includeDeleted"/> mirrors SET DELETED OFF — when <see langword="true"/>
+    /// deleted rows are indexed too (VFP keeps their entries in the CDX until PACK); the default excludes them.
+    /// </para>
     /// </summary>
-    public static void Build(string cdxPath, DbfTable schema, IReadOnlyList<BuildRow> rows, IReadOnlyList<CdxTagDefinition> tags)
+    public static void Build(string cdxPath, DbfTable schema, IReadOnlyList<BuildRow> rows, IReadOnlyList<CdxTagDefinition> tags,
+        EvaluationContext? evalContext = null, bool includeDeleted = false)
     {
         var sink = new PageSink();
         sink.Reserve();           // page 0: file header (filled last)
@@ -51,7 +60,7 @@ internal static class CdxIndexBuilder
         // Plan every per-tag tree up front (keys, geometry, header metadata, page footprint).
         var plans = new List<TagPlan>(tags.Count);
         foreach (var def in tags)
-            plans.Add(PlanTag(schema, rows, def));
+            plans.Add(PlanTag(schema, rows, def, evalContext, includeDeleted));
 
         // VFP places the tag-DIRECTORY root EARLY — on page 2 (offset 1024), BEFORE the per-tag
         // trees — so the real VFP9 runtime can open a .dbc that uses this .dcx (error 1552 otherwise).
@@ -133,10 +142,21 @@ internal static class CdxIndexBuilder
         public string ForExpr = string.Empty;
     }
 
-    private static TagPlan PlanTag(DbfTable schema, IReadOnlyList<BuildRow> rows, CdxTagDefinition def)
+    private static TagPlan PlanTag(DbfTable schema, IReadOnlyList<BuildRow> rows, CdxTagDefinition def,
+        EvaluationContext? evalContext, bool includeDeleted)
     {
         var collation = VfpCollations.ByName(def.Collation);
-        var ctx = new EvaluationContext { Collation = collation };
+        // The per-tag collation ALWAYS wins (it is baked into the tag header), but the KEY/FOR
+        // expressions must otherwise honour the caller's LIVE SET EXACT / SET ANSI so a character `=`
+        // inside a FOR/KEY filters exactly as a VFP run of the same program would (review finding #6).
+        var ctx = new EvaluationContext
+        {
+            Collation = collation,
+            Exact = evalContext?.Exact ?? false,
+            Ansi = evalContext?.Ansi ?? false,
+            Culture = evalContext?.Culture,
+            Encoding = evalContext?.Encoding,
+        };
 
         var (keyType, baseLen, isChar) = ResolveKey(schema, def.KeyExpression);
         int keyLen = CollatedKeyLength(baseLen, isChar, collation);
@@ -151,7 +171,9 @@ internal static class CdxIndexBuilder
         var entries = new List<Entry>(rows.Count);
         foreach (var row in rows)
         {
-            if (row.Record.IsDeleted)
+            // VFP keeps index entries for DELETED records in the CDX (only PACK removes them). With
+            // SET DELETED OFF (includeDeleted) we index them too; the default (SET DELETED ON) skips them.
+            if (!includeDeleted && row.Record.IsDeleted)
                 continue;
             var rc = new RowContext(row.Record, row.RecNo, recCount);
 
@@ -240,12 +262,18 @@ internal static class CdxIndexBuilder
             leaf.Index = alloc();
 
         // The 0x04 "data" leaf-attribute bit is NOT a per-tag property — it is a function of the leaf
-        // GEOMETRY: VFP9 sets it exactly when the record-number field is narrower than a full byte
-        // (RecnoBits < 8). Verified across vfp_test/dbctest/ref.DCX (OBJECTNAME RecnoBits=8 ⇒ 0x03,
-        // OBJECTTYPE RecnoBits=6 ⇒ 0x07), vfp_test/ligtest.CDX (RecnoBits=6 ⇒ 0x07) and every TasTrade
-        // .cdx (RecnoBits≥8 ⇒ 0x03/0x02). The tag directory (RecnoBits=16) therefore correctly clears
-        // it. The old isDataTag heuristic mis-set it on wide-recno data tags; this geometry rule is exact.
-        ushort leafExtra = (ushort)(geom.RecnoBits < 8 ? AttrData : 0);
+        // GEOMETRY: VFP9 sets it exactly when a leaf entry's packed record-number+dup+trail info block
+        // fits in ONE or TWO bytes (BytesPerEntry ≤ 2). Verified byte-for-byte against every FRESHLY
+        // built VFP9 golden: vfp_test/dbctest/ref.DCX (the wide composite tag BytesPerEntry=3 ⇒ 0x03;
+        // the str(parentid)+objecttype tag BytesPerEntry=2 ⇒ 0x07), vfp_test/ligtest.CDX (C(10) GENERAL,
+        // BytesPerEntry=2 ⇒ 0x07) and a live INDEX ON over a small free table (C(10) MACHINE / I keys,
+        // 4 records ⇒ BytesPerEntry=2 ⇒ 0x07). The tag directory (BytesPerEntry=3 for realistic tag
+        // counts) therefore correctly clears it. The earlier `RecnoBits < 8` rule coincided with this on
+        // the wide-key fixtures but mis-cleared 0x04 on small tables whose record field pads up to exactly
+        // 8 bits while the entry still packs into two bytes (e.g. a 4-record C(10)/I tag: RecnoBits=8 but
+        // BytesPerEntry=2). BytesPerEntry ≤ 2 is the exact rule and is read-invariant (the reader keys
+        // only off bits 0x01/0x02 — IndexNodeHeader.IsRoot/IsLeaf — never 0x04).
+        ushort leafExtra = (ushort)(geom.BytesPerEntry <= 2 ? AttrData : 0);
 
         // Single leaf → it is also the root (root | leaf).
         if (leaves.Count == 1)

@@ -29,6 +29,13 @@ public sealed class RuntimeState
     public int Reprocess { get; internal set; }
 
     /// <summary>
+    /// SET UNIQUE (default OFF). When ON, an <c>INDEX ON … TAG</c> with no explicit
+    /// <c>UNIQUE</c>/<c>CANDIDATE</c> clause builds a UNIQUE tag (one entry, lowest recno, per distinct
+    /// key). Read back by <c>SET("UNIQUE")</c>. microVFP P1 gap #1 — INDEX/ORDER WRITE model.
+    /// </summary>
+    public bool Unique { get; internal set; }
+
+    /// <summary>
     /// The RI-critical branch (MICROVFP_SEMANTICS.md §Locking / risk #5): <c>SET REPROCESS TO 0</c>
     /// makes the lock FUNCTIONS (RLOCK/FLOCK/…) fail FAST (return <c>.F.</c> immediately) WHEN an
     /// <c>ON ERROR</c> handler is installed; with no handler the same setting means "retry forever".

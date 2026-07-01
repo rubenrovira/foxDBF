@@ -331,6 +331,8 @@ public static class PrgParser
                 "SELECT" => BuildSelect(text),
                 "USE" => BuildUse(text),
                 "SEEK" => BuildSeek(text),
+                "INDEX" => BuildIndex(text),
+                "REINDEX" => BuildReindex(text),
                 "LOCATE" => BuildLocate(text),
                 "CONTINUE" => new ContinueStmt(),
                 "GO" or "GOTO" => BuildGo(text),
@@ -531,6 +533,64 @@ public static class PrgParser
             return new SeekStmt(PrgExpr.Parse(key), order, inArea);
         }
 
+        /// <summary>The bare flag words of <c>INDEX ON</c> (they carry no operand, so they are stripped
+        /// out before the key/TAG/OF/TO/FOR clauses are carved).</summary>
+        private static readonly string[] IndexFlagWords =
+            { "ASCENDING", "DESCENDING", "UNIQUE", "CANDIDATE", "ADDITIVE", "COMPACT" };
+
+        private static PrgStatement BuildIndex(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);                          // drop INDEX
+            if (PrgScan.FirstWord(rest) == "ON") rest = PrgScan.AfterFirstWord(rest); // drop ON
+
+            // Blank out the bare flag words in place (preserving offsets) so the key expression and the
+            // TAG/OF/TO/FOR clause bodies carve cleanly and never swallow a trailing DESCENDING/UNIQUE/….
+            bool descending = false, unique = false, candidate = false, additive = false;
+            var chars = rest.ToCharArray();
+            foreach (var (start, len, upper) in PrgScan.TopWords(rest))
+            {
+                if (Array.IndexOf(IndexFlagWords, upper) < 0) continue;
+                switch (upper)
+                {
+                    case "DESCENDING": descending = true; break;
+                    case "UNIQUE": unique = true; break;
+                    case "CANDIDATE": candidate = true; break;
+                    case "ADDITIVE": additive = true; break;
+                    // ASCENDING / COMPACT are the defaults — recognised so they are stripped, no flag set.
+                }
+                for (int i = start; i < start + len; i++) chars[i] = ' ';
+            }
+            string cleaned = new string(chars);
+
+            var (key, segs) = Carve(cleaned, "TAG", "OF", "TO", "FOR");
+            NameRef? tag = null, ofCdx = null, toIdx = null;
+            PrgExpr? forE = null;
+            foreach (var (k, body) in segs)
+            {
+                switch (k)
+                {
+                    case "TAG": tag = ToNameRef(FirstToken(body)); break;
+                    case "OF": ofCdx = ToNameRef(FirstToken(body)); break;
+                    case "TO": toIdx = ToNameRef(FirstToken(body)); break;
+                    case "FOR": if (body.Trim().Length > 0) forE = PrgExpr.Parse(body); break;
+                }
+            }
+
+            string keyText = key.Trim();
+            if (keyText.Length == 0)
+                return new UnknownCommand("INDEX", PrgScan.AfterFirstWord(text));
+            return new IndexStmt(PrgExpr.Parse(keyText), tag, ofCdx, toIdx, forE,
+                descending, unique, candidate, additive);
+        }
+
+        private static ReindexStmt BuildReindex(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);
+            var (_, segs) = Carve(rest, "IN");
+            NameRef? inArea = segs.Count > 0 ? ToNameRef(FirstToken(segs[0].Body)) : null;
+            return new ReindexStmt(inArea);
+        }
+
         private static LocateStmt BuildLocate(string text)
         {
             var (scope, forE, whileE) = ScopeForWhile(PrgScan.AfterFirstWord(text));
@@ -575,14 +635,15 @@ public static class PrgParser
             var (head, segs) = Carve(args, "IN", "DESCENDING", "ASCENDING", "TAG");
             NameRef? order = head.Trim().Length == 0 ? null : ToNameRef(FirstToken(head));
             NameRef? inArea = null;
-            bool descending = false;
+            bool? direction = null;   // null = no explicit clause; true = DESCENDING; false = ASCENDING.
             foreach (var (k, body) in segs)
             {
                 if (k == "IN") inArea = ToNameRef(FirstToken(body));
-                else if (k == "DESCENDING") descending = true;
+                else if (k == "DESCENDING") direction = true;
+                else if (k == "ASCENDING") direction = false;
                 else if (k == "TAG" && order is null) order = ToNameRef(FirstToken(body));
             }
-            return new SetOrderStmt(order, inArea, descending);
+            return new SetOrderStmt(order, inArea, direction);
         }
 
         private PrgStatement BuildOn(string text, int line)
