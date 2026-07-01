@@ -24,8 +24,6 @@
     <ProjectReference Include="..\..\src\CrossVault.FoxDbf.Data\CrossVault.FoxDbf.Data.csproj" />
     <ProjectReference Include="..\..\src\CrossVault.FoxDbf.Expressions\CrossVault.FoxDbf.Expressions.csproj" />
     <ProjectReference Include="..\..\src\CrossVault.FoxDbf.MicroVfp\CrossVault.FoxDbf.MicroVfp.csproj" />
-    <ProjectReference Include="..\..\src\CrossVault.FoxDbf.Highlike\CrossVault.FoxDbf.Highlike.csproj" />
-    <ProjectReference Include="..\..\src\CrossVault.FoxDbf.Sql\CrossVault.FoxDbf.Sql.csproj" />
   </ItemGroup>
 
 </Project>

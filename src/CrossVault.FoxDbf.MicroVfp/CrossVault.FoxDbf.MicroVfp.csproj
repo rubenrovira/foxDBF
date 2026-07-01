@@ -4,10 +4,34 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CS1734</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- PackageId intentionally differs from AssemblyName/RootNamespace (CrossVault.FoxDbf.MicroVfp) -
+         "CrossVault.microVFP" is the public-facing package name. -->
+    <PackageId>CrossVault.microVFP</PackageId>
+    <Version>0.6.0</Version>
+    <Authors>CrossVault</Authors>
+    <Company>CrossVault</Company>
+    <Description>A minimal, embeddable Visual FoxPro 9 stored-procedure interpreter: a tree-walking interpreter for real VFP9 .prg source (PROCEDURE/FUNCTION definitions, control flow, VFP dynamic scoping (LOCAL/PRIVATE/PUBLIC), by-value/by-reference parameter passing, ON ERROR/AERROR error handling) running against a live CrossVault.FoxDbf VfpSession - so .prg code that opens tables, seeks, scans, and writes records operates on the same byte-compatible, Rushmore-optimized engine as the rest of CrossVault.FoxDbf. For running real-world VFP9 business-logic stored procedures on .NET without a Visual FoxPro installation.</Description>
+    <PackageTags>foxpro;visualfoxpro;vfp;prg;interpreter;stored-procedure;dsl;xbase</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\CrossVault.FoxDbf.Sql\CrossVault.FoxDbf.Sql.csproj" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- CrossVault.FoxDbf.Sql was merged into CrossVault.FoxDbf (same package now, no cycle since
+         VfpSession/SqlParser live there); reference Core directly for a normal nuspec dependency. -->
+    <ProjectReference Include="..\CrossVault.FoxDbf\CrossVault.FoxDbf.csproj" />
     <ProjectReference Include="..\CrossVault.FoxDbf.Expressions\CrossVault.FoxDbf.Expressions.csproj" PrivateAssets="all" />
   </ItemGroup>
 

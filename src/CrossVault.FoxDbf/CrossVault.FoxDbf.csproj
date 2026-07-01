@@ -15,8 +15,8 @@
     <Version>0.6.0</Version>
     <Authors>CrossVault</Authors>
     <Company>CrossVault</Company>
-    <Description>Idiomatic .NET library for Visual FoxPro and dBase database files: read AND write .dbf tables, .fpt/.dbt memos, .cdx/.idx indexes, and .dbc database containers (long field names, code pages, NULL/_NullFlags, Varchar). Includes append/update/PACK/ZAP, VFP-compatible record locking, create-DBF/ALTER, create-DBC, CDX (re)indexing, a VFP expression engine with MACHINE/GENERAL collation, and a Rushmore-style query optimizer with a SYS(3054)-style ShowPlan, SET EXACT/DELETED/OPTIMIZE semantics, late materialization, an adaptive sparse/dense bitmap, and an optional memory-mapped read backend. For a cost-based planner with statistics + a cross-query index cache, add the opt-in CrossVault.FoxDbf.Highlike package. Output is byte-compatible with the real Visual FoxPro 9 runtime. Primary target Visual FoxPro.</Description>
-    <PackageTags>foxpro;visualfoxpro;dbf;dbc;fpt;dbt;cdx;xbase;dbase;clipper;reader;writer;codepage;rushmore</PackageTags>
+    <Description>Idiomatic .NET library for Visual FoxPro and dBase database files: read AND write .dbf tables, .fpt/.dbt memos, .cdx/.idx indexes, and .dbc database containers (long field names, code pages, NULL/_NullFlags, Varchar). Includes append/update/PACK/ZAP, VFP-compatible record locking, create-DBF/ALTER, create-DBC, CDX (re)indexing, a VFP expression engine with MACHINE/GENERAL collation, a Rushmore-style query optimizer with a SYS(3054)-style ShowPlan (SET EXACT/DELETED/OPTIMIZE semantics, late materialization, an adaptive sparse/dense bitmap, an optional memory-mapped read backend), a VFP-SQL parser + work-area session + executor (SELECT/JOIN/UNION/subqueries, DML, DDL), and the opt-in Highlike cost-based query accelerator (statistics, histograms, cross-query index cache) — all in one package. Output is byte-compatible with the real Visual FoxPro 9 runtime. Primary target Visual FoxPro.</Description>
+    <PackageTags>foxpro;visualfoxpro;dbf;dbc;fpt;dbt;cdx;xbase;dbase;clipper;reader;writer;codepage;rushmore;sql</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <RepositoryType>git</RepositoryType>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
@@ -38,10 +38,17 @@
     <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Public" />
     <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Internal" />
     <InternalsVisibleTo Include="CrossVault.FoxDbf.MicroVfp" />
+    <!-- VfpSession (formerly in the now-merged Sql project) exposes internal transaction/handle
+         seams (TxRedirectReadPath, TxBeginWritePath, TxDdlSnapshot, CloseAllHandles) that the ADO.NET
+         provider uses directly. -->
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Data" />
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\CrossVault.FoxDbf.Expressions\CrossVault.FoxDbf.Expressions.csproj" />
+    <!-- PrivateAssets="all": Expressions isn't independently published, its DLL is bundled into this
+         package's lib/ folder below (IncludeExpressionsAssemblyInPackage) - without this the nuspec
+         would ALSO declare a dependency on a "CrossVault.FoxDbf.Expressions" package that doesn't exist. -->
+    <ProjectReference Include="..\CrossVault.FoxDbf.Expressions\CrossVault.FoxDbf.Expressions.csproj" PrivateAssets="all" />
   </ItemGroup>
 
   <!-- Bundle the referenced Expressions assembly into the package's lib/ folder: a ProjectReference

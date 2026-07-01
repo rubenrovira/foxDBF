@@ -1,10 +1,16 @@
 # CrossVault.FoxDbf
 
-An idiomatic .NET library for **reading and writing** Visual FoxPro and dBase database
-files — `.dbf` tables, `.fpt`/`.dbt` memos, `.cdx`/`.idx` indexes, and `.dbc` database
+An idiomatic .NET library for **reading, writing, and querying (SQL)** Visual FoxPro and dBase
+database files — `.dbf` tables, `.fpt`/`.dbt` memos, `.cdx`/`.idx` indexes, and `.dbc` database
 containers. The primary target is Visual FoxPro, with dBase III/IV/V supported alongside.
 Written output is **byte-compatible with the real Visual FoxPro 9 runtime** (verified against
-it: created tables, indexes, and databases open in VFP9).
+it: created tables, indexes, and databases open in VFP9; SQL results match a brute-force oracle
+and the real VFP9 runtime).
+
+Need SQL from Dapper/ADO.NET/reporting tools instead of the raw API below? Use
+**[CrossVault.FoxDbf.Data](https://www.nuget.org/packages/CrossVault.FoxDbf.Data)** (the ADO.NET
+provider built on this package). Need to run VFP9 stored-procedure `.prg` business logic? Use
+**[CrossVault.microVFP](https://www.nuget.org/packages/CrossVault.microVFP)**.
 
 ## Features
 
@@ -32,7 +38,7 @@ it: created tables, indexes, and databases open in VFP9).
 - **CDX writing / REINDEX**: bulk-build a compact B-tree index for a tag (key + FOR
   expressions, MACHINE/GENERAL collation).
 
-### Expressions & query
+### Expressions & query engine
 - A VFP **expression engine** (`CrossVault.FoxDbf.Expressions`): hand-written lexer + Pratt
   parser compiled via `System.Linq.Expressions`, a broad function library, and byte-exact
   **MACHINE / GENERAL** collation.
@@ -44,9 +50,39 @@ it: created tables, indexes, and databases open in VFP9).
 - An optional **memory-mapped read backend** (`DbfOptions.ReadBackend`) for local files (falls back
   to `FileStream` on network shares).
 
-For a cost-based planner with persisted statistics (NDV / histograms / most-common-values) and a
-cross-query index cache, add the opt-in **[CrossVault.FoxDbf.Highlike](https://www.nuget.org/packages/CrossVault.FoxDbf.Highlike)**
-package and call `table.UseHighlike()` — same results, faster on repeated / large queries.
+### SQL (`CrossVault.FoxDbf.Sql` namespace, bundled in this package)
+A Visual FoxPro SQL parser + AST, a VFP **work-area data session**, and an executor over the
+Rushmore optimizer and writer above:
+- **`SqlParser.Parse(sql)`** → an AST. Every scalar/predicate fragment is parsed by the shared
+  `VfpExpression` engine — one expression grammar, used by indexes, filters, and SQL.
+- **`VfpSession`** — the per-connection VFP work-area model: `USE` / `SELECT` work areas, open a
+  `.dbc` (long field names) or a directory of free `.dbf` or a single `.dbf`, `alias.field`
+  resolution, auto-open of tables named in a query.
+- **Executor** — `SELECT` (projection, `WHERE` pushed to Rushmore, `GROUP BY`/`HAVING`, aggregates,
+  `ORDER BY`, `DISTINCT`, `TOP`, `INNER`/`LEFT`/`RIGHT`/`FULL JOIN`, `UNION [ALL]`, correlated
+  subqueries) and DML (`INSERT … VALUES`, `UPDATE … SET`, `DELETE` = VFP soft-delete) plus DDL
+  (`CREATE`/`ALTER`/`DROP TABLE`). Returns a `SqlResult` (column schema + streamed rows, or affected
+  count). SQL `=` follows **`SET ANSI`** (not `SET EXACT`); `UPDATE`/`DELETE` without a `WHERE`
+  affect all rows.
+
+Most users want **CrossVault.FoxDbf.Data** (ADO.NET) rather than `SqlParser`/`VfpSession` directly.
+
+### Highlike accelerator (`CrossVault.FoxDbf.Highlike` namespace, bundled in this package)
+The **opt-in high-performance accelerator**. It speeds up Rushmore-style queries **without ever
+changing the result** — the answer is always identical to a full table scan. Statistics and caches
+are **hints only**: stale, missing, or even wrong stats can only change the *plan* (speed), never
+the result set (the residual always confirms every candidate).
+
+> Named after the **Hochgern** (Hoch→High, gern→like). Referencing it never changes behaviour
+> unless you opt in via `UseHighlike()`.
+
+- **`.stx` statistics sidecar** — per-tag NDV, min/max, null/deleted counts, **equi-depth histograms**
+  and **most-common-values**, harvested in one sorted index walk. `Analyze(table)` (an explicit
+  UPDATE STATISTICS) or lazy on first use. Staleness via reccount + last-update stamp.
+- **Cost-based planner** — `EstimateRows` drives AND-ordering (selective-first), an index-vs-scan
+  threshold, and cost-driven lifting of the low-selectivity guards.
+- **Cross-query index cache** — decode each CDX tag once, reuse across queries; change-token +
+  `FileSystemWatcher` (local) / token-poll (network) invalidation; thread-safe, bounded, disposable.
 
 ## Quick start
 
@@ -93,6 +129,29 @@ DbfDatabaseBuilder.Create("shop.dbc", new[]
         new DbfColumnDef("COMPANY", 'C', 30),
     }),
 }, new DbcCreateOptions { Overwrite = true });
+```
+
+```csharp
+using CrossVault.FoxDbf.Sql;
+
+// SQL directly against a directory of free tables or a .dbc
+using var session = new VfpSession();
+session.OpenDirectory(@"C:\data");
+var result = session.Execute(
+    "SELECT company_name, country FROM customer WHERE country = 'Germany' ORDER BY company_name");
+foreach (var row in result!.Rows)
+    Console.WriteLine(row[0]);
+```
+
+```csharp
+using CrossVault.FoxDbf.Highlike;
+
+// Same API, same results as Core — just faster on repeated / large queries:
+using var accelerated = DbfTable.Open("orders.dbf").UseHighlike(new HighlikeOptions { EnableStatistics = true });
+foreach (var rec in accelerated.Query("AMOUNT > 1000 AND UPPER(NAME) = \"ACME\"").GetRecords(accelerated))
+{
+    /* ... */
+}
 ```
 
 Targets `net10.0`.

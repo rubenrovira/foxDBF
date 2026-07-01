@@ -32,12 +32,14 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\CrossVault.FoxDbf.Sql\CrossVault.FoxDbf.Sql.csproj" />
+    <!-- Sql and Highlike were merged into CrossVault.FoxDbf (one package now: core + SQL + opt-in
+         accelerator). Reference Core directly — normal reference, so `dotnet pack` emits a real
+         nuspec dependency on the published CrossVault.FoxDbf package. -->
+    <ProjectReference Include="..\CrossVault.FoxDbf\CrossVault.FoxDbf.csproj" />
     <!-- microVFP interpreter: the provider runs stored procedures / UDFs and (opt-in EnforceRules)
-         enforces the DBC's DEFAULT/RULE/TRIGGER on writes through it. MicroVfp -> Sql (no cycle). -->
+         enforces the DBC's DEFAULT/RULE/TRIGGER on writes through it. Normal reference -> nuspec
+         dependency on the published CrossVault.microVFP package. -->
     <ProjectReference Include="..\CrossVault.FoxDbf.MicroVfp\CrossVault.FoxDbf.MicroVfp.csproj" />
-    <!-- The opt-in Highlike accelerator: Accelerator=Highlike routes SELECT/COUNT through it. -->
-    <ProjectReference Include="..\CrossVault.FoxDbf.Highlike\CrossVault.FoxDbf.Highlike.csproj" />
     <!-- Data uses Expressions types directly (IVfpCollation/EvaluationContext in the conn-string
          mapping). Expressions is bundled in the Core package (no standalone package), so reference it
          compile-time only — PrivateAssets="all" — no NuGet dependency; the DLL arrives via Core. -->

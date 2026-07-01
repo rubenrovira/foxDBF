@@ -1,8 +1,10 @@
 # CrossVault.FoxDbf.Data
 
-An **ADO.NET data provider** for Visual FoxPro / dBase tables and database containers, built on
-[CrossVault.FoxDbf](https://www.nuget.org/packages/CrossVault.FoxDbf). Query FoxPro/dBase data from
-Dapper, raw ADO.NET, reporting tools and LINQPad — using SQL.
+An **ADO.NET data provider** for Visual FoxPro / dBase tables and database containers. Query
+FoxPro/dBase data from Dapper, raw ADO.NET, reporting tools and LINQPad — using SQL. Depends on
+[CrossVault.FoxDbf](https://www.nuget.org/packages/CrossVault.FoxDbf) (core + SQL engine) and
+[CrossVault.microVFP](https://www.nuget.org/packages/CrossVault.microVFP) (stored-procedure/UDF
+execution via `EnforceRules`) — both are pulled in automatically as NuGet dependencies.
 
 ## Quick start
 

@@ -306,26 +306,9 @@ public sealed class HighlikeEngineTests : IClassFixture<HighlikeEngineTests.HiTa
         Assert.Contains(5, q.RecordNumbers);
     }
 
-    // ============================================================ layering (dependency direction)
-
-    [Fact]
-    public void Core_DoesNotReference_Highlike()
-    {
-        var coreRefs = typeof(DbfTable).Assembly
-            .GetReferencedAssemblies()
-            .Select(a => a.Name);
-        Assert.DoesNotContain("CrossVault.FoxDbf.Highlike", coreRefs);
-    }
-
-    [Fact]
-    public void Highlike_References_Core()
-    {
-        var hiRefs = typeof(HighlikeEngine).Assembly
-            .GetReferencedAssemblies()
-            .Select(a => a.Name)
-            .ToArray();
-        Assert.Contains("CrossVault.FoxDbf", hiRefs);
-    }
+    // Highlike and Core were merged into a single CrossVault.FoxDbf assembly for NuGet packaging
+    // (one package instead of two) — the cross-assembly layering tests that used to live here no
+    // longer apply (there's no assembly boundary left to check).
 
     // ============================================================ shared temp table
 

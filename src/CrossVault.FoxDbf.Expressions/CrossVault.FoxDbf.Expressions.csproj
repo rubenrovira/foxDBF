@@ -4,12 +4,17 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Not independently published — bundled into the CrossVault.FoxDbf package's lib/ folder. -->
+    <IsPackable>false</IsPackable>
   </PropertyGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Public" />
     <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Internal" />
-    <InternalsVisibleTo Include="CrossVault.FoxDbf.Sql" />
+    <!-- Sql and Highlike were merged into CrossVault.FoxDbf; the old grant to "CrossVault.FoxDbf.Sql"
+         is replaced by one to "CrossVault.FoxDbf" itself (which already exists via the standalone
+         ProjectReference bundling — this covers the merged-in Sql/Highlike code too). -->
+    <InternalsVisibleTo Include="CrossVault.FoxDbf" />
     <InternalsVisibleTo Include="CrossVault.FoxDbf.MicroVfp" />
   </ItemGroup>
 
