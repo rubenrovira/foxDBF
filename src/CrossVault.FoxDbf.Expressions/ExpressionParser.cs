@@ -1,0 +1,176 @@
+using System;
+using System.Collections.Generic;
+
+namespace CrossVault.FoxDbf.Expressions;
+
+/// <summary>
+/// Hand-written recursive-descent + Pratt (precedence-climbing) parser producing
+/// an immutable AST. Throws <see cref="ExpressionException"/> on malformed input.
+///
+/// Binding powers (higher binds tighter):
+///   OR 10 | AND 20 | comparison 40 | additive 50 | multiplicative 60 | power 70
+/// Prefix:
+///   .NOT./!  parses an operand at 30 (looser than comparison, tighter than AND)
+///   unary -  parses an operand at 65 (tighter than *, looser than ^)
+/// </summary>
+internal sealed class ExpressionParser
+{
+    private readonly List<Token> _tokens;
+    private int _pos;
+    private int _depth;
+
+    /// <summary>Recursion-depth cap so a deeply-nested expression (e.g. thousands of parentheses) throws
+    /// a catchable <see cref="ExpressionException"/> instead of a fatal StackOverflowException.</summary>
+    private const int MaxDepth = 400;
+
+    private ExpressionParser(List<Token> tokens) => _tokens = tokens;
+
+    public static AstNode Parse(string text)
+    {
+        var tokens = new ExpressionLexer(text).Tokenize();
+        var parser = new ExpressionParser(tokens);
+        if (parser.Peek.Type == TokenType.Eof)
+            throw new ExpressionException("Empty expression.", 0);
+        var node = parser.ParseExpr(0);
+        if (parser.Peek.Type != TokenType.Eof)
+            throw new ExpressionException("Unexpected trailing input.", parser.Peek.Pos);
+        return node;
+    }
+
+    private Token Peek => _tokens[_pos];
+    private Token Next() => _tokens[_pos++];
+
+    private AstNode ParseExpr(int minBp)
+    {
+        if (++_depth > MaxDepth)
+            throw new ExpressionException("Expression nesting is too deep.", Peek.Pos);
+        try
+        {
+            return ParseExprCore(minBp);
+        }
+        finally { _depth--; }
+    }
+
+    private AstNode ParseExprCore(int minBp)
+    {
+        var left = ParsePrefix();
+        while (true)
+        {
+            var t = Peek;
+            int lbp = LeftBp(t.Type);
+            if (lbp < minBp || lbp == 0) break;
+            Next();
+            int rbp = t.Type == TokenType.Caret ? lbp : lbp + 1; // ^ is right-associative
+            var right = ParseExpr(rbp);
+            left = new BinaryNode(MapBinOp(t.Type), left, right);
+        }
+        return left;
+    }
+
+    private AstNode ParsePrefix()
+    {
+        var t = Peek;
+        switch (t.Type)
+        {
+            case TokenType.Number:
+            case TokenType.String:
+            case TokenType.DateLit:
+            case TokenType.DateTimeLit:
+                Next();
+                return new LiteralNode(t.Value);
+            case TokenType.True: Next(); return new LiteralNode(VfpValue.Logical(true));
+            case TokenType.False: Next(); return new LiteralNode(VfpValue.Logical(false));
+            case TokenType.NullLit: Next(); return new LiteralNode(VfpValue.Null);
+
+            case TokenType.Minus:
+                Next();
+                return new UnaryNode(UnOp.Neg, ParseExpr(65));
+            case TokenType.Plus:
+                Next();
+                return ParseExpr(65); // unary plus is a no-op
+            case TokenType.Not:
+            case TokenType.Bang:
+                Next();
+                return new UnaryNode(UnOp.Not, ParseExpr(30));
+
+            case TokenType.LParen:
+            {
+                Next();
+                var inner = ParseExpr(0);
+                Expect(TokenType.RParen, "Expected ')'.");
+                return inner;
+            }
+
+            case TokenType.Identifier:
+                return ParseIdentifier();
+
+            default:
+                throw new ExpressionException(
+                    t.Type == TokenType.Eof ? "Unexpected end of expression."
+                                            : $"Unexpected token at position {t.Pos}.",
+                    t.Pos);
+        }
+    }
+
+    private AstNode ParseIdentifier()
+    {
+        var id = Next();
+        if (Peek.Type == TokenType.LParen)
+        {
+            Next(); // '('
+            var args = new List<AstNode>();
+            if (Peek.Type != TokenType.RParen)
+            {
+                args.Add(ParseExpr(0));
+                while (Peek.Type == TokenType.Comma)
+                {
+                    Next();
+                    args.Add(ParseExpr(0));
+                }
+            }
+            Expect(TokenType.RParen, "Expected ')' to close function call.");
+            return new FunctionNode(id.Text, args.ToArray());
+        }
+        return new FieldNode(id.Text);
+    }
+
+    private void Expect(TokenType type, string message)
+    {
+        if (Peek.Type != type) throw new ExpressionException(message, Peek.Pos);
+        Next();
+    }
+
+    private static int LeftBp(TokenType t) => t switch
+    {
+        TokenType.Or => 10,
+        TokenType.And => 20,
+        TokenType.Eq or TokenType.ExactEq or TokenType.Ne or
+        TokenType.Lt or TokenType.Le or TokenType.Gt or TokenType.Ge or
+        TokenType.Dollar => 40,
+        TokenType.Plus or TokenType.Minus => 50,
+        TokenType.Star or TokenType.Slash or TokenType.Percent => 60,
+        TokenType.Caret => 70,
+        _ => 0,
+    };
+
+    private static BinOp MapBinOp(TokenType t) => t switch
+    {
+        TokenType.Plus => BinOp.Add,
+        TokenType.Minus => BinOp.Sub,
+        TokenType.Star => BinOp.Mul,
+        TokenType.Slash => BinOp.Div,
+        TokenType.Percent => BinOp.Mod,
+        TokenType.Caret => BinOp.Pow,
+        TokenType.Eq => BinOp.Eq,
+        TokenType.ExactEq => BinOp.ExactEq,
+        TokenType.Ne => BinOp.Ne,
+        TokenType.Lt => BinOp.Lt,
+        TokenType.Le => BinOp.Le,
+        TokenType.Gt => BinOp.Gt,
+        TokenType.Ge => BinOp.Ge,
+        TokenType.Dollar => BinOp.Dollar,
+        TokenType.And => BinOp.And,
+        TokenType.Or => BinOp.Or,
+        _ => throw new ExpressionException("Invalid binary operator."),
+    };
+}

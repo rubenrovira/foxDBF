@@ -1,0 +1,230 @@
+using System;
+using System.Collections.Generic;
+using CrossVault.FoxDbf;
+using CrossVault.FoxDbf.Expressions;
+using CrossVault.FoxDbf.Query;
+using CrossVault.FoxDbf.Write;
+
+namespace CrossVault.FoxDbf.Sql;
+
+/// <summary>
+/// The Phase-1c DML executor (INSERT / UPDATE / DELETE over a single base table). It mirrors
+/// <see cref="SelectExecutor"/>'s shape: it resolves the TARGET table via the <see cref="VfpSession"/>
+/// work-area model (reusing an open alias, else auto-opening it WRITABLE), drives
+/// <see cref="QueryOptimizer.FindRecords"/> for the WHERE candidate set, and uses
+/// <see cref="CrossVault.FoxDbf.Expressions.VfpExpression.Evaluate"/> for VALUES / SET expressions.
+/// <para>
+/// VFP semantics: DELETE is a SOFT delete (deletion flag only — never a pack); UPDATE/DELETE with no
+/// WHERE affect ALL live rows; <c>SET DELETED ON</c> excludes already-deleted rows from the candidate
+/// set; INSERT is single-row VALUES only; <c>=</c> in WHERE follows SQL/ANSI semantics like SELECT.
+/// </para>
+/// <para>
+/// Each handler resolves the target table via <see cref="VfpSession.OpenWritableTarget"/> (reusing an
+/// open work area's file, else auto-opening SHARED), evaluates VALUES / SET via
+/// <see cref="CrossVault.FoxDbf.Expressions.VfpExpression.Evaluate"/>, drives
+/// <see cref="QueryOptimizer.FindRecords"/> for the WHERE candidate set, and writes through the
+/// <see cref="DbfWriter"/>. Affected-record counts come back via <see cref="SqlResult.Dml"/>.
+/// </para>
+/// </summary>
+internal sealed class DmlExecutor
+{
+    private readonly VfpSession _session;
+
+    public DmlExecutor(VfpSession session) => _session = session;
+
+    /// <summary>Executes one DML statement and returns its affected-record count via
+    /// <see cref="SqlResult.Dml"/>.</summary>
+    public SqlResult Run(SqlStatement statement) => statement switch
+    {
+        InsertStatement ins => Insert(ins),
+        UpdateStatement upd => Update(upd),
+        DeleteStatement del => Delete(del),
+        _ => throw new NotSupportedException($"'{statement.GetType().Name}' is not a DML statement."),
+    };
+
+    // ---- INSERT ---------------------------------------------------------------------------
+
+    private SqlResult Insert(InsertStatement st)
+    {
+        var ctx = _session.SqlContext();
+        using var target = _session.OpenWritableTarget(st.Table);
+        var writer = target.Writer;
+        var columns = writer.Schema.Columns;
+
+        // Evaluate every VALUES expression to a CONSTANT: ConstantRow has no row, so a bare field
+        // reference throws, while constant functions (DATE() / STR() …) evaluate fine.
+        var values = new object?[st.Values.Count];
+        for (int i = 0; i < st.Values.Count; i++)
+            values[i] = SelectExecutor.ToClr(st.Values[i].Evaluate(ConstantRow.Instance, ctx));
+
+        if (st.Columns is { } cols)
+        {
+            // Explicit column list: map name → value (missing columns stay blank / NULL); validate count.
+            if (cols.Count != values.Length)
+                throw new FoxDbfSqlException(
+                    $"INSERT column/value count mismatch: {cols.Count} column(s) but {values.Length} value(s).");
+
+            var map = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < cols.Count; i++)
+            {
+                if (IndexOfColumn(columns, cols[i]) < 0)
+                    throw new FoxDbfSqlException($"Column '{cols[i]}' does not exist in table '{st.Table}'.");
+                map[cols[i]] = values[i];
+            }
+            writer.AppendRecord(map);
+        }
+        else
+        {
+            // No column list: values map to the physical field order; VFP requires one per field.
+            if (values.Length != columns.Count)
+                throw new FoxDbfSqlException(
+                    $"INSERT value count {values.Length} does not match the table's {columns.Count} column(s) (no column list given).");
+            writer.AppendRecord(values);
+        }
+        return SqlResult.Dml(1);
+    }
+
+    // ---- UPDATE ---------------------------------------------------------------------------
+
+    private SqlResult Update(UpdateStatement st)
+    {
+        var ctx = _session.SqlContext();
+        using var target = _session.OpenWritableTarget(st.Table);
+        var writer = target.Writer;
+        var table = target.Table;
+        var columns = writer.Schema.Columns;
+
+        // Resolve each SET column to a physical index up front (clear error for an unknown column).
+        var assigns = new (int Index, CrossVault.FoxDbf.Expressions.VfpExpression Value)[st.Assignments.Count];
+        var setColumns = new HashSet<int>();
+        for (int i = 0; i < st.Assignments.Count; i++)
+        {
+            int idx = IndexOfColumn(columns, st.Assignments[i].Column);
+            if (idx < 0)
+                throw new FoxDbfSqlException(
+                    $"Column '{st.Assignments[i].Column}' does not exist in table '{st.Table}'.");
+            assigns[i] = (idx, st.Assignments[i].Value);
+            setColumns.Add(idx);
+        }
+
+        // §D3: ONE whole-file lock spans candidate selection AND every write, so a concurrent shared
+        // writer cannot slip a change between the match and the recno-targeted write (lost update).
+        // No-op when the target was opened EXCLUSIVE; each per-record UpdateRecord/Delete re-enters
+        // the held lock (WithLock's covered-range guard) rather than re-locking.
+        using var lockScope = writer.LockFileScope();
+
+        var matched = MatchedRecords(table, st.Where?.Text, ctx);
+        foreach (var (recNo, rec) in matched)
+        {
+            // Rewrite the FULL row: seed every field from the record's CURRENT value, then apply each
+            // SET expression evaluated against THIS row (so amount = amount + 1 reads its own value).
+            // EXCEPTION: FPT-backed columns (M/W/G/P) the SET list does not touch carry the KeepValue
+            // sentinel so their existing .fpt block pointer is preserved verbatim — round-tripping
+            // their read-back value (decoded memo content, or a raw G/P pointer) back through the
+            // memo-append path would grow the .fpt unboundedly and corrupt General/Picture fields.
+            var positional = new object?[columns.Count];
+            for (int i = 0; i < columns.Count; i++)
+                positional[i] = columns[i].Type is 'M' or 'W' or 'G' or 'P' && !setColumns.Contains(i)
+                    ? DbfWriter.KeepValue
+                    : rec[columns[i].Name];
+
+            var rowCtx = new RecordRow(rec, recNo, table.RecordCount);
+            foreach (var (idx, val) in assigns)
+                positional[idx] = SelectExecutor.ToClr(val.Evaluate(rowCtx, ctx));
+
+            writer.UpdateRecord(recNo - 1, positional);
+
+            // VFP UPDATE modifies field DATA only — a row that was already deleted stays deleted.
+            // (UpdateRecord rewrites the full row as active; re-apply the deletion mark here.)
+            if (rec.IsDeleted)
+                writer.Delete(recNo - 1);
+        }
+        return SqlResult.Dml(matched.Count);
+    }
+
+    // ---- DELETE ---------------------------------------------------------------------------
+
+    private SqlResult Delete(DeleteStatement st)
+    {
+        var ctx = _session.SqlContext();
+        using var target = _session.OpenWritableTarget(st.Table);
+        var writer = target.Writer;
+
+        // §D3: ONE whole-file lock spans candidate selection AND the deletes so they are atomic with
+        // respect to other shared writers (no-op under EXCLUSIVE).
+        using var lockScope = writer.LockFileScope();
+
+        // VFP soft delete: set the deletion flag only — never a pack.
+        var matched = MatchedRecords(target.Table, st.Where?.Text, ctx);
+        foreach (var (recNo, _) in matched)
+            writer.Delete(recNo - 1);
+        return SqlResult.Dml(matched.Count);
+    }
+
+    // ---- candidate-set helpers ------------------------------------------------------------
+
+    /// <summary>The records (1-based recno + the record) matching <paramref name="whereText"/> — no
+    /// WHERE means ALL rows (<c>.T.</c>). <c>SET DELETED ON</c> excludes already-deleted rows via the
+    /// evaluation context, mirroring the SELECT path. Records are returned in ascending recno order,
+    /// read from the writable target's live view so just-written state is seen.</summary>
+    private List<(int RecNo, DbfRecord Rec)> MatchedRecords(
+        DbfTable table, string? whereText, EvaluationContext ctx)
+    {
+        string filter = string.IsNullOrWhiteSpace(whereText) ? ".T." : whereText!;
+        var qr = _session.FindRecords(table, null, filter, ctx);
+        var hits = new HashSet<int>(qr.RecordNumbers);
+
+        var list = new List<(int, DbfRecord)>(hits.Count);
+        int recno = 0;
+        foreach (var rec in table.EnumerateAll(includeDeleted: true))
+        {
+            recno++;
+            if (hits.Contains(recno)) list.Add((recno, rec));
+        }
+        return list;
+    }
+
+    private static int IndexOfColumn(IReadOnlyList<DbfColumn> cols, string name)
+    {
+        for (int i = 0; i < cols.Count; i++)
+            if (string.Equals(cols[i].Name, name, StringComparison.OrdinalIgnoreCase))
+                return i;
+        return -1;
+    }
+
+    // ---- per-record row state (SET / WHERE evaluation) ------------------------------------
+
+    /// <summary>Adapts a <see cref="DbfRecord"/> to <see cref="IRowContext"/> so a SET expression
+    /// reads THIS row's own current values (e.g. <c>amount = amount + 1</c>).</summary>
+    private sealed class RecordRow : IRowContext
+    {
+        private readonly DbfRecord _rec;
+        public RecordRow(DbfRecord rec, int recNo, int recCount)
+        {
+            _rec = rec; RecNo = recNo; RecCount = recCount;
+        }
+        public int RecNo { get; }
+        public int RecCount { get; }
+        public bool Deleted => _rec.IsDeleted;
+        public object? GetField(string name)
+        {
+            int dot = name.LastIndexOf('.');
+            string field = dot >= 0 ? name[(dot + 1)..] : name;
+            return _rec[field];
+        }
+    }
+
+    /// <summary>The row context used to evaluate a constant INSERT VALUES expression: it has NO row,
+    /// so a bare field reference is an error (it throws), while constant functions like
+    /// <c>DATE()</c> / <c>STR()</c> evaluate fine.</summary>
+    private sealed class ConstantRow : IRowContext
+    {
+        public static readonly ConstantRow Instance = new();
+        public int RecNo => 0;
+        public int RecCount => 0;
+        public bool Deleted => false;
+        public object? GetField(string name)
+            => throw new FoxDbfSqlException(
+                $"Field reference '{name}' is not allowed in an INSERT ... VALUES expression (no row context).");
+    }
+}

@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CS1734</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>CrossVault.FoxDbf.Data</PackageId>
+    <Version>0.6.0</Version>
+    <Authors>CrossVault</Authors>
+    <Company>CrossVault</Company>
+    <Description>ADO.NET data provider for Visual FoxPro / dBase tables and database containers, built on CrossVault.FoxDbf. Use FoxPro/dBase data from Dapper, raw ADO.NET, reporting, and LINQPad via SQL: FoxDbfConnection / FoxDbfCommand / FoxDbfDataReader / FoxDbfParameter / FoxDbfConnectionStringBuilder / FoxDbfProviderFactory. Connection string mirrors the VFP OLE DB Provider (Data Source = .dbc | directory | .dbf; Collate; Exclusive; Deleted; Ansi; ReadOnly; Accelerator=Highlike). Supports SELECT (INNER/LEFT/RIGHT/FULL JOIN, UNION, correlated subqueries, GROUP BY, aggregates, ORDER BY, TOP), INSERT/UPDATE/DELETE, CREATE/ALTER/DROP TABLE, the VFP work-area model (USE/SELECT), positional ? and named @/: parameters, real transactions (atomic rollback), DataAdapter/CommandBuilder, GetSchema metadata, and a static DBF-header type map. Output is byte-compatible with the real Visual FoxPro 9 runtime.</Description>
+    <PackageTags>foxpro;visualfoxpro;dbf;dbc;ado.net;adonet;dbprovider;sql;dapper;xbase;dbase</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Public" />
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Internal" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CrossVault.FoxDbf.Sql\CrossVault.FoxDbf.Sql.csproj" />
+    <!-- microVFP interpreter: the provider runs stored procedures / UDFs and (opt-in EnforceRules)
+         enforces the DBC's DEFAULT/RULE/TRIGGER on writes through it. MicroVfp -> Sql (no cycle). -->
+    <ProjectReference Include="..\CrossVault.FoxDbf.MicroVfp\CrossVault.FoxDbf.MicroVfp.csproj" />
+    <!-- The opt-in Highlike accelerator: Accelerator=Highlike routes SELECT/COUNT through it. -->
+    <ProjectReference Include="..\CrossVault.FoxDbf.Highlike\CrossVault.FoxDbf.Highlike.csproj" />
+    <!-- Data uses Expressions types directly (IVfpCollation/EvaluationContext in the conn-string
+         mapping). Expressions is bundled in the Core package (no standalone package), so reference it
+         compile-time only — PrivateAssets="all" — no NuGet dependency; the DLL arrives via Core. -->
+    <ProjectReference Include="..\CrossVault.FoxDbf.Expressions\CrossVault.FoxDbf.Expressions.csproj" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>

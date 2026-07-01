@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Public" />
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Internal" />
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Sql" />
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.MicroVfp" />
+  </ItemGroup>
+
+</Project>

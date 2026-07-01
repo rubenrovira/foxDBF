@@ -1,0 +1,42 @@
+using System.Text;
+
+namespace CrossVault.FoxDbf.Index;
+
+/// <summary>
+/// Internal byte-decoding helpers shared by the CDX/IDX header parsers
+/// (plan §C2). All index expression text is uncompiled ASCII.
+/// </summary>
+internal static class IndexText
+{
+    /// <summary>
+    /// Reads a NUL-terminated ASCII string from <paramref name="span"/> starting
+    /// at <paramref name="start"/>, scanning at most <paramref name="maxLength"/>
+    /// bytes. Returns the empty string when out of range or empty.
+    /// </summary>
+    public static string ReadAsciiZ(ReadOnlySpan<byte> span, int start, int maxLength)
+    {
+        if (start < 0 || start >= span.Length || maxLength <= 0)
+            return string.Empty;
+
+        int available = Math.Min(maxLength, span.Length - start);
+        var region = span.Slice(start, available);
+
+        int nul = region.IndexOf((byte)0);
+        if (nul >= 0)
+            region = region[..nul];
+
+        return region.IsEmpty ? string.Empty : Encoding.ASCII.GetString(region);
+    }
+
+    /// <summary>
+    /// Reads the 8-byte collation name at @494. An all-zero (or empty) field
+    /// means the MACHINE collation.
+    /// </summary>
+    public static string ReadCollation(ReadOnlySpan<byte> eightBytes)
+    {
+        int nul = eightBytes.IndexOf((byte)0);
+        var region = nul >= 0 ? eightBytes[..nul] : eightBytes;
+        region = region.TrimEnd((byte)0x20);
+        return region.IsEmpty ? "MACHINE" : Encoding.ASCII.GetString(region);
+    }
+}

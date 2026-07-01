@@ -1,0 +1,58 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- CS1591: don't require an XML doc on every public member (0.1.0). NU1510: CodePages
+         is referenced intentionally for CP125x support. CS1734: minor doc-tag polish (TODO). -->
+    <NoWarn>$(NoWarn);CS1591;NU1510;CS1734</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>CrossVault.FoxDbf</PackageId>
+    <Version>0.6.0</Version>
+    <Authors>CrossVault</Authors>
+    <Company>CrossVault</Company>
+    <Description>Idiomatic .NET library for Visual FoxPro and dBase database files: read AND write .dbf tables, .fpt/.dbt memos, .cdx/.idx indexes, and .dbc database containers (long field names, code pages, NULL/_NullFlags, Varchar). Includes append/update/PACK/ZAP, VFP-compatible record locking, create-DBF/ALTER, create-DBC, CDX (re)indexing, a VFP expression engine with MACHINE/GENERAL collation, and a Rushmore-style query optimizer with a SYS(3054)-style ShowPlan, SET EXACT/DELETED/OPTIMIZE semantics, late materialization, an adaptive sparse/dense bitmap, and an optional memory-mapped read backend. For a cost-based planner with statistics + a cross-query index cache, add the opt-in CrossVault.FoxDbf.Highlike package. Output is byte-compatible with the real Visual FoxPro 9 runtime. Primary target Visual FoxPro.</Description>
+    <PackageTags>foxpro;visualfoxpro;dbf;dbc;fpt;dbt;cdx;xbase;dbase;clipper;reader;writer;codepage;rushmore</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The test project exercises a few internal test seams (e.g. the §A8 per-column
+         long-name guard DbfDatabase.ApplyLongNames). -->
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Public" />
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Internal" />
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.MicroVfp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CrossVault.FoxDbf.Expressions\CrossVault.FoxDbf.Expressions.csproj" />
+  </ItemGroup>
+
+  <!-- Bundle the referenced Expressions assembly into the package's lib/ folder: a ProjectReference
+       is not packed by default, so without this the nupkg would ship a broken dependency. -->
+  <PropertyGroup>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeExpressionsAssemblyInPackage</TargetsForTfmSpecificBuildOutput>
+  </PropertyGroup>
+  <Target Name="IncludeExpressionsAssemblyInPackage">
+    <ItemGroup>
+      <BuildOutputInPackage Include="$(OutputPath)CrossVault.FoxDbf.Expressions.dll" />
+    </ItemGroup>
+  </Target>
+
+</Project>

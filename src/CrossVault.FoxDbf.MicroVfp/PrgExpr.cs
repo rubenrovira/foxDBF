@@ -1,0 +1,66 @@
+using System.Text.RegularExpressions;
+using CrossVault.FoxDbf.Expressions;
+
+namespace CrossVault.FoxDbf.MicroVfp;
+
+/// <summary>
+/// An expression FRAGMENT located by the PRG parser (the RHS of an assignment, an
+/// IF/DO&#160;WHILE/DO&#160;CASE condition, FOR bounds, a REPLACE&#160;WITH value, a SCAN/DELETE
+/// FOR clause, a RETURN value, …). The PRG parser does NOT have its own expression grammar:
+/// every fragment is handed verbatim to <see cref="VfpExpression.Parse"/> (the existing,
+/// battle-tested xBase expression engine). <see cref="Parsed"/> holds the resulting AST.
+/// </summary>
+public sealed class PrgExpr
+{
+    /// <summary>The exact source text of the fragment (trimmed).</summary>
+    public string Text { get; }
+
+    /// <summary>
+    /// The parsed expression, or <c>null</c> for the rare fragment the expression engine
+    /// cannot represent yet (e.g. a by-reference <c>@var</c> argument inside a DECLARE-DLL
+    /// call). Parser phase keeps the raw text so the whole corpus still parses.
+    /// </summary>
+    public VfpExpression? Parsed { get; }
+
+    /// <summary>True when <see cref="Parsed"/> is a real <see cref="VfpExpression"/>.</summary>
+    public bool IsParsed => Parsed is not null;
+
+    private PrgExpr(string text, VfpExpression? parsed)
+    {
+        Text = text;
+        Parsed = parsed;
+    }
+
+    // VFP's by-reference marker '@var' is legal only in argument position; it is a no-op for
+    // PARSE-structure, so we strip it as a fallback when the raw fragment won't parse.
+    private static readonly Regex ByRef = new(@"@(?=[A-Za-z_])", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Parses <paramref name="text"/> via <see cref="VfpExpression.Parse"/>. Never throws:
+    /// an unrepresentable fragment yields a <see cref="PrgExpr"/> with <see cref="Parsed"/>
+    /// = <c>null</c> (still carrying its <see cref="Text"/>).
+    /// </summary>
+    public static PrgExpr Parse(string text)
+    {
+        var t = (text ?? string.Empty).Trim();
+        // Normalise VFP memory-array syntax (bracket subscripts → parens; ALEN/AERROR array-name argument
+        // → quoted name) so the engine can parse + the interpreter resolve it. Text is kept verbatim.
+        var norm = MicroVfpExprRewrite.Normalize(t);
+        try
+        {
+            return new PrgExpr(t, VfpExpression.Parse(norm));
+        }
+        catch (ExpressionException)
+        {
+            var stripped = ByRef.Replace(norm, string.Empty);
+            if (!string.Equals(stripped, norm, System.StringComparison.Ordinal))
+            {
+                try { return new PrgExpr(t, VfpExpression.Parse(stripped)); }
+                catch (ExpressionException) { }
+            }
+            return new PrgExpr(t, null);
+        }
+    }
+
+    public override string ToString() => Text;
+}

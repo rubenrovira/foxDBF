@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CrossVault.FoxDbf.Sql\CrossVault.FoxDbf.Sql.csproj" />
+    <ProjectReference Include="..\CrossVault.FoxDbf.Expressions\CrossVault.FoxDbf.Expressions.csproj" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Public" />
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Internal" />
+  </ItemGroup>
+
+</Project>

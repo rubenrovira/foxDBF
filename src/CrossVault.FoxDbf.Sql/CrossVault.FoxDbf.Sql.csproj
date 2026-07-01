@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CS1734</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>CrossVault.FoxDbf.Sql</PackageId>
+    <Version>0.6.0</Version>
+    <Authors>CrossVault</Authors>
+    <Company>CrossVault</Company>
+    <Description>VFP-SQL engine for CrossVault.FoxDbf: a Visual FoxPro SQL parser + AST, a VFP work-area data session (USE/SELECT, .dbc / free-table directory / single .dbf, alias.field), and an executor over the Core Rushmore optimizer + writer — SELECT (projection, WHERE, GROUP BY/HAVING, aggregates, ORDER BY, DISTINCT, TOP, INNER/LEFT/RIGHT/FULL JOIN, UNION, correlated subqueries), DML (INSERT/UPDATE/DELETE with VFP soft-delete) and DDL (CREATE/ALTER/DROP TABLE). Every expression fragment is evaluated by the shared VFP expression engine; SQL '=' follows SET ANSI. Reusable by an ADO.NET provider (CrossVault.FoxDbf.Data) and future stored-procedure tooling.</Description>
+    <PackageTags>foxpro;visualfoxpro;dbf;dbc;sql;vfp-sql;parser;query;xbase;dbase;join</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Public" />
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Internal" />
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Data" />
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.MicroVfp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Core becomes the package dependency (CrossVault.FoxDbf). Expressions is bundled inside the
+         Core package, so it must NOT surface as a separate dependency here — PrivateAssets="all". -->
+    <ProjectReference Include="..\CrossVault.FoxDbf\CrossVault.FoxDbf.csproj" />
+    <ProjectReference Include="..\CrossVault.FoxDbf.Expressions\CrossVault.FoxDbf.Expressions.csproj" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>
