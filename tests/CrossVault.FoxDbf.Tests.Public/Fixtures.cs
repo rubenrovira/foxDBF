@@ -4,8 +4,11 @@ namespace CrossVault.FoxDbf.Tests;
 /// Locates the repo's PUBLIC test data: the Ruby dbf gem fixtures, the VFP9-generated
 /// fixtures under vfp_test/, and the Tastrade sample database (Microsoft's public FoxPro
 /// sample — safe to ship). The repo root is found by walking up from the test output dir
-/// to the .slnx. Real customer data (data/, exportdata/) lives in FixturesInternal instead
-/// (CrossVault.FoxDbf.Tests.Internal-only, never shipped in the public sync).
+/// to the .git entry — NOT CrossVault.FoxDbf.slnx, which only exists in the private
+/// foxDBFInternal repo; this project also runs standalone from the public foxDBF repo,
+/// which has no .slnx at all. Real customer data (data/, exportdata/) lives in
+/// FixturesInternal instead (CrossVault.FoxDbf.Tests.Internal-only, never shipped in the
+/// public sync).
 /// </summary>
 public static class Fixtures
 {
@@ -31,9 +34,9 @@ public static class Fixtures
     private static string FindRepoRoot()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "CrossVault.FoxDbf.slnx")))
+        while (dir is not null && !Directory.Exists(Path.Combine(dir.FullName, ".git")) && !File.Exists(Path.Combine(dir.FullName, ".git")))
             dir = dir.Parent;
         return dir?.FullName
-            ?? throw new DirectoryNotFoundException("Could not locate repo root (CrossVault.FoxDbf.slnx) above " + AppContext.BaseDirectory);
+            ?? throw new DirectoryNotFoundException("Could not locate repo root (.git) above " + AppContext.BaseDirectory);
     }
 }
