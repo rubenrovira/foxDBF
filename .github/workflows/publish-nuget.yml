@@ -1,0 +1,70 @@
+name: Publish NuGet packages
+
+# Publishes the 3 public packages (CrossVault.FoxDbf, CrossVault.FoxDbf.Data, CrossVault.microVFP)
+# to nuget.org using Trusted Publishing (OIDC) — no long-lived API key stored as a GitHub secret.
+# See https://learn.microsoft.com/nuget/nuget-org/trusted-publishing.
+#
+# Deliberately lives HERE (crossvault/foxDBF, the public mirror) rather than in the private
+# foxDBFInternal repo: this way a compromise of this workflow only grants NuGet-publish authority,
+# never anything related to the private repo's secrets or data — trust-domain separation. Runs
+# from THIS repo's own checkout, so paths below are repo-root-relative (no "public/" prefix) and
+# there's no top-level .slnx here (that only exists in the private repo) — the 3 packable projects
+# are packed individually by path instead.
+#
+# One-time setup needed on nuget.org BEFORE this can push anything (external, manual — see this
+# repo's own docs or the private repo's internal packaging notes for context): a Trusted Publishing
+# policy naming THIS repo (Repository Owner: crossvault, Repository: foxDBF), the workflow FILE
+# NAME ONLY (publish-nuget.yml — not the .github/workflows/ path), and optionally the "release"
+# environment below to restrict the policy further.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {} # manual re-run / first deliberate publish
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release # optional GitHub Environment — lets you require manual approval before
+    # a publish runs, and lets the nuget.org Trusted Publishing policy be scoped to just this
+    # environment name (see nuget.org policy setup above)
+    permissions:
+      contents: read
+      id-token: write # required: lets this job request a GitHub OIDC token for NuGet/login
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Run Public test suite
+        run: dotnet test tests/CrossVault.FoxDbf.Tests.Public/CrossVault.FoxDbf.Tests.Public.csproj --configuration Release
+        # This repo has no leak-guard test to run (PublicScopeGuardTests lives in the private
+        # repo's Internal test project, which never syncs here) - that check already ran BEFORE
+        # this code ever reached this repo. This is purely a "does it still work" functional gate.
+
+      - name: Pack the 3 public packages
+        run: |
+          dotnet pack src/CrossVault.FoxDbf/CrossVault.FoxDbf.csproj --configuration Release --output artifacts
+          dotnet pack src/CrossVault.FoxDbf.Data/CrossVault.FoxDbf.Data.csproj --configuration Release --output artifacts
+          dotnet pack src/CrossVault.FoxDbf.MicroVfp/CrossVault.FoxDbf.MicroVfp.csproj --configuration Release --output artifacts
+
+      - name: NuGet login (OIDC → temporary API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          # Recommended by the NuGet docs: a secret holding the nuget.org username (NOT the
+          # email address, NOT an API key — this alone can't publish anything without the OIDC
+          # exchange above matching the configured Trusted Publishing policy).
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Push packages to nuget.org
+        run: |
+          dotnet nuget push "artifacts/*.nupkg" \
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
