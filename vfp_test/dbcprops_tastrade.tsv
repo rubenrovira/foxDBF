@@ -1,0 +1,311 @@
+T	setup	RuleExpression	
+T	setup	InsertTrigger	
+T	setup	UpdateTrigger	
+T	setup	DeleteTrigger	
+F	setup.key_name	DefaultValue	
+F	setup.key_name	RuleExpression	
+F	setup.key_name	RuleText	
+F	setup.value	DefaultValue	
+F	setup.value	RuleExpression	
+F	setup.value	RuleText	
+T	customer	RuleExpression	
+T	customer	InsertTrigger	
+T	customer	UpdateTrigger	__ri_update_customer()
+T	customer	DeleteTrigger	__ri_delete_customer()
+F	customer.customer_id	DefaultValue	
+F	customer.customer_id	RuleExpression	.NOT.EMPTY(customer_id)
+F	customer.customer_id	RuleText	"Customer ID cannot be empty."
+F	customer.company_name	DefaultValue	
+F	customer.company_name	RuleExpression	.NOT.EMPTY(company_name)
+F	customer.company_name	RuleText	"Company name cannot be empty."
+F	customer.contact_name	DefaultValue	
+F	customer.contact_name	RuleExpression	
+F	customer.contact_name	RuleText	
+F	customer.contact_title	DefaultValue	
+F	customer.contact_title	RuleExpression	
+F	customer.contact_title	RuleText	
+F	customer.address	DefaultValue	
+F	customer.address	RuleExpression	
+F	customer.address	RuleText	
+F	customer.city	DefaultValue	
+F	customer.city	RuleExpression	
+F	customer.city	RuleText	
+F	customer.region	DefaultValue	
+F	customer.region	RuleExpression	
+F	customer.region	RuleText	
+F	customer.postal_code	DefaultValue	
+F	customer.postal_code	RuleExpression	
+F	customer.postal_code	RuleText	
+F	customer.country	DefaultValue	
+F	customer.country	RuleExpression	
+F	customer.country	RuleText	
+F	customer.phone	DefaultValue	
+F	customer.phone	RuleExpression	
+F	customer.phone	RuleText	
+F	customer.fax	DefaultValue	
+F	customer.fax	RuleExpression	
+F	customer.fax	RuleText	
+F	customer.max_order_amt	DefaultValue	
+F	customer.max_order_amt	RuleExpression	max_order_amt=>min_order_amt
+F	customer.max_order_amt	RuleText	"Maximum order amount must be greater than or equal to minimum order amount."
+F	customer.min_order_amt	DefaultValue	
+F	customer.min_order_amt	RuleExpression	min_order_amt<=max_order_amt
+F	customer.min_order_amt	RuleText	"Minimum order amount must be less than or equal to maximum order amount."
+F	customer.discount	DefaultValue	0
+F	customer.discount	RuleExpression	
+F	customer.discount	RuleText	
+F	customer.sales_region	DefaultValue	
+F	customer.sales_region	RuleExpression	
+F	customer.sales_region	RuleText	
+T	user_level	RuleExpression	
+T	user_level	InsertTrigger	
+T	user_level	UpdateTrigger	__ri_update_user_level()
+T	user_level	DeleteTrigger	__ri_delete_user_level()
+F	user_level.group_id	DefaultValue	
+F	user_level.group_id	RuleExpression	
+F	user_level.group_id	RuleText	
+F	user_level.description	DefaultValue	
+F	user_level.description	RuleExpression	
+F	user_level.description	RuleText	
+F	user_level.startup_action	DefaultValue	
+F	user_level.startup_action	RuleExpression	
+F	user_level.startup_action	RuleText	
+T	supplier	RuleExpression	
+T	supplier	InsertTrigger	
+T	supplier	UpdateTrigger	__ri_update_supplier()
+T	supplier	DeleteTrigger	__ri_delete_supplier()
+F	supplier.supplier_id	DefaultValue	newid()
+F	supplier.supplier_id	RuleExpression	
+F	supplier.supplier_id	RuleText	
+F	supplier.company_name	DefaultValue	
+F	supplier.company_name	RuleExpression	.NOT.EMPTY(company_name)
+F	supplier.company_name	RuleText	"Company name cannot be empty."
+F	supplier.contact_name	DefaultValue	
+F	supplier.contact_name	RuleExpression	
+F	supplier.contact_name	RuleText	
+F	supplier.contact_title	DefaultValue	
+F	supplier.contact_title	RuleExpression	
+F	supplier.contact_title	RuleText	
+F	supplier.address	DefaultValue	
+F	supplier.address	RuleExpression	
+F	supplier.address	RuleText	
+F	supplier.city	DefaultValue	
+F	supplier.city	RuleExpression	
+F	supplier.city	RuleText	
+F	supplier.region	DefaultValue	
+F	supplier.region	RuleExpression	
+F	supplier.region	RuleText	
+F	supplier.postal_code	DefaultValue	
+F	supplier.postal_code	RuleExpression	
+F	supplier.postal_code	RuleText	
+F	supplier.country	DefaultValue	
+F	supplier.country	RuleExpression	
+F	supplier.country	RuleText	
+F	supplier.phone	DefaultValue	
+F	supplier.phone	RuleExpression	
+F	supplier.phone	RuleText	
+F	supplier.fax	DefaultValue	
+F	supplier.fax	RuleExpression	
+F	supplier.fax	RuleText	
+T	shippers	RuleExpression	
+T	shippers	InsertTrigger	
+T	shippers	UpdateTrigger	__ri_update_shippers()
+T	shippers	DeleteTrigger	__ri_delete_shippers()
+F	shippers.shipper_id	DefaultValue	newid()
+F	shippers.shipper_id	RuleExpression	
+F	shippers.shipper_id	RuleText	
+F	shippers.company_name	DefaultValue	
+F	shippers.company_name	RuleExpression	.NOT.EMPTY(company_name)
+F	shippers.company_name	RuleText	"Company name cannot be empty."
+T	products	RuleExpression	
+T	products	InsertTrigger	__ri_insert_products()
+T	products	UpdateTrigger	__ri_update_products()
+T	products	DeleteTrigger	__ri_delete_products()
+F	products.product_id	DefaultValue	newid()
+F	products.product_id	RuleExpression	
+F	products.product_id	RuleText	
+F	products.supplier_id	DefaultValue	
+F	products.supplier_id	RuleExpression	
+F	products.supplier_id	RuleText	
+F	products.category_id	DefaultValue	
+F	products.category_id	RuleExpression	
+F	products.category_id	RuleText	
+F	products.product_name	DefaultValue	
+F	products.product_name	RuleExpression	.NOT.EMPTY(product_name)
+F	products.product_name	RuleText	"Product name cannot be empty."
+F	products.english_name	DefaultValue	
+F	products.english_name	RuleExpression	
+F	products.english_name	RuleText	
+F	products.quantity_in_unit	DefaultValue	
+F	products.quantity_in_unit	RuleExpression	
+F	products.quantity_in_unit	RuleText	
+F	products.unit_price	DefaultValue	
+F	products.unit_price	RuleExpression	
+F	products.unit_price	RuleText	
+F	products.unit_cost	DefaultValue	
+F	products.unit_cost	RuleExpression	
+F	products.unit_cost	RuleText	
+F	products.units_in_stock	DefaultValue	0
+F	products.units_in_stock	RuleExpression	
+F	products.units_in_stock	RuleText	
+F	products.units_on_order	DefaultValue	0
+F	products.units_on_order	RuleExpression	
+F	products.units_on_order	RuleText	
+F	products.reorder_level	DefaultValue	0
+F	products.reorder_level	RuleExpression	
+F	products.reorder_level	RuleText	
+F	products.discontinued	DefaultValue	
+F	products.discontinued	RuleExpression	
+F	products.discontinued	RuleText	
+T	order_line_items	RuleExpression	
+T	order_line_items	InsertTrigger	__ri_insert_order_line_items()
+T	order_line_items	UpdateTrigger	__ri_update_order_line_items()
+T	order_line_items	DeleteTrigger	
+F	order_line_items.order_id	DefaultValue	
+F	order_line_items.order_id	RuleExpression	
+F	order_line_items.order_id	RuleText	
+F	order_line_items.product_id	DefaultValue	
+F	order_line_items.product_id	RuleExpression	
+F	order_line_items.product_id	RuleText	
+F	order_line_items.unit_price	DefaultValue	
+F	order_line_items.unit_price	RuleExpression	
+F	order_line_items.unit_price	RuleText	
+F	order_line_items.quantity	DefaultValue	1
+F	order_line_items.quantity	RuleExpression	
+F	order_line_items.quantity	RuleText	
+T	orders	RuleExpression	valorder()
+T	orders	InsertTrigger	__ri_insert_orders()
+T	orders	UpdateTrigger	__ri_update_orders()
+T	orders	DeleteTrigger	__ri_delete_orders()
+F	orders.order_id	DefaultValue	newid()
+F	orders.order_id	RuleExpression	
+F	orders.order_id	RuleText	
+F	orders.customer_id	DefaultValue	
+F	orders.customer_id	RuleExpression	
+F	orders.customer_id	RuleText	
+F	orders.shipper_id	DefaultValue	
+F	orders.shipper_id	RuleExpression	
+F	orders.shipper_id	RuleText	
+F	orders.order_number	DefaultValue	newid("order_number")
+F	orders.order_number	RuleExpression	
+F	orders.order_number	RuleText	
+F	orders.order_date	DefaultValue	DATE()
+F	orders.order_date	RuleExpression	
+F	orders.order_date	RuleText	
+F	orders.ship_to_name	DefaultValue	
+F	orders.ship_to_name	RuleExpression	
+F	orders.ship_to_name	RuleText	
+F	orders.ship_to_address	DefaultValue	
+F	orders.ship_to_address	RuleExpression	
+F	orders.ship_to_address	RuleText	
+F	orders.ship_to_city	DefaultValue	
+F	orders.ship_to_city	RuleExpression	
+F	orders.ship_to_city	RuleText	
+F	orders.ship_to_region	DefaultValue	
+F	orders.ship_to_region	RuleExpression	
+F	orders.ship_to_region	RuleText	
+F	orders.ship_to_postal_code	DefaultValue	
+F	orders.ship_to_postal_code	RuleExpression	
+F	orders.ship_to_postal_code	RuleText	
+F	orders.ship_to_country	DefaultValue	
+F	orders.ship_to_country	RuleExpression	
+F	orders.ship_to_country	RuleText	
+F	orders.discount	DefaultValue	0
+F	orders.discount	RuleExpression	
+F	orders.discount	RuleText	
+F	orders.freight	DefaultValue	
+F	orders.freight	RuleExpression	
+F	orders.freight	RuleText	
+F	orders.paid	DefaultValue	
+F	orders.paid	RuleExpression	
+F	orders.paid	RuleText	
+F	orders.deliver_by	DefaultValue	DATE()+7
+F	orders.deliver_by	RuleExpression	deliver_by=>order_date
+F	orders.deliver_by	RuleText	"Cannot be earlier than Order Date"
+F	orders.notes	DefaultValue	
+F	orders.notes	RuleExpression	
+F	orders.notes	RuleText	
+F	orders.employee_id	DefaultValue	defaultemployee()
+F	orders.employee_id	RuleExpression	
+F	orders.employee_id	RuleText	
+T	employee	RuleExpression	
+T	employee	InsertTrigger	__ri_insert_employee()
+T	employee	UpdateTrigger	__ri_update_employee()
+T	employee	DeleteTrigger	__ri_delete_employee()
+F	employee.employee_id	DefaultValue	newid()
+F	employee.employee_id	RuleExpression	
+F	employee.employee_id	RuleText	
+F	employee.last_name	DefaultValue	
+F	employee.last_name	RuleExpression	.NOT.EMPTY(last_name)
+F	employee.last_name	RuleText	"Last name cannot be empty."
+F	employee.first_name	DefaultValue	
+F	employee.first_name	RuleExpression	
+F	employee.first_name	RuleText	
+F	employee.title	DefaultValue	
+F	employee.title	RuleExpression	
+F	employee.title	RuleText	
+F	employee.birth_date	DefaultValue	
+F	employee.birth_date	RuleExpression	
+F	employee.birth_date	RuleText	
+F	employee.hire_date	DefaultValue	
+F	employee.hire_date	RuleExpression	
+F	employee.hire_date	RuleText	
+F	employee.address	DefaultValue	
+F	employee.address	RuleExpression	
+F	employee.address	RuleText	
+F	employee.city	DefaultValue	
+F	employee.city	RuleExpression	
+F	employee.city	RuleText	
+F	employee.region	DefaultValue	
+F	employee.region	RuleExpression	
+F	employee.region	RuleText	
+F	employee.postal_code	DefaultValue	
+F	employee.postal_code	RuleExpression	
+F	employee.postal_code	RuleText	
+F	employee.country	DefaultValue	
+F	employee.country	RuleExpression	
+F	employee.country	RuleText	
+F	employee.home_phone	DefaultValue	
+F	employee.home_phone	RuleExpression	
+F	employee.home_phone	RuleText	
+F	employee.extension	DefaultValue	
+F	employee.extension	RuleExpression	
+F	employee.extension	RuleText	
+F	employee.group_id	DefaultValue	
+F	employee.group_id	RuleExpression	
+F	employee.group_id	RuleText	
+F	employee.sales_region	DefaultValue	
+F	employee.sales_region	RuleExpression	
+F	employee.sales_region	RuleText	
+F	employee.password	DefaultValue	"Tastrade"
+F	employee.password	RuleExpression	
+F	employee.password	RuleText	
+F	employee.photo_file	DefaultValue	
+F	employee.photo_file	RuleExpression	
+F	employee.photo_file	RuleText	
+F	employee.notes	DefaultValue	
+F	employee.notes	RuleExpression	
+F	employee.notes	RuleText	
+F	employee.photo	DefaultValue	
+F	employee.photo	RuleExpression	
+F	employee.photo	RuleText	
+T	category	RuleExpression	
+T	category	InsertTrigger	
+T	category	UpdateTrigger	__ri_update_category()
+T	category	DeleteTrigger	__ri_delete_category()
+F	category.category_id	DefaultValue	newid()
+F	category.category_id	RuleExpression	
+F	category.category_id	RuleText	
+F	category.category_name	DefaultValue	
+F	category.category_name	RuleExpression	.NOT.EMPTY(category_name)
+F	category.category_name	RuleText	"Category name cannot be empty."
+F	category.description	DefaultValue	
+F	category.description	RuleExpression	
+F	category.description	RuleText	
+F	category.picture_file	DefaultValue	
+F	category.picture_file	RuleExpression	
+F	category.picture_file	RuleText	
+F	category.picture	DefaultValue	
+F	category.picture	RuleExpression	
+F	category.picture	RuleText	
+DONE	10
