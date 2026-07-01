@@ -443,6 +443,7 @@ public sealed class VfpInterpreter
         if (Has("field") && Has("rule")) return 1582;            // field validation rule violated.
         if (Has("record") && Has("rule")) return 1583;           // record (table) validation rule violated.
         if (Has("rule violated") || Has("violates the rule")) return 1582; // bare rule-text → field-rule class.
+        if (Has("session number is invalid")) return 1540;       // SET DATASESSION TO <non-existent session>.
         if (Has("locked") || Has("not locked") || Has("lock")) return 130; // record/file is in use / locked.
         if (Has("not found") || Has("does not exist")) return 1; // "File does not exist".
         if (Has("data type") || Has("type mismatch") || Has("not the same data type")) return 9; // type mismatch.
@@ -1234,11 +1235,28 @@ public sealed class VfpInterpreter
             case "COLLATE": SetCollate(arg); break;             // baked into the next INDEX tag; SET("COLLATE").
             case "UNIQUE": Runtime.Unique = OnOff(arg); break;  // session default for a clause-less INDEX; SET("UNIQUE").
             case "KEY": SetKey(arg); break;                     // master-index visible key range; feeds Visible().
+            case "DATASESSION": SetDataSession(arg); break;     // single-session stub; TO 1 no-op, else err 1540.
             default: break; // TALK / COMPATIBLE / DATA / PROCEDURE / … — irrelevant to results.
         }
     }
 
     private static bool OnOff(string s) => s.Trim().StartsWith("ON", StringComparison.OrdinalIgnoreCase);
+
+    // SET DATASESSION TO n — in real VFP this switches among data sessions, but private data sessions
+    // only ever come from forms (DataSession=2); a bare PRG/SP interpreter has just the default public
+    // session #1. So this is a faithful single-session stub: TO 1 is a no-op; ANY other id (0, 5, …) is
+    // an invalid session → VFP error 1540 "Session number is invalid." (verified against vfp9.exe:
+    // SET("DATASESSION") is NUMERIC 1; TO 1 ok; TO 0 and TO 5 both raise 1540). SET("DATASESSION")=1 is
+    // returned by FnSet. Full multi-session work-area registry is the deferred P3 architecture item.
+    private void SetDataSession(string arg)
+    {
+        string s = arg.Trim();
+        if (s.StartsWith("TO", StringComparison.OrdinalIgnoreCase)) s = s.Substring(2).Trim();
+        var v = EvalText(s);
+        int n = IsNumeric(v) ? (int)v.AsNumber : int.TryParse(v.AsString, out var p) ? p : -1;
+        if (n == 1) return;   // the only session microVFP has → no-op.
+        throw new MicroVfpRuntimeException("Session number is invalid.");   // VFP error 1540.
+    }
 
     private void SetReprocess(string arg)
     {
@@ -2235,6 +2253,7 @@ public sealed class VfpInterpreter
             "UNIQUE" => VfpValue.Character(Runtime.Unique ? "ON" : "OFF"),
             "RELATION" => VfpValue.Character(RelationSetString(Session.CurrentArea)),  // reproduces the SET RELATION args.
             "SKIP" => VfpValue.Character(SkipSetString(Session.CurrentArea)),          // comma-list of 1:n aliases.
+            "DATASESSION" => VfpValue.Number(1m),   // NUMERIC (verified vs vfp9.exe) — single public session.
             "TALK" => VfpValue.Character("OFF"),
             "COMPATIBLE" => VfpValue.Character("OFF"),
             _ => VfpValue.Character(string.Empty),
