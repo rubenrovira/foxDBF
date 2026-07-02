@@ -43,6 +43,7 @@ internal static class MicroVfpExprRewrite
         s = QuoteArrayFnArg(s, "ALEN");
         s = QuoteArrayFnArg(s, "AERROR");
         s = QuoteArrayFnArg(s, "ATAGINFO");   // ATAGINFO(ArrayName [, cTagFile [, area]]) — name by reference.
+        s = QuoteArrayFnArg(s, "ALINES");     // ALINES(ArrayName, cExpr [, …]) — array name by reference.
         s = QuoteLookupArgs(s);               // LOOKUP(rReturn, eSearch, rSearched [, cTag]) — field names by reference.
         return s;
     }

@@ -3116,6 +3116,25 @@ public sealed class VfpInterpreter
             case "CURVAL": r = FnCurVal(a); return true;
             case "MESSAGEBOX": r = VfpValue.Integer(6); return true;           // IDYES (never reached in targets).
             case "COCREATEGUID": r = FnCoCreateGuid(); return true;
+
+            // ─── P2 scalar/string batch (MICROVFP_EXTENSIONS_BACKLOG C.18) — STUBS, RED until implemented ───
+            case "VARTYPE": r = FnVartype(a); return true;
+            case "TRANSFORM": r = FnTransform(a); return true;
+            case "PROPER": r = FnProper(a); return true;
+            case "ISLOWER": r = VfpValue.Logical(FnIsLower(a)); return true;
+            case "ISUPPER": r = VfpValue.Logical(FnIsUpper(a)); return true;
+            case "STREXTRACT": r = VfpValue.Character(FnStrExtract(a)); return true;
+            case "GETWORDCOUNT": r = VfpValue.Integer(FnGetWordCount(a)); return true;
+            case "GETWORDNUM": r = VfpValue.Character(FnGetWordNum(a)); return true;
+            case "SOUNDEX": r = VfpValue.Character(FnSoundex(a)); return true;
+            case "DIFFERENCE": r = VfpValue.Integer(FnDifference(a)); return true;
+            case "STRCONV": r = VfpValue.Character(FnStrConv(a)); return true;
+            case "CPCONVERT": r = VfpValue.Character(FnCpConvert(a)); return true;
+            case "CPCURRENT": r = VfpValue.Integer(FnCpCurrent(a)); return true;
+            case "CPDBF": r = VfpValue.Integer(FnCpDbf(a)); return true;
+            case "TEXTMERGE": r = VfpValue.Character(FnTextMerge(a)); return true;
+            case "ALINES": r = VfpValue.Integer(FnAlines(a)); return true;
+
             default: r = VfpValue.Null; return false;
         }
     }
@@ -3227,6 +3246,8 @@ public sealed class VfpInterpreter
             // equal VFP9's. Stable + non-crashing: both halves come from the OS identity.
             case 0: return VfpValue.Character($"{Environment.MachineName} # {Environment.UserName}");
             case 1: return VfpValue.Character(JulianDay(DateTime.Today).ToString(CultureInfo.InvariantCulture));
+            // SYS(10, nJulianDay) — Julian-day number → date string (inverse of SYS(11)). STUB, RED until implemented.
+            case 10: return FnSys10(a);
             // SYS(14, nIndexNumber [, area]) — the KEY expression of the nth open index, ALL-CAPS (s4g266).
             // Unlike KEY(), SYS(14) REQUIRES the index number; an out-of-range number yields "" (no error).
             case 14:
@@ -3464,6 +3485,475 @@ public sealed class VfpInterpreter
         Random.Shared.NextBytes(bytes);
         Memory.Set("lcBuffer", VfpValue.Character(Encoding.Latin1.GetString(bytes)));
         return VfpValue.Integer(0);
+    }
+
+    // ─────────────────────────── P2 scalar/string batch ───────────────────────────
+    // Authoritative semantics: MICROVFP_EXTENSIONS_BACKLOG.md §C.18 + verified empirically against the
+    // VFP9 runtime (TRANSFORM pictures / SOUNDEX quirks / PROPER edge cases confirmed byte-for-byte).
+
+    /// <summary>The default word separators for GETWORDCOUNT()/GETWORDNUM() (space, tab, LF, CR).</summary>
+    private const string DefaultWordDelims = " \t\n\r";
+
+    /// <summary>VARTYPE(eExpr [, lNullDataType]): the 1-letter type code of the ALREADY-evaluated value
+    /// (unlike TYPE(), which macro-evaluates a string). NULL → "X" (the VFP quirk) unless lNullDataType is
+    /// set — but a bare .NULL. carries no base type, so it stays "X".</summary>
+    private VfpValue FnVartype(VfpValue[] a)
+    {
+        if (a.Length == 0) return VfpValue.Character("U");
+        var v = a[0];
+        if (v.Type == VfpType.Null) return VfpValue.Character("X");
+        string code = v.Type switch
+        {
+            VfpType.Character => "C",
+            VfpType.Numeric or VfpType.Integer => "N",
+            VfpType.Currency => "Y",
+            VfpType.Date => "D",
+            VfpType.DateTime => "T",
+            VfpType.Logical => "L",
+            _ => "U",
+        };
+        return VfpValue.Character(code);
+    }
+
+    /// <summary>TRANSFORM(eExpr [, cFormatCodes]): picture/@-function formatting of any value. Without a
+    /// format the value's default stringification is used; with one, the @-function codes (@! upper, @0 hex)
+    /// and numeric PICTURE templates (9/#/,/.) are honoured.</summary>
+    private VfpValue FnTransform(VfpValue[] a)
+    {
+        if (a.Length == 0) return VfpValue.Character(string.Empty);
+        var v = a[0];
+        string fmt = a.Length > 1 && a[1].Type == VfpType.Character ? a[1].AsString : string.Empty;
+        if (fmt.Length == 0) return VfpValue.Character(TransformNoFormat(v));
+
+        // Split "@<funcs> <picture>" — the @-run ends at the first space; the rest is the PICTURE template.
+        string funcs = string.Empty, picture = fmt;
+        if (fmt[0] == '@')
+        {
+            int sp = fmt.IndexOf(' ');
+            if (sp < 0) { funcs = fmt[1..]; picture = string.Empty; }
+            else { funcs = fmt.Substring(1, sp - 1); picture = fmt[(sp + 1)..]; }
+        }
+        bool hex = funcs.Contains('0');
+        bool upper = funcs.Contains('!');
+
+        if (v.Type is VfpType.Numeric or VfpType.Integer or VfpType.Currency)
+        {
+            if (hex) return VfpValue.Character("0x" + ((uint)v.AsInteger).ToString("X8", CultureInfo.InvariantCulture));
+            if (picture.Length > 0) return VfpValue.Character(FormatNumericPicture(v.AsNumber, picture));
+            return VfpValue.Character(TransformNoFormat(v));
+        }
+        if (v.Type == VfpType.Character)
+        {
+            string s = v.AsString;
+            if (upper) s = s.ToUpperInvariant();
+            return VfpValue.Character(s);
+        }
+        if (v.Type == VfpType.Logical)
+        {
+            if (picture.Contains('Y') || picture.Contains('y')) return VfpValue.Character(v.AsLogical ? "Y" : "N");
+            return VfpValue.Character(v.AsLogical ? "T" : "F");
+        }
+        return VfpValue.Character(TransformNoFormat(v));
+    }
+
+    /// <summary>The default (format-less) TRANSFORM/TEXTMERGE stringification of a value.</summary>
+    private static string TransformNoFormat(VfpValue v) => v.Type switch
+    {
+        VfpType.Character => v.AsString,
+        // VFP9 (runtime-verified): the format-less TRANSFORM of a logical is the ".T."/".F." literal, NOT "T"/"F".
+        VfpType.Logical => v.AsLogical ? ".T." : ".F.",
+        VfpType.Null => ".NULL.",
+        VfpType.Date => v.AsDate == default ? new string(' ', 10) : v.AsDate.ToString("MM/dd/yyyy", CultureInfo.InvariantCulture),
+        VfpType.DateTime => v.AsDateTime.ToString("MM/dd/yyyy hh:mm:ss tt", CultureInfo.InvariantCulture),
+        VfpType.Numeric or VfpType.Integer or VfpType.Currency => NumberToPlainString(v.AsNumber),
+        _ => v.ToString(),
+    };
+
+    /// <summary>A numeric value as its shortest exact decimal string (no leading/trailing padding, trailing
+    /// fractional zeros trimmed): 5→"5", 1234.5→"1234.5", 1234.50→"1234.5".</summary>
+    private static string NumberToPlainString(decimal d)
+    {
+        string s = d.ToString(CultureInfo.InvariantCulture);
+        if (s.Contains('.')) s = s.TrimEnd('0').TrimEnd('.');
+        return s;
+    }
+
+    /// <summary>Render <paramref name="value"/> onto a numeric PICTURE template (9/# digit slots, ',' grouping,
+    /// '.' decimal point, '*' fill). Digits fill right-to-left; the sign takes the slot left of the top digit;
+    /// unfilled slots become spaces and grouping is suppressed in the pad area.</summary>
+    private static string FormatNumericPicture(decimal value, string picture)
+    {
+        int dot = picture.IndexOf('.');
+        string intPat = dot < 0 ? picture : picture[..dot];
+        string decPat = dot < 0 ? string.Empty : picture[(dot + 1)..];
+        int decCount = decPat.Count(ch => ch is '9' or '#');
+
+        decimal absRounded = Math.Round(Math.Abs(value), decCount, MidpointRounding.AwayFromZero);
+        bool neg = value < 0;
+        string fixedStr = absRounded.ToString("F" + decCount, CultureInfo.InvariantCulture);
+        int fdot = fixedStr.IndexOf('.');
+        string intDigits = fdot < 0 ? fixedStr : fixedStr[..fdot];
+        string decDigits = fdot < 0 ? string.Empty : fixedStr[(fdot + 1)..];
+        string body = (neg ? "-" : string.Empty) + intDigits;
+
+        var outChars = new List<char>();
+        int bi = body.Length - 1;
+        for (int pi = intPat.Length - 1; pi >= 0; pi--)
+        {
+            char t = intPat[pi];
+            switch (t)
+            {
+                case '9':
+                case '#':
+                    if (bi >= 0) outChars.Add(body[bi--]); else outChars.Add(' ');
+                    break;
+                case ',':
+                    outChars.Add(bi >= 0 && char.IsDigit(body[bi]) ? ',' : ' ');
+                    break;
+                case '*':
+                    if (bi >= 0) outChars.Add(body[bi--]); else outChars.Add('*');
+                    break;
+                default:
+                    outChars.Add(t);
+                    break;
+            }
+        }
+        while (bi >= 0) outChars.Add(body[bi--]);   // picture too narrow → keep the overflow digits.
+        outChars.Reverse();
+        string intResult = new string(outChars.ToArray());
+        return decCount > 0 ? intResult + "." + decDigits : intResult;
+    }
+
+    /// <summary>PROPER(cStr): upper-case the FIRST character of each space-delimited word, lower-case the
+    /// rest. Deliberately as "simple-minded" as VFP — Mc/Mac and apostrophes are NOT special (the documented
+    /// PROPER weakness): "mcDONALD"→"Mcdonald", "o'brien"→"O'brien".</summary>
+    private VfpValue FnProper(VfpValue[] a)
+    {
+        if (a.Length == 0) return VfpValue.Character(string.Empty);
+        string s = a[0].AsString;
+        var sb = new StringBuilder(s.Length);
+        bool atWordStart = true;
+        foreach (char c in s)
+        {
+            if (c == ' ') { sb.Append(c); atWordStart = true; }
+            else { sb.Append(atWordStart ? char.ToUpperInvariant(c) : char.ToLowerInvariant(c)); atWordStart = false; }
+        }
+        return VfpValue.Character(sb.ToString());
+    }
+
+    /// <summary>ISLOWER(cStr): the FIRST character is a lowercase letter (empty/non-alpha → .F.).</summary>
+    private static bool FnIsLower(VfpValue[] a) => a.Length > 0 && a[0].AsString.Length > 0 && char.IsLower(a[0].AsString[0]);
+
+    /// <summary>ISUPPER(cStr): the FIRST character is an uppercase letter (empty/non-alpha → .F.).</summary>
+    private static bool FnIsUpper(VfpValue[] a) => a.Length > 0 && a[0].AsString.Length > 0 && char.IsUpper(a[0].AsString[0]);
+
+    /// <summary>STREXTRACT(cSearched, cBegin [, cEnd [, nOcc [, nFlags]]]): the substring after the
+    /// nOcc-th cBegin up to cEnd (or end-of-string when cEnd is empty). nFlags bit 1 = case-insensitive;
+    /// bit 2 = return the remainder when cEnd is present but not found.</summary>
+    private static string FnStrExtract(VfpValue[] a)
+    {
+        if (a.Length < 2) return string.Empty;
+        string searched = a[0].AsString;
+        string begin = a[1].AsString;
+        string end = a.Length > 2 ? a[2].AsString : string.Empty;
+        int occ = a.Length > 3 ? (int)a[3].AsNumber : 1;
+        int flags = a.Length > 4 ? (int)a[4].AsNumber : 0;
+        if (occ < 1) occ = 1;
+        var cmp = (flags & 1) != 0 ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        bool remainderIfNoEnd = (flags & 2) != 0;
+
+        if (begin.Length == 0) return string.Empty;
+        int idx = -1, from = 0;
+        for (int k = 0; k < occ; k++)
+        {
+            idx = searched.IndexOf(begin, from, cmp);
+            if (idx < 0) return string.Empty;
+            from = idx + begin.Length;
+        }
+        int start = idx + begin.Length;
+        if (end.Length == 0) return searched[start..];
+        int endIdx = searched.IndexOf(end, start, cmp);
+        if (endIdx < 0) return remainderIfNoEnd ? searched[start..] : string.Empty;
+        return searched.Substring(start, endIdx - start);
+    }
+
+    /// <summary>Split <paramref name="s"/> into "words" on any single character in <paramref name="delims"/>,
+    /// collapsing runs (no empty words) — the shared engine for GETWORDCOUNT/GETWORDNUM.</summary>
+    private static List<string> GetWords(string s, string delims)
+    {
+        var res = new List<string>();
+        int i = 0, n = s.Length;
+        while (i < n)
+        {
+            while (i < n && delims.IndexOf(s[i]) >= 0) i++;
+            if (i >= n) break;
+            int start = i;
+            while (i < n && delims.IndexOf(s[i]) < 0) i++;
+            res.Add(s[start..i]);
+        }
+        return res;
+    }
+
+    /// <summary>GETWORDCOUNT(cStr [, cDelims]): word count. cDelims (a LIST of single-char separators)
+    /// REPLACES the defaults (space/tab/LF/CR).</summary>
+    private static int FnGetWordCount(VfpValue[] a)
+    {
+        if (a.Length == 0) return 0;
+        string delims = a.Length > 1 && a[1].Type == VfpType.Character && a[1].AsString.Length > 0 ? a[1].AsString : DefaultWordDelims;
+        return GetWords(a[0].AsString, delims).Count;
+    }
+
+    /// <summary>GETWORDNUM(cStr, nIndex [, cDelims]): the nIndex-th word (1-based). No bounds error — an
+    /// out-of-range / non-positive index silently returns "" (the documented VFP quirk).</summary>
+    private static string FnGetWordNum(VfpValue[] a)
+    {
+        if (a.Length < 2) return string.Empty;
+        string delims = a.Length > 2 && a[2].Type == VfpType.Character && a[2].AsString.Length > 0 ? a[2].AsString : DefaultWordDelims;
+        var words = GetWords(a[0].AsString, delims);
+        int n = (int)a[1].AsNumber;
+        return n >= 1 && n <= words.Count ? words[n - 1] : string.Empty;
+    }
+
+    /// <summary>The classic (simple) Soundex code (1 letter + 3 digits) VFP returns — verified against the
+    /// VFP9 runtime incl. its quirks (first char kept verbatim; H/W transparent; adjacent same-code merge;
+    /// empty → "0000").</summary>
+    private static string SoundexCode(string s)
+    {
+        if (s.Length == 0) return "0000";
+        char first = s[0];
+        var sb = new StringBuilder(4);
+        sb.Append(char.IsLetter(first) ? char.ToUpperInvariant(first) : first);
+        int prev = SoundexDigit(first);
+        for (int i = 1; i < s.Length && sb.Length < 4; i++)
+        {
+            int d = SoundexDigit(s[i]);
+            if (d != 0 && d != prev) sb.Append((char)('0' + d));
+            prev = d;
+        }
+        while (sb.Length < 4) sb.Append('0');
+        return sb.ToString();
+    }
+
+    private static int SoundexDigit(char c) => char.ToUpperInvariant(c) switch
+    {
+        'B' or 'F' or 'P' or 'V' => 1,
+        'C' or 'G' or 'J' or 'K' or 'Q' or 'S' or 'X' or 'Z' => 2,
+        'D' or 'T' => 3,
+        'L' => 4,
+        'M' or 'N' => 5,
+        'R' => 6,
+        _ => 0,
+    };
+
+    /// <summary>SOUNDEX(cStr): phonetic code (see <see cref="SoundexCode"/>).</summary>
+    private static string FnSoundex(VfpValue[] a) => SoundexCode(a.Length > 0 ? a[0].AsString : string.Empty);
+
+    /// <summary>DIFFERENCE(cStr1, cStr2): count of position-wise matching Soundex characters (0..4).</summary>
+    private static int FnDifference(VfpValue[] a)
+    {
+        if (a.Length < 2) return 0;
+        string c1 = SoundexCode(a[0].AsString), c2 = SoundexCode(a[1].AsString);
+        int match = 0;
+        for (int i = 0; i < 4; i++) if (c1[i] == c2[i]) match++;
+        return match;
+    }
+
+    /// <summary>STRCONV(cExpr, nConversion [, ...]): the common, runtime-verified conversion codes. A VFP
+    /// character value is a byte string; the connection stores those bytes as Latin1 chars (byte==char code).
+    /// The codepage is the connection's Windows-ANSI codepage (== CPCURRENT()). Verified byte-for-byte against
+    /// the VFP9 runtime for input "Ab"+CHR(233):
+    ///   5 = codepage → double-byte Unicode (UTF-16LE)   ["Ab é" → 41 00 62 00 E9 00]
+    ///   6 = double-byte Unicode (UTF-16LE) → codepage   (inverse of 5)
+    ///   7 = lower-case (locale)                          ["Ab é" → "ab é"]
+    ///   8 = upper-case (locale)                          ["Ab é" → "AB É"]
+    ///   9 = codepage → UTF-8                             ["Ab é" → 41 62 C3 A9]
+    ///  10 = UTF-8 → codepage                             (inverse of 9)
+    /// FLAGGED (not runtime-distinct on an SBCS/1252 connection — pass through unchanged, matching the runtime
+    /// for such content): 1/2/3/4 (single↔double-byte DBCS locale conversions) and any other/exotic code.</summary>
+    private string FnStrConv(VfpValue[] a)
+    {
+        if (a.Length < 2) return a.Length > 0 ? a[0].AsString : string.Empty;
+        string s = a[0].AsString;
+        int mode = (int)a[1].AsNumber;
+        var l1 = Encoding.Latin1;
+        var cp = ConnectionEncoding();
+        byte[] bytes = l1.GetBytes(s);   // the connection's byte string.
+        try
+        {
+            switch (mode)
+            {
+                case 5:   // codepage bytes → UTF-16LE bytes
+                    return l1.GetString(Encoding.Unicode.GetBytes(cp.GetString(bytes)));
+                case 6:   // UTF-16LE bytes → codepage bytes
+                    return l1.GetString(cp.GetBytes(Encoding.Unicode.GetString(bytes)));
+                case 7:   // lower-case (locale)
+                    return l1.GetString(cp.GetBytes(cp.GetString(bytes).ToLower(CultureInfo.CurrentCulture)));
+                case 8:   // upper-case (locale)
+                    return l1.GetString(cp.GetBytes(cp.GetString(bytes).ToUpper(CultureInfo.CurrentCulture)));
+                case 9:   // codepage → UTF-8
+                    return l1.GetString(Encoding.UTF8.GetBytes(cp.GetString(bytes)));
+                case 10:  // UTF-8 → codepage
+                    return l1.GetString(cp.GetBytes(Encoding.UTF8.GetString(bytes)));
+                default:  // FLAG: DBCS single↔double-byte locale modes / exotic codes — pass through.
+                    return s;
+            }
+        }
+        catch (Exception ex) when (ex is ArgumentException or DecoderFallbackException or EncoderFallbackException)
+        {
+            return s;   // malformed input for the requested conversion — degrade to the input (no error).
+        }
+    }
+
+    /// <summary>The connection's Windows-ANSI code page as an <see cref="Encoding"/> (== CPCURRENT()); falls
+    /// back to Latin1 if the codepage cannot be resolved on this platform.</summary>
+    private static Encoding ConnectionEncoding()
+    {
+        try { return Encoding.GetEncoding(CultureInfo.CurrentCulture.TextInfo.ANSICodePage); }
+        catch (ArgumentException) { return Encoding.Latin1; }
+    }
+
+    /// <summary>CPCONVERT(nCurrentCP, nNewCP, cExpr): transcode cExpr between code pages. Same CP ⇒ identity;
+    /// otherwise best-effort via the registered code-page provider, degrading to the input on any failure.</summary>
+    private static string FnCpConvert(VfpValue[] a)
+    {
+        if (a.Length < 3) return a.Length > 2 ? a[2].AsString : string.Empty;
+        int from = (int)a[0].AsNumber, to = (int)a[1].AsNumber;
+        string s = a[2].AsString;
+        if (from == to) return s;
+        try
+        {
+            var srcEnc = Encoding.GetEncoding(from);
+            var dstEnc = Encoding.GetEncoding(to);
+            byte[] raw = Encoding.Latin1.GetBytes(s);   // the connection stores single-byte text as Latin1.
+            byte[] converted = Encoding.Convert(srcEnc, dstEnc, raw);
+            return Encoding.Latin1.GetString(converted);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+        {
+            return s;
+        }
+    }
+
+    /// <summary>CPCURRENT([1|2]): the current system code page — 1 (default) = Windows ANSI, 2 = the
+    /// underlying OEM/DOS code page.</summary>
+    private static int FnCpCurrent(VfpValue[] a)
+    {
+        bool oem = a.Length > 0 && IsNumeric(a[0]) && (int)a[0].AsNumber == 2;
+        var ti = CultureInfo.CurrentCulture.TextInfo;
+        return oem ? ti.OEMCodePage : ti.ANSICodePage;
+    }
+
+    /// <summary>CPDBF([cAlias|nArea]): the code page marked in the addressed (or current) table's header,
+    /// as a VFP code-page id; 0 when no table is open.</summary>
+    private int FnCpDbf(VfpValue[] a)
+    {
+        var wa = AreaArg(a, 0);
+        return wa?.Table.Encoding.CodePage ?? 0;
+    }
+
+    /// <summary>TEXTMERGE(cExpr [, lParse [, cDelimBegin [, cDelimEnd]]]): replace every &lt;&lt;expr&gt;&gt;
+    /// placeholder with the default stringification of the evaluated expression (a one-liner TEXT…ENDTEXT
+    /// engine). The begin/end delimiters default to "&lt;&lt;"/"&gt;&gt;" but may be overridden per-call
+    /// (VFP's SET TEXTMERGE DELIMITERS is a separate, unimplemented command). lParse is accepted and ignored —
+    /// this function always evaluates.</summary>
+    private string FnTextMerge(VfpValue[] a)
+    {
+        if (a.Length == 0) return string.Empty;
+        string s = a[0].AsString;
+        string beg = a.Length > 2 && a[2].Type == VfpType.Character && a[2].AsString.Length > 0 ? a[2].AsString : "<<";
+        string end = a.Length > 3 && a[3].Type == VfpType.Character && a[3].AsString.Length > 0 ? a[3].AsString : ">>";
+        var sb = new StringBuilder(s.Length);
+        int i = 0;
+        while (i < s.Length)
+        {
+            int open = s.IndexOf(beg, i, StringComparison.Ordinal);
+            if (open < 0) { sb.Append(s, i, s.Length - i); break; }
+            sb.Append(s, i, open - i);
+            int close = s.IndexOf(end, open + beg.Length, StringComparison.Ordinal);
+            if (close < 0) { sb.Append(s, open, s.Length - open); break; }
+            string expr = s.Substring(open + beg.Length, close - open - beg.Length);
+            sb.Append(TransformNoFormat(EvalText(expr)));
+            i = close + end.Length;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>ALINES(ArrayName, cExpr [, nFlags | lTrim [, cParseChar1 [, cParseChar2 …]]]): split cExpr
+    /// into lines, (re)dimension the named array to the line count, fill it row-by-row, and return the count.
+    /// Default parsing is on line breaks (CR, LF, CRLF); when one or more cParseChar are given they REPLACE
+    /// the line-break parsing (split on ANY of those single chars). The 3rd arg is overloaded (the documented
+    /// VFP quirk): logical ⇒ lTrim; numeric ⇒ nFlags (bit 1 = trim each line, bit 4 = skip empty lines);
+    /// character ⇒ it is already the first cParseChar. The array name arrives as a string (MicroVfpExprRewrite
+    /// quotes the first arg).</summary>
+    private int FnAlines(VfpValue[] a)
+    {
+        if (a.Length < 2) return 0;
+        string name = a[0].AsString;
+        string text = a[1].AsString;
+
+        bool trim = false, skipEmpty = false;
+        int parseFrom = 2;                       // index of the first cParseChar arg (default: none).
+        if (a.Length > 2)
+        {
+            var p = a[2];
+            if (p.Type == VfpType.Logical) { trim = p.AsLogical; parseFrom = 3; }
+            else if (p.Type is VfpType.Numeric or VfpType.Integer or VfpType.Currency)
+            {
+                int flags = (int)p.AsNumber;
+                trim = (flags & 1) != 0;
+                skipEmpty = (flags & 4) != 0;
+                parseFrom = 3;
+            }
+            // else (character) ⇒ p is already the first parse char; parseFrom stays 2.
+        }
+
+        // Collect any explicit parse characters (each argument contributes its single chars).
+        var parseChars = new List<char>();
+        for (int k = parseFrom; k < a.Length; k++)
+            foreach (char c in a[k].AsString) parseChars.Add(c);
+
+        string[] lines;
+        if (parseChars.Count > 0)
+            lines = text.Split(parseChars.ToArray());
+        else
+            lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+
+        var outLines = new List<string>(lines.Length);
+        foreach (var raw in lines)
+        {
+            string line = trim ? raw.Trim(' ', '\t') : raw;
+            if (skipEmpty && line.Length == 0) continue;
+            outLines.Add(line);
+        }
+
+        int count = outLines.Count;
+        var arr = Memory.RedimOrCreateArray(name, Math.Max(1, count), 0);
+        for (int i = 0; i < count; i++) arr.Set(i + 1, null, VfpValue.Character(outLines[i]));
+        return count;
+    }
+
+    /// <summary>SYS(10, nJulianDay): a Julian-day number → date string, honouring the interpreter's date
+    /// rendering (inverse of SYS(11)/SYS(1)).</summary>
+    private VfpValue FnSys10(VfpValue[] a)
+    {
+        if (a.Length < 2) return VfpValue.Character(string.Empty);
+        var d = FromJulianDay((int)a[1].AsNumber);
+        return VfpValue.Character(d.ToString("MM/dd/yyyy", CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>The inverse of <see cref="JulianDay"/> (Fliegel–Van Flandern).</summary>
+    private static DateOnly FromJulianDay(int jd)
+    {
+        int a = jd + 32044;
+        int b = (4 * a + 3) / 146097;
+        int c = a - 146097 * b / 4;
+        int d = (4 * c + 3) / 1461;
+        int e = c - 1461 * d / 4;
+        int m = (5 * e + 2) / 153;
+        int day = e - (153 * m + 2) / 5 + 1;
+        int month = m + 3 - 12 * (m / 10);
+        int year = 100 * b + d - 4800 + m / 10;
+        return new DateOnly(year, month, day);
     }
 
     private static int FnOccurs(VfpValue[] a)
