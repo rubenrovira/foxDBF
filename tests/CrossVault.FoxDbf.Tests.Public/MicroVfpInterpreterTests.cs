@@ -291,4 +291,61 @@ PROCEDURE rep_without
             Assert.False(interp.Runtime.LockFailFast); // no handler ⇒ would retry forever (not fail-fast)
         }
     }
+
+    // ───────────────────────── assignment-shape vs command-verb collision ─────────────────────────
+    // A local named after a command verb (total/sum/pack/count/…) must be an ASSIGNMENT, not a mis-parsed
+    // command silently dropped as UnknownCommand. Regression for the review finding that `total = 0`
+    // routed to BuildTotal (TOTAL ON…TO…), failed the grammar, and left the variable unchanged.
+
+    [Theory]
+    [InlineData("total")]
+    [InlineData("sum")]
+    [InlineData("pack")]
+    [InlineData("count")]
+    [InlineData("copy")]
+    [InlineData("delete")]
+    public void Assignment_ToCommandVerbNamedLocal_IsStored_NotDroppedAsCommand(string name)
+    {
+        // <name> = 5; <name> = <name> + 37  ⇒ 42, proving both the first store AND a re-store parse.
+        string prg = $@"
+PROCEDURE verb_local
+  LOCAL {name}
+  {name} = 5
+  {name} = {name} + 37
+  RETURN {name}
+";
+        var interp = MicroVfpTestSupport.NewFromSource(prg, out var s);
+        using (s)
+            Assert.Equal(42m, interp.Call("verb_local").AsNumber);
+    }
+
+    [Fact]
+    public void Assignment_ArrayElementAndMemberTargets_AreStored()
+    {
+        // Subscripted (arr(2)) and m.-qualified (m.total) lvalues also route to assignment, not a command.
+        const string prg = @"
+PROCEDURE lv_targets
+  LOCAL total
+  DIMENSION arr(2)
+  arr(2) = 40
+  m.total = 2
+  RETURN arr(2) + m.total
+";
+        var interp = MicroVfpTestSupport.NewFromSource(prg, out var s);
+        using (s)
+            Assert.Equal(42m, interp.Call("lv_targets").AsNumber);
+    }
+
+    [Fact]
+    public void CommandContainingTopLevelEquals_IsNotMisreadAsAssignment()
+    {
+        // A real command whose text contains a top-level '=' further along (a FOR/filter condition) must
+        // still parse as the COMMAND — the assignment fast-path only intercepts a single-lvalue prefix, so
+        // "DELETE FOR id = 1" (prefix "DELETE FOR id" has a space) and "SET FILTER TO amount = 10" stay
+        // commands, not Assignments.
+        Assert.IsType<DeleteStmt>(PrgParser.Parse("DELETE FOR id = 1").Main[0]);
+        Assert.IsType<SetStmt>(PrgParser.Parse("SET FILTER TO amount = 10").Main[0]);
+        // …while the bare store still becomes an Assignment even though STORE-less "delete"/"set" are verbs.
+        Assert.IsType<Assignment>(PrgParser.Parse("delete = id = 1").Main[0]);
+    }
 }

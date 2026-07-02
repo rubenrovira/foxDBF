@@ -41,12 +41,57 @@ int n = cn.Execute("UPDATE customer SET region = @r WHERE customer_id = @id", ne
 | `Ansi` | `on` / `off` | SQL `=` comparison (`SET ANSI`) |
 | `ReadOnly` | `true` / `false` | |
 | `Accelerator` | `Highlike` / `None` | opt-in cost-based query acceleration |
+| `EnforceRules` (alias `EnforceRI`) | `on` / `off` (default `off`) | opt in to the VFP write model on writes — see below |
 
 ## Supported SQL
 
-`SELECT` with projection, `WHERE`, `INNER`/`LEFT JOIN`, `GROUP BY`/`HAVING`, aggregates,
-`ORDER BY`, `DISTINCT`, `TOP`; `INSERT … VALUES`, `UPDATE`, `DELETE` (VFP soft-delete); the VFP
-work-area model via `USE` / `SELECT` commands. Positional `?` and named `@`/`:` parameters.
+`SELECT` with projection, `WHERE`, `INNER`/`LEFT`/`RIGHT`/`FULL JOIN`, `UNION [ALL]`, correlated
+subqueries, `GROUP BY`/`HAVING`, aggregates, `ORDER BY`, `DISTINCT`, `TOP`; `INSERT … VALUES`,
+`UPDATE`, `DELETE` (VFP soft-delete); `CREATE`/`ALTER`/`DROP TABLE`; the VFP work-area model via
+`USE` / `SELECT` commands. Positional `?` and named `@`/`:` parameters. Real transactions
+(`BeginTransaction` → atomic commit/rollback), `DataAdapter`/`CommandBuilder`, and `GetSchema`
+metadata collections.
+
+## Stored procedures, UDFs, and opt-in rule enforcement
+
+With a `.dbc` open, the provider runs the container's stored procedures / UDFs on the embedded
+[microVFP](https://www.nuget.org/packages/CrossVault.microVFP) interpreter (sharing the connection's
+work-area session):
+
+```csharp
+using var cmd = cn.CreateCommand();
+cmd.CommandType = CommandType.StoredProcedure;   // System.Data
+cmd.CommandText = "NewID";                        // a stored procedure in the .dbc
+var p = cmd.CreateParameter(); p.ParameterName = "alias"; p.Value = "orders"; cmd.Parameters.Add(p);
+object? nextId = cmd.ExecuteScalar();             // the SP's RETURN value; side effects persist
+```
+
+An ad-hoc microVFP expression works too — a `CommandText` starting with `?` or `=` (e.g.
+`"?UPPER('abc')"`, `"=1 + 2"`) is evaluated directly.
+
+Add `EnforceRules=on` (alias `EnforceRI`) to the connection string, with a `.dbc` open, and
+`INSERT`/`UPDATE`/`DELETE` run the full VFP write model — field `DEFAULT`s → field `RULE`s →
+`NOT NULL` / type / width → the record `RULE` → unique / candidate / primary-key → the bound
+referential-integrity trigger — atomically, exactly as VFP9 (`UPDATE` has no `DEFAULT` phase).
+Default is **off** (the raw DML path, byte-for-byte unchanged), so existing code is unaffected
+unless you opt in.
+
+## Modern factories: `DbDataSource` and `DbBatch`
+
+`FoxDbfDataSource` (a `DbDataSource`, .NET 7+) is a connection factory for dependency injection —
+register one as a singleton and resolve connections/commands from it. `FoxDbfBatch` (a `DbBatch`,
+.NET 6+) runs several commands over one connection (`ExecuteReader` exposes the first result set and
+`NextResult()` walks the rest; `ExecuteNonQuery` sums affected counts).
+
+```csharp
+using var source = new FoxDbfDataSource(@"Data Source=C:\data\tastrade.dbc;Deleted=on");
+using var conn = source.OpenConnection();
+
+using var batch = conn.CreateBatch();
+batch.BatchCommands.Add(new FoxDbfBatchCommand("SELECT company_name FROM customer WHERE country = 'Germany'"));
+batch.BatchCommands.Add(new FoxDbfBatchCommand("SELECT company_name FROM customer WHERE country = 'USA'"));
+using var r = batch.ExecuteReader();   // first set; r.NextResult() → second set
+```
 
 ## Register with `DbProviderFactories`
 

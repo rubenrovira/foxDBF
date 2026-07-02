@@ -536,6 +536,18 @@ public static class PrgParser
             // MacroSubstStmt and expanded+re-parsed at RUNTIME (textual substitution before execution).
             if (kw is not ("&" or "ON" or "#") && PrgScan.ContainsTopLevelMacro(text))
                 return new MacroSubstStmt(new MacroSubst(text.Trim())) { Line = line };
+            // VFP disambiguates a STORE (`<lvalue> = <expr>`, a single '=', not '==') from a command by
+            // SHAPE, not by the first word: `total = 0` is an assignment even though TOTAL is a command
+            // verb. Detect that shape BEFORE dispatching to a same-named builder, otherwise common
+            // variable names that collide with command keywords (total/sum/pack/count/date/type/…) would
+            // route to the command grammar, fail it, and be silently dropped as an UnknownCommand.
+            if (kw is not ("=" or "&" or "#"))
+            {
+                int eqPos = PrgScan.IndexOfAssign(text);
+                if (eqPos > 0 && IsAssignTarget(text.Substring(0, eqPos)))
+                    return new Assignment(text.Substring(0, eqPos).Trim(),
+                                          PrgExpr.Parse(text.Substring(eqPos + 1))) { Line = line };
+            }
             PrgStatement node = kw switch
             {
                 "LOCAL" => BuildVarDecl(DeclScope.Local, text),
@@ -601,6 +613,33 @@ public static class PrgParser
                 return new Assignment(target, PrgExpr.Parse(text.Substring(eq + 1)));
             }
             return new UnknownCommand(kw, PrgScan.AfterFirstWord(text));
+        }
+
+        // A left-hand side is an assignable REFERENCE — an identifier optionally followed by member
+        // access (<c>.name</c>) and/or balanced subscripts (<c>[…]</c> / <c>(…)</c>), and NOTHING else.
+        // A top-level space (a second bare word, e.g. "SET FILTER TO x", "DELETE FOR a") disqualifies it,
+        // which is exactly what separates a store (<c>total = 0</c>) from a command that merely contains a
+        // '=' further along (<c>SET FILTER TO x = y</c>). IndexOfAssign already guarantees the '=' sits at
+        // bracket-depth 0 outside any string, so the target's brackets/strings here are balanced/closed.
+        private static bool IsAssignTarget(string s)
+        {
+            s = s.Trim();
+            if (s.Length == 0 || !(char.IsLetter(s[0]) || s[0] == '_')) return false;
+            int depth = 0;
+            bool inStr = false;
+            char q = '\0';
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (inStr) { if (c == q) inStr = false; continue; }
+                if (c is '\'' or '"') { inStr = true; q = c; continue; }
+                if (c is '(' or '[') { depth++; continue; }
+                if (c is ')' or ']') { if (depth == 0) return false; depth--; continue; }
+                if (depth > 0) continue;                                  // inside a subscript: anything goes
+                if (c == '.' || char.IsLetterOrDigit(c) || c == '_') continue;   // member-access chain
+                return false;                                            // top-level space/operator ⇒ command
+            }
+            return depth == 0 && !inStr;
         }
 
         private static VarDecl BuildVarDecl(DeclScope scope, string text)

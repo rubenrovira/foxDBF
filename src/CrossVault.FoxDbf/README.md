@@ -37,6 +37,10 @@ provider built on this package). Need to run VFP9 stored-procedure `.prg` busine
 - **Create** a `.dbc` database container (`.dbc` + `.DCT` + `.DCX` + member backlinks).
 - **CDX writing / REINDEX**: bulk-build a compact B-tree index for a tag (key + FOR
   expressions, MACHINE/GENERAL collation).
+- **Incremental index maintenance**: once a structural `.cdx` tag exists, every append/update
+  edits it in place (`O(log n)`), so a `REPLACE` followed by a `SEEK` finds the row without a
+  `REINDEX` — exactly as Visual FoxPro does. (`Delete`/`Recall` leave the key in the index, matching
+  VFP soft-delete semantics — it clears at `PACK`.)
 
 ### Expressions & query engine
 - A VFP **expression engine** (`CrossVault.FoxDbf.Expressions`): hand-written lexer + Pratt
@@ -134,9 +138,9 @@ DbfDatabaseBuilder.Create("shop.dbc", new[]
 ```csharp
 using CrossVault.FoxDbf.Sql;
 
-// SQL directly against a directory of free tables or a .dbc
+// SQL directly against a .dbc (long field names) or a directory of free tables (10-char names)
 using var session = new VfpSession();
-session.OpenDirectory(@"C:\data");
+session.OpenDatabase(@"C:\data\shop.dbc");   // or session.OpenDirectory(@"C:\data")
 var result = session.Execute(
     "SELECT company_name, country FROM customer WHERE country = 'Germany' ORDER BY company_name");
 foreach (var row in result!.Rows)

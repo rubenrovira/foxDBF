@@ -13,7 +13,7 @@ No native dependencies, no COM/OLE DB interop, no Visual FoxPro IDE required —
 | Package | What it's for |
 |---|---|
 | **[CrossVault.FoxDbf](src/CrossVault.FoxDbf/README.md)** | The core: read/write `.dbf`/`.fpt`/`.cdx`/`.dbc`, the VFP expression engine, a Rushmore-style query optimizer, a SQL parser + executor, and the opt-in Highlike performance accelerator. Everything below builds on this. |
-| **[CrossVault.FoxDbf.Data](src/CrossVault.FoxDbf.Data/README.md)** | An ADO.NET data provider (`DbConnection`/`DbCommand`/`DbDataReader`) — use FoxPro/dBase data from Dapper, raw ADO.NET, reporting tools, LINQPad. |
+| **[CrossVault.FoxDbf.Data](src/CrossVault.FoxDbf.Data/README.md)** | An ADO.NET data provider (`DbConnection`/`DbCommand`/`DbDataReader`, plus `DbDataSource` and `DbBatch`) — use FoxPro/dBase data from Dapper, raw ADO.NET, reporting tools, LINQPad. Runs a `.dbc`'s stored procedures/UDFs, and can opt in (`EnforceRules`) to the full VFP write model (DEFAULTs/RULEs/RI triggers) on writes. |
 | **[CrossVault.microVFP](src/CrossVault.FoxDbf.MicroVfp/README.md)** | A minimal, embeddable interpreter for real VFP9 `.prg` stored-procedure/business-logic code — for when you just need to *run* FoxPro logic, not a full data provider. |
 
 `CrossVault.FoxDbf.Expressions` (the shared expression engine) has [its own README](src/CrossVault.FoxDbf.Expressions/README.md)
@@ -69,9 +69,12 @@ while (r.Read()) Console.WriteLine(r.GetString(0));
 ```csharp
 using CrossVault.FoxDbf.MicroVfp;
 using CrossVault.FoxDbf.Sql;
+using CrossVault.FoxDbf.Expressions;   // VfpValue
 
 var interp = new VfpInterpreter(new VfpSession());
-interp.Execute("? 1 + 2");
+interp.Execute("FUNCTION AddUp(a, b)\n RETURN a + b\nENDFUNC");
+VfpValue sum = interp.Call("AddUp", VfpValue.Integer(1), VfpValue.Integer(2));
+Console.WriteLine(sum.AsNumber);   // 3
 ```
 
 See [`docs/`](docs/) for a step-by-step walkthrough of each area (reading, writing/indexing,

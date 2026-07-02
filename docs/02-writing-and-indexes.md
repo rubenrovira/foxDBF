@@ -33,6 +33,25 @@ w.CreateTag(new CdxTagDefinition("ADULTS", "NAME", forExpression: "AGE >= 18"));
 Each `CreateTag` call bulk-builds a compact B-tree for that key expression over the table's
 **current** contents — the same structural `.cdx` format Visual FoxPro reads, byte-for-byte.
 
+### Indexes stay current on every write
+
+Once a structural `.cdx` tag exists, the writer **maintains it incrementally** — every
+`AppendRecord`/`UpdateRecord` edits each open tag in place (an `O(log n)` B-tree insert/remove),
+exactly as Visual FoxPro does. You do **not** need a `REINDEX` after a write: a `REPLACE` (update)
+followed by a `SEEK`/index-optimized query finds the row immediately. (`Delete`/`Recall` deliberately
+do **no** index work — VFP soft-deletes leave a record's key in the index until you `PACK`.)
+
+```csharp
+w.AppendRecord(new Dictionary<string, object?> { ["NAME"] = "Grace", ["AGE"] = 38 });  // after CreateTag
+// The NAME_IDX tag already reflects "Grace" — no REINDEX. An index-optimized query finds it:
+using var table = DbfTable.Open("people.dbf");
+foreach (var rec in table.Query("NAME = \"Grace\"").GetRecords(table))
+    Console.WriteLine(rec.GetInt32("age"));   // 38
+```
+
+(`REINDEX` is still available for a full rebuild — e.g. after loading a table whose `.cdx` was
+deleted or is stale — but ordinary appends/updates no longer require it.)
+
 ## Update / delete / recall
 
 ```csharp

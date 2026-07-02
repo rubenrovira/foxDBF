@@ -10,26 +10,37 @@ in this project.
 
 ## Run a self-contained snippet
 
-No table, no `.dbc` — just VFP language constructs:
+No table, no `.dbc` — just VFP language constructs. Define a `FUNCTION`, then read its result back in
+C# with `Call(...)` (there is no `?`/`??` console output — see [Deviations](#deviations-from-vfp)):
 
 ```csharp
 using CrossVault.FoxDbf.MicroVfp;
 using CrossVault.FoxDbf.Sql;
+using CrossVault.FoxDbf.Expressions;   // VfpValue lives here
 
 var interp = new VfpInterpreter(new VfpSession());
 interp.Execute(@"
-    LOCAL x, i, total
-    total = 0
-    FOR i = 1 TO 5
-        total = total + i
-    ENDFOR
-    ? total
+    FUNCTION SumTo(n)
+        LOCAL i, running
+        running = 0
+        FOR i = 1 TO n
+            running = running + i
+        ENDFOR
+        RETURN running
+    ENDFUNC
 ");
+
+VfpValue result = interp.Call("SumTo", VfpValue.Integer(5));
+Console.WriteLine(result.AsNumber);   // 15
 ```
 
 ## Load and call a procedure/function
 
 ```csharp
+using CrossVault.FoxDbf.MicroVfp;
+using CrossVault.FoxDbf.Sql;
+using CrossVault.FoxDbf.Expressions;   // VfpValue lives here
+
 using var session = new VfpSession();
 session.OpenDatabase(@"C:\data\shop.dbc");
 
@@ -69,21 +80,35 @@ PrgProgram program = PrgParser.Parse(prgSourceText);
 
 ## What's implemented
 
-- **Control flow**: `IF/ENDIF`, `DO CASE/ENDCASE`, `DO WHILE/ENDDO`, `FOR/ENDFOR`, `SCAN/ENDSCAN`,
-  `EXIT`/`LOOP`, `RETURN`.
+- **Control flow**: `IF/ENDIF`, `DO CASE/ENDCASE`, `DO WHILE/ENDDO`, `FOR/ENDFOR`,
+  `FOR EACH … IN <array>/ENDFOR`, `SCAN/ENDSCAN`, `EXIT`/`LOOP`, `RETURN`.
 - **Scoping**: `LOCAL`/`PRIVATE`/`PUBLIC` with VFP's dynamic-scoping rules — a `PRIVATE` hides a
   same-named variable from an outer caller for the rest of the call chain (not lexical scoping).
   `DIMENSION`/`REDIMENSION` memory arrays (preserve existing elements on resize; new elements
-  `.F.`-fill), `RELEASE`.
+  `.F.`-fill), `RELEASE`, `CLEAR MEMORY`/`CLEAR ALL`.
+- **Preprocessing / macros**: `#DEFINE`/`#UNDEF`, `#IF`/`#IFDEF`/`#IFNDEF`, and generalised
+  `&var` / `&var.` **macro substitution executed at runtime** (a `&`-line is expanded to the
+  variable's current text and run).
 - **Parameters**: `PARAMETERS`/`LPARAMETERS`, by-value (`=Func(args)`/`(...)`) vs. by-reference
   (`DO proc WITH args`) passing.
 - **Data access**: `USE`/`SELECT` work areas, `SEEK`/`GO`/`SKIP`, `REPLACE`/`DELETE`/`RECALL`/
-  `INSERT`, `SUM`, `BEGIN`/`END TRANSACTION`/`ROLLBACK` (copy-on-write), an embedded VFP-SQL
-  `SELECT` (routed through the same [SQL engine](03-sql-and-ado-net.md) as everything else).
-- **Indexing**: `INDEX ON … TAG` (into the table's structural `.cdx`), `SET ORDER TO`, `REINDEX` —
-  see [Deviations from VFP](#deviations-from-vfp) for the forms that are refused rather than attempted.
+  `INSERT`, `GATHER`/`SCATTER`, `APPEND FROM`/`COPY TO` (`.dbf`), `PACK`, `SUM`/`TOTAL`,
+  `BEGIN`/`END TRANSACTION`/`ROLLBACK` (copy-on-write), and an embedded VFP-SQL `SELECT` (routed
+  through the same [SQL engine](03-sql-and-ado-net.md) as everything else).
+- **Parent-child navigation**: `SET RELATION TO <key> INTO <alias>` and `SET SKIP TO` — moving the
+  parent's record pointer repositions each related child; `RELATION()`/`TARGET()` read the links back.
+- **Table / row buffering**: `CURSORSETPROP('Buffering', 1-5)` / `CURSORGETPROP`, `TABLEUPDATE()` /
+  `TABLEREVERT()`, and `OLDVAL()`/`CURVAL()`/`GETFLDSTATE()` — a real optimistic-buffering model, not
+  constants.
+- **Indexing**: `INDEX ON … TAG` (structural `.cdx`), `INDEX ON … TAG … OF <cdx>` (non-structural
+  `.cdx`), `INDEX ON … TO <idx>` (standalone `.idx`), `SET ORDER TO`, `SET INDEX TO` / `USE … INDEX`
+  (multiple indexes per work area), `REINDEX`, `DELETE TAG`, plus introspection
+  (`TAG()`/`TAGCOUNT()`/`TAGNO()`/`KEY()`/`ORDER()`/`CANDIDATE()`/`PRIMARY()`/`DESCENDING()`/`FOR()`/
+  `CDX()`/`SYS(14)`/`ATAGINFO()`).
 - **Error handling**: `ON ERROR`, `AERROR()` (the full 7-column result-array contract), `MESSAGE()`/
   `ERROR()`/`LINENO()`.
+- **Referential integrity**: the DBC's stored `RULE`s and the generated insert/update/delete RI
+  triggers auto-fire on `INSERT`/`REPLACE`/`DELETE` through the interpreter, cascading exactly as VFP9.
 
 ## Function reference
 
@@ -107,7 +132,15 @@ Every function below runs as real VFP semantics, not a stub — see
 | `CHR()`, `ASC()` | |
 | `CHRTRAN()` | |
 | `STR()`, `STRZERO()`, `VAL()` | |
-| `ISDIGIT()`, `ISALPHA()` | first-character checks, as in VFP |
+| `ISDIGIT()`, `ISALPHA()`, `ISUPPER()`, `ISLOWER()` | first-character checks, as in VFP |
+| `PROPER()` | title-case each word |
+| `TRANSFORM()` | format a value with a VFP `@`/picture format string |
+| `STREXTRACT()` | text between two delimiters |
+| `GETWORDCOUNT()`, `GETWORDNUM()` | word count / N-th word |
+| `SOUNDEX()`, `DIFFERENCE()` | phonetic key / similarity |
+| `STRCONV()`, `CPCONVERT()` | string / code-page conversions |
+| `TEXTMERGE()` | expand `<< >>` expression bits in a template |
+| `ALINES()` | split text into a memory array of lines |
 
 **Date / time**
 
@@ -125,7 +158,8 @@ Every function below runs as real VFP semantics, not a stub — see
 | `ABS()`, `INT()`, `ROUND()`, `MOD()`, `MAX()`, `MIN()` | |
 | `IIF()`, `BETWEEN()`, `INLIST()` | |
 | `EMPTY()`, `ISNULL()` | |
-| `TYPE()` | returns a VFP type code (`C`, `N`, `L`, `D`, …) |
+| `TYPE()` | returns a VFP type code (`C`, `N`, `L`, `D`, …) from an expression *string* |
+| `VARTYPE()` | returns the type code of a *value* (no re-evaluation) |
 | `EVALUATE()` / `EVAL()` | evaluates a text expression at runtime |
 
 **Arrays**
@@ -133,6 +167,11 @@ Every function below runs as real VFP semantics, not a stub — see
 | Function | Notes |
 |---|---|
 | `ALEN()` | total elements (no dimension arg), rows (dim `1`), or columns (dim `2`) |
+| `AELEMENT()`, `ASUBSCRIPT()` | element number ↔ (row, col) subscript conversion |
+| `ACOPY()`, `ADEL()`, `AINS()` | copy / delete / insert array elements |
+| `ASORT()` | sort a memory array |
+| `AFIELDS()` | fill an array with the current table's field structure |
+| `ADATABASES()`, `AUSED()`, `ASESSIONS()` | open databases / work areas / data sessions into an array |
 
 **Work area / record state** — these are the *session-aware* versions (they read the live cursor,
 not a context-free default), and take precedence over any same-named generic function above:
@@ -140,13 +179,25 @@ not a context-free default), and take precedence over any same-named generic fun
 | Function | Notes |
 |---|---|
 | `SELECT()`, `USED()`, `ALIAS()` | |
-| `DBF()` | current table's source path; `DBC()` is a stub — see deviations |
-| `RECNO()`, `RECCOUNT()` | |
+| `DBF()`, `DBC()` | current table's / current database's source path |
+| `INDBC()`, `ISEXCLUSIVE()`, `ISREADONLY()` | membership / open-mode of a table or database |
+| `HEADER()`, `RECNO()`, `RECCOUNT()`, `LUPDATE()` | header size / record pointer / count / last-update date |
 | `EOF()`, `BOF()`, `FOUND()`, `DELETED()` | |
-| `SEEK()` | function form of the `SEEK` command, returns success as `.T.`/`.F.` |
-| `OLDVAL()`, `CURVAL()` | transaction-buffer field snapshots |
+| `SEEK()`, `LOOKUP()` | function-form seek / seek-and-return-a-field |
+| `RELATION()`, `TARGET()` | read back a work area's `SET RELATION` links |
+| `CURSORGETPROP()`, `CURSORSETPROP()`, `GETFLDSTATE()` | the buffering model (`Buffering` 1-5, field/row state) |
+| `OLDVAL()`, `CURVAL()`, `TABLEUPDATE()`, `TABLEREVERT()` | buffer snapshots / commit / discard |
 | `PCOUNT()` / `PARAMETERS()` | count of arguments actually passed to the current call |
 | `PROGRAM()` | current procedure name, or `n` levels up the call stack |
+
+**Index introspection** — read the open indexes of the current work area:
+
+| Function | Notes |
+|---|---|
+| `TAG()`, `TAGCOUNT()`, `TAGNO()` | tag name by position / count / number of a named tag |
+| `KEY()`, `FOR()`, `ORDER()` | a tag's key / `FOR` filter / the controlling order |
+| `CANDIDATE()`, `PRIMARY()`, `UNIQUE()`, `DESCENDING()` | a tag's flags |
+| `CDX()`, `IDXCOLLATE()`, `ATAGINFO()` | `.cdx` path / collation / all tag info into an array |
 
 **Error handling**
 
@@ -168,7 +219,7 @@ not a context-free default), and take precedence over any same-named generic fun
 | `SECONDS()` | |
 | `COCREATEGUID()` | |
 | `TXNLEVEL()` | transaction nesting depth |
-| `RLOCK()`/`LOCK()`, `FLOCK()`, `ISRLOCKED()`/`ISFLOCKED()`, `CURSORGETPROP()`, `GETFLDSTATE()` | see deviations — modelled for a single-session interpreter, not real contention |
+| `RLOCK()`/`LOCK()`, `FLOCK()`, `ISRLOCKED()`/`ISFLOCKED()` | see deviations — a single in-process interpreter never sees lock contention, so a lock is always granted |
 | `MESSAGEBOX()` | stub — see deviations |
 
 ## Deviations from VFP
@@ -177,6 +228,11 @@ microVFP runs real VFP9 `.prg` source, but it is a **headless, single-session in
 business-logic stored procedures** — not a drop-in replacement for the full VFP9 IDE/runtime. The
 differences below are deliberate, verified simplifications, not bugs to be worked around:
 
+- **`?`/`??` display output is not implemented.** There is no console to print to, so a `? expr` /
+  `?? expr` line parses but produces nothing (it falls into the "unrecognized command" bucket below —
+  no output, no exception). To observe a value, return it from a `FUNCTION`/`PROCEDURE` and read the
+  `Call(...)` result in C# (as the snippets above do), or evaluate it with
+  `interp.EvalExpression("expr")`.
 - **`LOCATE`/`CONTINUE` parse but do not move the record pointer.** The syntax is recognized (a
   `.prg` containing `LOCATE FOR …` still parses cleanly), but neither command currently performs the
   scan — `LOCATE` is a no-op today, not a search. Use `SCAN FOR … / EXIT / ENDSCAN` instead, which
@@ -189,13 +245,6 @@ differences below are deliberate, verified simplifications, not bugs to be worke
   [2. Writing and indexes](02-writing-and-indexes.md#vfp-compatible-locking)) — it's just not wired
   through these interpreter-level function calls, since the interpreter itself is always the sole
   writer in its own process.
-- **`INDEX ON … TAG` only targets the structural `.cdx`.** `INDEX ON … TO <idx>` (a standalone
-  `.idx` file) and `INDEX … TAG … OF <cdx>` (a non-structural `.cdx`) are refused with an explicit,
-  catchable `MicroVfpRuntimeException` rather than silently attempted or silently ignored.
-- **`&macro` / `&macro.` substitution is parsed but not expanded.** A macro reference is captured
-  verbatim so surrounding code still parses, but it is never resolved/executed at runtime — with one
-  specific exception: `ON ERROR &lcHandler` *is* installed and re-evaluated, because that's the one
-  macro form real-world RI/stored-procedure corpora actually rely on.
 - **An unrecognized command is captured, not rejected — and not executed either.** Any command verb
   the parser doesn't model yet still parses (so a whole `.prg` file continues to load even if it uses
   a handful of exotic commands), but it silently does nothing at runtime. A `.prg` parsing cleanly is
@@ -203,14 +252,14 @@ differences below are deliberate, verified simplifications, not bugs to be worke
   [What's implemented](#whats-implemented) and the [function reference](#function-reference) above
   for what's real.
 - **A few functions are intentional stubs**, always returning the same constant: `MESSAGEBOX()`
-  always returns `6` (`IDYES`) since there is no UI to show; `DBC()` always returns `""`;
-  `CURSORGETPROP()`/`GETFLDSTATE()` return constants since microVFP doesn't model VFP's buffering
-  modes; unimplemented `SYS(n)` codes return `""` rather than their real per-code VFP9 behavior.
+  always returns `6` (`IDYES`) since there is no UI to show; unimplemented `SYS(n)` codes return `""`
+  rather than their real per-code VFP9 behavior. (`DBC()`, `CURSORGETPROP()`/`GETFLDSTATE()` used to
+  be on this list — they now return real values; see [What's implemented](#whats-implemented).)
 
-Referential-integrity trigger auto-firing and the remaining VFP9 command surface (low-level file
-I/O, `SET RELATION`, …) are being built out incrementally, prioritized by what real `.prg`
-business-logic corpora actually use — the goal is correctly running real-world stored procedures,
-not 100% language coverage on day one.
+The remaining VFP9 command surface (low-level file I/O, `LOCATE`/`CONTINUE` movement, multi-session
+`SET DATASESSION`, contested locking) is being built out incrementally, prioritized by what real
+`.prg` business-logic corpora actually use — the goal is correctly running real-world stored
+procedures, not 100% language coverage on day one.
 
 ## Next
 

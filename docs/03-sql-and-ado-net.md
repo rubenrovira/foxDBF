@@ -10,7 +10,9 @@ Dapper/raw `DbCommand`/reporting tools. Most applications want the ADO.NET route
 using CrossVault.FoxDbf.Sql;
 
 using var session = new VfpSession();
-session.OpenDirectory(@"C:\data");          // a folder of free .dbf tables (or session.OpenDatabase("shop.dbc"))
+session.OpenDatabase(@"C:\data\shop.dbc");  // a .dbc gives the long field names below; use
+                                            // session.OpenDirectory(@"C:\data") for a folder of free
+                                            // .dbf tables (whose columns keep VFP's 10-char names).
 
 var result = session.Execute(
     "SELECT company_name, country FROM customer WHERE country = 'Germany' ORDER BY company_name");
@@ -66,6 +68,7 @@ int updated = cn.Execute(
 | `Ansi` | `on` / `off` | SQL `=` comparison (`SET ANSI`) |
 | `ReadOnly` | `true` / `false` | |
 | `Accelerator` | `Highlike` / `None` | opt-in cost-based query acceleration ([5. Highlike](05-highlike-accelerator.md)) |
+| `EnforceRules` (alias `EnforceRI`) | `on` / `off` (default `off`) | opt in to the VFP write model on `INSERT`/`UPDATE`/`DELETE` — see [Enforcing DBC rules](#enforcing-dbc-rules-on-writes) |
 
 ### What SQL is supported
 
@@ -75,6 +78,92 @@ subqueries, `GROUP BY`/`HAVING`, aggregates, `ORDER BY`, `DISTINCT`, `TOP`; `INS
 `CREATE`/`ALTER`/`DROP TABLE`. Positional `?` and named `@`/`:` parameters. SQL `=` follows
 **`SET ANSI`** (the `Ansi` connection-string keyword above), not `SET EXACT`.
 
+### Stored procedures and UDFs
+
+When the data source is a `.dbc`, the connection can run the container's stored procedures / UDFs —
+the same VFP9 `.prg` business logic the [microVFP runtime](04-microvfp-runtime.md) executes, sharing
+the connection's work-area session. Set `CommandType.StoredProcedure` and put the procedure name in
+`CommandText`; parameters are passed positionally, by value, in the order you add them, and
+`ExecuteScalar` returns the procedure's `RETURN` value:
+
+```csharp
+using var cmd = cn.CreateCommand();
+cmd.CommandType = CommandType.StoredProcedure;
+cmd.CommandText = "NewID";                         // a stored procedure in the .dbc
+var p = cmd.CreateParameter();
+p.ParameterName = "alias";
+p.Value = "orders";
+cmd.Parameters.Add(p);
+
+object? nextId = cmd.ExecuteScalar();              // the SP's RETURN value; side effects persist
+```
+
+For a quick one-off, an ad-hoc microVFP expression — `CommandText` starting with `?` or `=` — is
+evaluated directly (no stored procedure required):
+
+```csharp
+using var e = cn.CreateCommand();
+e.CommandText = "?UPPER('abc')";                   // or "=1 + 2"
+object? value = e.ExecuteScalar();                 // "ABC"
+```
+
+### Enforcing DBC rules on writes
+
+By default the provider's `INSERT`/`UPDATE`/`DELETE` take the raw DML path — fast, and byte-for-byte
+what you'd get writing the `.dbf` yourself. Opt in with `EnforceRules=on` (alias `EnforceRI`) **and a
+`.dbc` open**, and each write instead runs the full VFP write model through microVFP, atomically, in
+the same order VFP9 does: field `DEFAULT`s → field `RULE`s → `NOT NULL` / type / width → the record
+`RULE` → unique / candidate / primary-key → the table's bound insert/update/delete
+**referential-integrity trigger**. (`UPDATE` has no `DEFAULT` phase.)
+
+```csharp
+using var cn = new FoxDbfConnection(@"Data Source=C:\data\shop.dbc;EnforceRules=on");
+cn.Open();
+
+using var cmd = cn.CreateCommand();
+cmd.CommandText = "INSERT INTO orders (customer_id) VALUES ('ACME')";
+cmd.ExecuteNonQuery();     // per-field DEFAULTs auto-fill; RULEs + the RI trigger run; a violation
+                           // throws a FoxDbfException and rolls the row back — exactly like VFP9
+```
+
+Enforcement is a `.dbc` concept: a free-table / single-`.dbf` connection has no `DEFAULT`/`RULE`/
+`TRIGGER` metadata, so its writes stay on the raw path even with `EnforceRules=on`. Default is **off**
+— existing code is unaffected unless you ask for it.
+
+### A `DbDataSource` for dependency injection
+
+`FoxDbfDataSource` is the modern [`DbDataSource`](https://learn.microsoft.com/dotnet/api/system.data.common.dbdatasource)
+factory (.NET 7+) — register one as a singleton from a single connection string and resolve
+connections/commands from it, instead of threading the string through your app:
+
+```csharp
+using var source = new FoxDbfDataSource(@"Data Source=C:\data\shop.dbc;Deleted=on");
+
+using DbConnection cn = source.OpenConnection();          // a fresh, already-open connection
+using DbCommand cmd = cn.CreateCommand();
+cmd.CommandText = "SELECT company_name FROM customer WHERE country = 'Germany'";
+object? first = cmd.ExecuteScalar();
+```
+
+### Batching several commands
+
+`FoxDbfBatch` implements [`DbBatch`](https://learn.microsoft.com/dotnet/api/system.data.common.dbbatch)
+(.NET 6+). The engine is a local file engine, so there's no network round-trip to save — the batch is
+an API-completeness convenience: `ExecuteReader` exposes the first command's rows and `NextResult()`
+walks to each subsequent one, `ExecuteNonQuery` sums the affected counts, and the batch honors the
+connection's active transaction and its `EnforceRules` setting.
+
+```csharp
+using var batch = cn.CreateBatch();
+batch.BatchCommands.Add(new FoxDbfBatchCommand("SELECT company_name FROM customer WHERE country = 'Germany'"));
+batch.BatchCommands.Add(new FoxDbfBatchCommand("SELECT company_name FROM customer WHERE country = 'USA'"));
+
+using var r = batch.ExecuteReader();
+while (r.Read()) { /* first command's rows */ }
+if (r.NextResult())
+    while (r.Read()) { /* second command's rows */ }
+```
+
 ### Register as a named provider
 
 ```csharp
@@ -82,7 +171,8 @@ DbProviderFactories.RegisterFactory("CrossVault.FoxDbf", FoxDbfProviderFactory.I
 ```
 
 Useful for tools that look up providers by name (config-driven data layers, some reporting tools)
-rather than `new`-ing `FoxDbfConnection` directly.
+rather than `new`-ing `FoxDbfConnection` directly. The registered `FoxDbfProviderFactory` also creates
+data sources (`CreateDataSource`) and batches (`CreateBatch`).
 
 ## Next
 
