@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System.Linq;
 using CrossVault.FoxDbf.Expressions;
 using CrossVault.FoxDbf.Index;
 
@@ -39,6 +41,119 @@ public sealed partial class DbfWriter
         if (tags.Count == 0)
             return;
         RebuildStructuralCdx(tags, evalContext, includeDeleted);
+    }
+
+    /// <summary>
+    /// Build a standalone legacy <c>.idx</c> at <paramref name="idxPath"/> for KEY
+    /// <paramref name="keyExpr"/> (optional <paramref name="forExpr"/> filter) over the live table —
+    /// the write side of <c>INDEX ON eExpr TO cIdx</c>. Overwrites any existing file at the path.
+    /// A standalone index is NOT advertised in the DBF header (it is not auto-opened by USE).
+    /// </summary>
+    public void CreateStandaloneIdx(string idxPath, string keyExpr, string? forExpr = null,
+        bool unique = false, EvaluationContext? evalContext = null, bool includeDeleted = false)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(idxPath);
+        ArgumentNullException.ThrowIfNull(keyExpr);
+        Flush();
+        var rows = MaterializeRows();
+        IdxIndexBuilder.Build(idxPath, _schema, rows, keyExpr, forExpr, unique, evalContext, includeDeleted);
+    }
+
+    /// <summary>
+    /// Build (or replace) a tag <paramref name="definition"/> in the compound <c>.cdx</c> at
+    /// <paramref name="cdxPath"/> — the STRUCTURAL sidecar (<paramref name="structural"/> true, the DBF
+    /// header structural bit is then advertised) or a NAMED non-structural <c>.cdx</c>
+    /// (<paramref name="structural"/> false). Preserves any sibling tags already in the file.
+    /// </summary>
+    public void CreateTagIn(string cdxPath, bool structural, CdxTagDefinition definition,
+        EvaluationContext? evalContext = null, bool includeDeleted = false)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(cdxPath);
+        ArgumentNullException.ThrowIfNull(definition);
+
+        var tags = ReadTagDefinitionsFrom(cdxPath);
+        tags.RemoveAll(t => string.Equals(t.Name, definition.Name, StringComparison.OrdinalIgnoreCase));
+        tags.Add(definition);
+
+        Flush();
+        var rows = MaterializeRows();
+        CdxIndexBuilder.Build(cdxPath, _schema, rows, tags, evalContext, includeDeleted);
+        if (structural && !_hasStructuralCdx)
+        {
+            SetStructuralCdxFlag();
+            _hasStructuralCdx = true;
+            _usesStructuralScheme = VfpLock.UsesStructuralScheme(_version.Code, true);
+        }
+    }
+
+    /// <summary>
+    /// DELETE TAG — remove <paramref name="names"/> (or ALL when <paramref name="names"/> is
+    /// <see langword="null"/>) from the compound <c>.cdx</c> at <paramref name="cdxPath"/>, rebuilding
+    /// the remaining tags. When the last tag is removed the file is DELETED (VFP behaviour) and, for a
+    /// <paramref name="structural"/> sidecar, the DBF header structural bit is cleared. Returns the number
+    /// of tags remaining afterwards (0 ⇒ the file was deleted).
+    /// </summary>
+    public int DeleteTagsIn(string cdxPath, bool structural, IReadOnlyCollection<string>? names,
+        EvaluationContext? evalContext = null, bool includeDeleted = false)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(cdxPath);
+
+        var tags = ReadTagDefinitionsFrom(cdxPath);
+        if (tags.Count == 0)
+            return 0;
+
+        if (names is null)
+            tags.Clear();                                   // DELETE TAG ALL
+        else
+            tags.RemoveAll(t => names.Any(n => string.Equals(n, t.Name, StringComparison.OrdinalIgnoreCase)));
+
+        if (tags.Count == 0)
+        {
+            try { if (File.Exists(cdxPath)) File.Delete(cdxPath); } catch { /* best-effort */ }
+            if (structural && _hasStructuralCdx)
+            {
+                ClearStructuralCdxFlag();
+                _hasStructuralCdx = false;
+            }
+            return 0;
+        }
+
+        Flush();
+        var rows = MaterializeRows();
+        CdxIndexBuilder.Build(cdxPath, _schema, rows, tags, evalContext, includeDeleted);
+        return tags.Count;
+    }
+
+    /// <summary>Read the tag definitions currently in the compound <c>.cdx</c> at
+    /// <paramref name="cdxPath"/> (empty when the file is missing). Throws only when the file exists but
+    /// cannot be parsed.</summary>
+    private static List<CdxTagDefinition> ReadTagDefinitionsFrom(string cdxPath)
+    {
+        var result = new List<CdxTagDefinition>();
+        if (!File.Exists(cdxPath))
+            return result;
+
+        using var index = IndexFile.Open(cdxPath);
+        var fileHeader = index.ReadCdxHeader(0);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var byOffset = new List<(uint Offset, CdxTagDefinition Def)>();
+        foreach (var (headerOffset, nameBytes) in
+                 IndexTraversal.EnumerateCompact(index, fileHeader.Root, fileHeader.KeyLength, isCharacter: true))
+        {
+            string name = TrimName(nameBytes);
+            if (name.Length == 0 || !seen.Add(name))
+                continue;
+            var hdr = index.ReadCdxHeader(headerOffset);
+            string? forExpr = hdr.HasFor && hdr.ForExpression.Length > 0 ? hdr.ForExpression : null;
+            byOffset.Add((headerOffset, new CdxTagDefinition(name, hdr.KeyExpression, forExpr,
+                hdr.Descending, hdr.SortOrder, hdr.IsUnique)));
+        }
+        byOffset.Sort((a, b) => a.Offset.CompareTo(b.Offset));   // creation (header-layout) order.
+        foreach (var (_, def) in byOffset) result.Add(def);
+        return result;
     }
 
     /// <summary>The structural <c>.cdx</c> path beside the table (same stem, <c>.cdx</c> extension).</summary>
@@ -84,6 +199,11 @@ public sealed partial class DbfWriter
             var fileHeader = index.ReadCdxHeader(0);
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+            // The directory enumerates tags in NAME (B-tree) order, but VFP numbers tags by their
+            // HEADER-PAGE LAYOUT order (= creation order — the directory's "recno" is the header byte
+            // offset). Collect with that offset and sort by it so a rebuild preserves creation order —
+            // which is what TAG()/SYS(14)/DESCENDING() enumerate over (verified vs vfp9.exe).
+            var byOffset = new List<(uint Offset, CdxTagDefinition Def)>();
             foreach (var (headerOffset, nameBytes) in
                      IndexTraversal.EnumerateCompact(index, fileHeader.Root, fileHeader.KeyLength, isCharacter: true))
             {
@@ -93,14 +213,11 @@ public sealed partial class DbfWriter
 
                 var hdr = index.ReadCdxHeader(headerOffset);
                 string? forExpr = hdr.HasFor && hdr.ForExpression.Length > 0 ? hdr.ForExpression : null;
-                result.Add(new CdxTagDefinition(
-                    name,
-                    hdr.KeyExpression,
-                    forExpr,
-                    hdr.Descending,
-                    hdr.SortOrder,
-                    hdr.IsUnique));
+                byOffset.Add((headerOffset, new CdxTagDefinition(
+                    name, hdr.KeyExpression, forExpr, hdr.Descending, hdr.SortOrder, hdr.IsUnique)));
             }
+            byOffset.Sort((a, b) => a.Offset.CompareTo(b.Offset));
+            foreach (var (_, def) in byOffset) result.Add(def);
         }
         catch (Exception ex)
         {

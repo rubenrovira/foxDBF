@@ -233,23 +233,26 @@ public sealed class MicroVfpIndexWriteTests
         Assert.True(b.Bool("FOUND()"));
     }
 
-    // ─────────────────────────── unsupported forms must throw (not no-op) ───────────────────────────
+    // ─────────────────────────── standalone .idx / non-structural .cdx now BUILD (INDEX/ORDER MODEL) ───────────────────────────
+    // (These forms USED to be catchable refusals; the multi-index pipeline now implements them — the full
+    // behaviour is pinned in MicroVfpIndexModelTests. Here we only confirm the file is produced.)
 
     [Fact]
-    public void IndexOn_ToStandaloneIdxFile_ThrowsClearError()
+    public void IndexOn_ToStandaloneIdxFile_BuildsIdx()
     {
         using var b = new Bench();
-        // No .idx writer / no multi-index-per-area model yet → must be an explicit, catchable refusal.
-        Assert.Throws<MicroVfpRuntimeException>(() =>
-            b.Run("USE people\nINDEX ON id TO people_id"));
+        b.Run("USE people\nINDEX ON id TO people_id");
+        Assert.True(File.Exists(Path.Combine(b.Dir, "people_id.idx")),
+            "INDEX ON … TO people_id did not create the standalone .idx.");
     }
 
     [Fact]
-    public void IndexOn_TagOfNonStructuralCdx_ThrowsClearError()
+    public void IndexOn_TagOfNonStructuralCdx_BuildsCdx()
     {
         using var b = new Bench();
-        Assert.Throws<MicroVfpRuntimeException>(() =>
-            b.Run("USE people\nINDEX ON id TAG x OF other.cdx"));
+        b.Run("USE people\nINDEX ON id TAG x OF other.cdx");
+        Assert.True(File.Exists(Path.Combine(b.Dir, "other.cdx")),
+            "INDEX ON … TAG x OF other.cdx did not create the non-structural .cdx.");
     }
 
     // ─────────────────────────── review MUST-FIX regressions ───────────────────────────

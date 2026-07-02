@@ -512,7 +512,7 @@ internal static class CdxIndexBuilder
     }
 
     /// <summary>Resolve the on-disk key type, byte length and char-ness for a tag KEY expression.</summary>
-    private static (IndexKeyType Type, int KeyLen, bool IsChar) ResolveKey(DbfTable schema, string keyExpr)
+    internal static (IndexKeyType Type, int KeyLen, bool IsChar) ResolveKey(DbfTable schema, string keyExpr)
     {
         string field = (keyExpr ?? string.Empty).Trim();
         foreach (var col in schema.Columns)
@@ -735,7 +735,7 @@ internal static class CdxIndexBuilder
     }
 
     /// <summary>Adapts a <see cref="DbfRecord"/> to the expression engine row contract.</summary>
-    private sealed class RowContext : IRowContext
+    internal sealed class RowContext : IRowContext
     {
         private readonly DbfRecord _record;
         public RowContext(DbfRecord record, int recNo, int recCount) { _record = record; RecNo = recNo; RecCount = recCount; }
@@ -773,7 +773,7 @@ internal static class CdxIndexBuilder
     }
 
     /// <summary>Adapts a <see cref="DbfTable"/> to the expression engine static-schema contract.</summary>
-    private sealed class TableSchema : ISchema
+    internal sealed class TableSchema : ISchema
     {
         private readonly DbfTable _table;
         public TableSchema(DbfTable table) => _table = table;

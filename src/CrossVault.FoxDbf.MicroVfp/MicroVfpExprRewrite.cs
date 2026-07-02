@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 
 namespace CrossVault.FoxDbf.MicroVfp;
@@ -41,6 +42,8 @@ internal static class MicroVfpExprRewrite
         s = ConvertSubscripts(s);
         s = QuoteArrayFnArg(s, "ALEN");
         s = QuoteArrayFnArg(s, "AERROR");
+        s = QuoteArrayFnArg(s, "ATAGINFO");   // ATAGINFO(ArrayName [, cTagFile [, area]]) — name by reference.
+        s = QuoteLookupArgs(s);               // LOOKUP(rReturn, eSearch, rSearched [, cTag]) — field names by reference.
         return s;
     }
 
@@ -108,6 +111,101 @@ internal static class MicroVfpExprRewrite
             i++;
         }
         return sb.ToString();
+    }
+
+    /// <summary>Quote the field-NAME arguments of every <c>LOOKUP( … )</c> call — the 1st (rReturn) and
+    /// 3rd (rSearched) positional args — when they are bare field references, so the host receives the
+    /// NAMES (VFP takes field names there, not values). The 2nd (search value) and 4th (tag) are left as
+    /// evaluated expressions. String-literal aware; nested parens/strings respected in the arg split.</summary>
+    private static string QuoteLookupArgs(string s)
+    {
+        int upper = s.IndexOf("LOOKUP", StringComparison.OrdinalIgnoreCase);
+        if (upper < 0) return s;
+
+        var sb = new StringBuilder(s.Length + 8);
+        int i = 0;
+        while (i < s.Length)
+        {
+            char c = s[i];
+            if (c == '\'' || c == '"')
+            {
+                char q = c; sb.Append(c); i++;
+                while (i < s.Length) { sb.Append(s[i]); if (s[i] == q) break; i++; }
+                i++;
+                continue;
+            }
+            if (char.IsAsciiLetter(c) || c == '_')
+            {
+                int start = i; i++;
+                while (i < s.Length && IsIdentChar(s[i])) i++;
+                string ident = s.Substring(start, i - start);
+                int p = i;
+                while (p < s.Length && char.IsWhiteSpace(s[p])) p++;
+                if (ident.Equals("LOOKUP", StringComparison.OrdinalIgnoreCase) && p < s.Length && s[p] == '(')
+                {
+                    int close = MatchParen(s, p);
+                    if (close > p)
+                    {
+                        string inner = s.Substring(p + 1, close - p - 1);
+                        var parts = new List<string>(SplitTopLevelCommas(inner));
+                        if (parts.Count >= 1) parts[0] = QuoteIfBareField(parts[0]);
+                        if (parts.Count >= 3) parts[2] = QuoteIfBareField(parts[2]);
+                        sb.Append(ident).Append('(').Append(string.Join(",", parts)).Append(')');
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                sb.Append(ident);
+                continue;
+            }
+            sb.Append(c);
+            i++;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Wrap a bare field reference (an identifier, optionally <c>alias.field</c>) in single quotes;
+    /// leave anything else (a literal, a number, an expression) untouched.</summary>
+    private static string QuoteIfBareField(string part)
+    {
+        string t = part.Trim();
+        if (t.Length == 0 || !(char.IsAsciiLetter(t[0]) || t[0] == '_')) return part;
+        foreach (char ch in t)
+            if (!(IsIdentChar(ch) || ch == '.')) return part;
+        return "'" + t + "'";
+    }
+
+    /// <summary>Index of the <c>)</c> matching the <c>(</c> at <paramref name="open"/> (string-aware), or −1.</summary>
+    private static int MatchParen(string s, int open)
+    {
+        int depth = 0; bool inStr = false; char q = '\0';
+        for (int i = open; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (inStr) { if (c == q) inStr = false; continue; }
+            if (c == '\'' || c == '"') { inStr = true; q = c; continue; }
+            if (c == '(') depth++;
+            else if (c == ')') { depth--; if (depth == 0) return i; }
+        }
+        return -1;
+    }
+
+    /// <summary>Split at TOP-LEVEL commas (ignoring commas inside nested parens/brackets or strings).</summary>
+    private static IEnumerable<string> SplitTopLevelCommas(string s)
+    {
+        var result = new List<string>();
+        int depth = 0; bool inStr = false; char q = '\0'; int start = 0;
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (inStr) { if (c == q) inStr = false; continue; }
+            if (c == '\'' || c == '"') { inStr = true; q = c; continue; }
+            if (c is '(' or '[') depth++;
+            else if (c is ')' or ']') depth--;
+            else if (c == ',' && depth == 0) { result.Add(s.Substring(start, i - start)); start = i + 1; }
+        }
+        result.Add(s.Substring(start));
+        return result;
     }
 
     /// <summary>Having just emitted the function name (cursor at <paramref name="i"/>), if a <c>(</c> +

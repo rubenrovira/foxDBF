@@ -58,6 +58,11 @@ public sealed class VfpInterpreter
     private sealed class FileSnapshot { public string Path = ""; public byte[]? Dbf; public byte[]? Cdx; public byte[]? Fpt; }
     private readonly List<TxnFrame> _txn = new();
 
+    // ── SET NEAR (per data-session; microVFP INDEX/ORDER MODEL) ──
+    // When ON, a failed SEEK leaves the pointer on the record just past where the key would sort
+    // (EOF if past the end) instead of at EOF. Read back via SET("NEAR"). Scope: SEEK only.
+    private bool _setNear;
+
     // ── SET RELATION (multi-table relation model; microVFP P1 gap #2) ──
     // Re-entrancy guard: while a parent move is repositioning its children, the child moves (SEEK/GOTO)
     // must NOT themselves re-fire the reposition hook — chaining is driven explicitly by
@@ -479,6 +484,8 @@ public sealed class VfpInterpreter
             case SetOrderStmt so: ExecSetOrder(so); break;
             case IndexStmt ix: ExecIndex(ix); break;
             case ReindexStmt rix: ExecReindex(rix); break;
+            case DeleteTagStmt dt: ExecDeleteTag(dt); break;
+            case SetIndexStmt si: ExecSetIndex(si); break;
             case SetStmt set: ExecSet(set); break;
             case SetRelationStmt sr: ExecSetRelation(sr); break;
             case SetRelationOffStmt sro: ExecSetRelationOff(sro); break;
@@ -675,10 +682,42 @@ public sealed class VfpInterpreter
         var wa = Session.FindAreaByAlias(aliasName);
         if (wa is not null)
         {
-            string? order = u.Order is null ? null : NameOf(u.Order);
-            _meta[wa.Area] = new AreaMeta { Order = string.IsNullOrEmpty(order) ? null : order };
+            var m = new AreaMeta();
+            _meta[wa.Area] = m;
+
+            // USE … INDEX <list> — open+track the named non-structural index files (was a no-op).
+            if (u.Index is { Count: > 0 } && wa.Table.SourcePath is string tpath)
+                foreach (var f in u.Index)
+                {
+                    string fp = ResolveExistingIndexPath(tpath, NameOf(f).Trim());
+                    if (File.Exists(fp)) AddExtraIndex(wa.Area, fp);
+                }
+
+            // Controlling order: an explicit ORDER wins; else the FIRST listed index becomes master.
+            string? orderName = u.Order is null ? null : NameOf(u.Order).Trim();
+            if (!string.IsNullOrEmpty(orderName))
+                m.Order = ResolveOrderName(wa.Area, orderName);
+            else if (m.ExtraIndexes is { Count: > 0 })
+                m.Order = FirstIndexIdentity(wa.Area);
+
             GoTop(wa.Area);
         }
+    }
+
+    /// <summary>The controlling-order identity of the FIRST opened non-structural index of
+    /// <paramref name="area"/> — a standalone <c>.idx</c>'s stem, or the first tag of a <c>.cdx</c>.</summary>
+    private string? FirstIndexIdentity(int area)
+    {
+        var extras = Meta(area).ExtraIndexes;
+        if (extras is null || extras.Count == 0) return null;
+        string p = extras[0];
+        if (IsIdxPath(p)) return IdxOrderName(p);
+        try
+        {
+            using var cdx = CdxFile.Open(p, Session.AreaAt(area)?.Table);
+            return TagsInLayoutOrder(cdx).FirstOrDefault()?.Name;
+        }
+        catch { return null; }
     }
 
     private void ExecSelectArea(SelectAreaStmt sa)
@@ -827,7 +866,7 @@ public sealed class VfpInterpreter
         // separate, out-of-scope refinement — here the override lasts until the next SET ORDER.)
         if (so.Direction is bool wantDescending)
         {
-            bool tagDescending = MasterTag(area)?.Descending ?? false;
+            bool tagDescending = MasterDescending(area);
             m.OrderReversed = wantDescending != tagDescending;
         }
         else
@@ -844,19 +883,17 @@ public sealed class VfpInterpreter
     private string? ResolveOrderName(int area, string? name)
     {
         if (string.IsNullOrEmpty(name)) return null;
-        var names = Session.AreaAt(area)?.Cdx?.TagNames;
+        var inv = IndexInventory(area);   // full open set: idx + structural cdx tags + extra cdx tags.
         if (int.TryParse(name, out int n))
         {
             if (n <= 0) return null;   // SET ORDER TO 0 ⇒ natural/record order.
-            if (names is not null && n <= names.Count) return names[n - 1];
+            if (n <= inv.Count) return inv[n - 1].Name;
             throw new MicroVfpRuntimeException(
-                $"SET ORDER TO {n}: index number is out of range (the work area has " +
-                $"{(names?.Count ?? 0)} tag(s)).");
+                $"SET ORDER TO {n}: index number is out of range (the work area has {inv.Count} index(es)).");
         }
-        if (names is not null)
-            foreach (var tagName in names)
-                if (string.Equals(tagName, name, StringComparison.OrdinalIgnoreCase))
-                    return tagName;
+        foreach (var slot in inv)
+            if (string.Equals(slot.Name, name, StringComparison.OrdinalIgnoreCase))
+                return slot.Name;
         throw new MicroVfpRuntimeException($"SET ORDER TO {name}: tag not found in the current work area.");
     }
 
@@ -881,20 +918,6 @@ public sealed class VfpInterpreter
         if (wa is null)
             throw new MicroVfpRuntimeException("INDEX ON: no table is open in the current work area.");
 
-        // Unsupported forms → an explicit, catchable refusal (never a silent no-op).
-        if (ix.ToIdx is not null || ix.Tag is null)
-            throw new MicroVfpRuntimeException(
-                "INDEX ON … TO <idx>: standalone .idx indexes are not supported — use INDEX ON … TAG <name> " +
-                "(into the structural .cdx).");
-        if (ix.OfCdx is not null)
-            throw new MicroVfpRuntimeException(
-                "INDEX ON … TAG … OF <cdx>: non-structural .cdx files are not supported — only the structural .cdx.");
-
-        // VFP UPPERCASES the tag name in the .cdx directory (verified byte-for-byte vs VFP9); the KEY /
-        // FOR expression case is PRESERVED as typed (matches the reverse-engineered DBC .dcx).
-        string tagName = NameOf(ix.Tag).Trim().ToUpperInvariant();
-        if (tagName.Length == 0)
-            throw new MicroVfpRuntimeException("INDEX ON: a TAG name is required.");
         if (wa.Table.SourcePath is not string path)
             throw new MicroVfpRuntimeException("INDEX ON: the current table has no file on disk.");
 
@@ -904,8 +927,44 @@ public sealed class VfpInterpreter
         // UNIQUE clause OR the SET UNIQUE session default (candidate is a distinct constraint, not UNIQUE).
         bool unique = ix.Unique || (Runtime.Unique && !candidate);
         string collation = _ctx.Collation?.Name ?? "MACHINE";
+        var m = Meta(area);
+
+        // ── INDEX ON eExpr TO <idx> — build a standalone legacy .idx and make it the controlling order. ──
+        if (ix.ToIdx is not null)
+        {
+            string idxPath = ResolveSidecarPath(path, NameOf(ix.ToIdx).Trim(), ".idx");
+            BuildTagOnDisk(path, w => w.CreateStandaloneIdx(idxPath, keyExpr, forExpr, unique, _ctx, !_ctx.Deleted));
+            AddExtraIndex(area, idxPath);
+            m.Order = IdxOrderName(idxPath);
+            ResetOrderState(m);
+            GoTop(area);
+            return;
+        }
+
+        if (ix.Tag is null)
+            throw new MicroVfpRuntimeException("INDEX ON: a TAG name is required.");
+
+        // VFP UPPERCASES the tag name in the .cdx directory (verified byte-for-byte vs VFP9); the KEY /
+        // FOR expression case is PRESERVED as typed (matches the reverse-engineered DBC .dcx).
+        string tagName = NameOf(ix.Tag).Trim().ToUpperInvariant();
+        if (tagName.Length == 0)
+            throw new MicroVfpRuntimeException("INDEX ON: a TAG name is required.");
+
         var def = new CdxTagDefinition(tagName, keyExpr, forExpr, ix.Descending, collation, unique);
 
+        // ── INDEX ON eExpr TAG cTag OF <cdx> — build a tag in a NAMED (non-structural) compound index. ──
+        if (ix.OfCdx is not null)
+        {
+            string cdxPath = ResolveSidecarPath(path, NameOf(ix.OfCdx).Trim(), ".cdx");
+            BuildTagOnDisk(path, w => w.CreateTagIn(cdxPath, structural: false, def, _ctx, !_ctx.Deleted));
+            AddExtraIndex(area, cdxPath);
+            m.Order = tagName;
+            ResetOrderState(m);
+            GoTop(area);
+            return;
+        }
+
+        // ── structural .cdx tag (the already-shipped path). ──
         // CANDIDATE: capture the pre-image so a uniqueness violation rolls the .cdx/.dbf back (VFP does not
         // create the tag on a duplicate).
         FileSnapshot? pre = candidate ? CaptureSnapshot(path) : null;
@@ -925,12 +984,305 @@ public sealed class VfpInterpreter
         }
 
         // The new tag becomes the controlling order (VFP behaviour) and the pointer goes to its top.
-        var m = Meta(area);
         m.Order = tagName;
-        m.OrderReversed = false;   // a fresh INDEX ON resets any prior SET ORDER … DESCENDING override.
+        ResetOrderState(m);
+        GoTop(area);
+    }
+
+    /// <summary>Reset the cached index sequence + any SET KEY range after the controlling order changes
+    /// (a fresh INDEX ON / SET ORDER re-bases GO TOP / SKIP and clears any DESCENDING override).</summary>
+    private static void ResetOrderState(AreaMeta m)
+    {
+        m.OrderReversed = false;
         m.Ordered = null; m.OrderedFor = null; m.OrderPos = -1;
         m.KeySet = false; m.KeyRange = false; m.KeyLow = null; m.KeyHigh = null; m.KeyVisible = null;
-        GoTop(area);
+    }
+
+    /// <summary>Resolve a sidecar index file path relative to the table's directory: an explicit
+    /// extension is honoured, else <paramref name="defaultExt"/> is appended.</summary>
+    private static string ResolveSidecarPath(string tablePath, string name, string defaultExt)
+    {
+        string dir = Path.GetDirectoryName(Path.GetFullPath(tablePath)) ?? ".";
+        string file = Path.HasExtension(name) ? name : name + defaultExt;
+        return Path.IsPathRooted(file) ? Path.GetFullPath(file) : Path.GetFullPath(Path.Combine(dir, file));
+    }
+
+    /// <summary>The controlling-order identity a standalone <c>.idx</c> is addressed by — its file stem,
+    /// uppercased (an <c>.idx</c> has no tag name).</summary>
+    private static string IdxOrderName(string idxPath)
+        => Path.GetFileNameWithoutExtension(idxPath).ToUpperInvariant();
+
+    /// <summary>Track <paramref name="fullPath"/> as an open non-structural index of <paramref name="area"/>
+    /// (idempotent; case-insensitive).</summary>
+    private void AddExtraIndex(int area, string fullPath)
+    {
+        var m = Meta(area);
+        m.ExtraIndexes ??= new List<string>();
+        if (!m.ExtraIndexes.Any(p => SamePath(p, fullPath)))
+            m.ExtraIndexes.Add(Path.GetFullPath(fullPath));
+    }
+
+    // ─────────────────────────── DELETE TAG / SET INDEX (microVFP INDEX/ORDER MODEL) ───────────────────────────
+
+    /// <summary>DELETE TAG cTag[, …] | ALL [OF cCdx] — rebuild the target compound <c>.cdx</c> without the
+    /// named tag(s) (structural by default, or the named <c>OF</c> file). ALL removes every tag (and, when
+    /// the file becomes empty, VFP deletes it). Deleting the controlling order reverts to natural order.</summary>
+    private void ExecDeleteTag(DeleteTagStmt dt)
+    {
+        int area = dt.In is not null ? ResolveAreaRef(dt.In) : Session.CurrentArea;
+        var wa = Session.AreaAt(area);
+        if (wa?.Table.SourcePath is not string path)
+            throw new MicroVfpRuntimeException("DELETE TAG: no table is open in the work area.");
+
+        bool structural = dt.OfCdx is null;
+        string cdxPath = structural
+            ? Path.ChangeExtension(path, ".cdx")
+            : ResolveSidecarPath(path, NameOf(dt.OfCdx!).Trim(), ".cdx");
+        IReadOnlyCollection<string>? names = dt.All ? null : dt.Tags;
+
+        BuildTagOnDisk(path, w => w.DeleteTagsIn(cdxPath, structural, names, _ctx, includeDeleted: !_ctx.Deleted));
+
+        // A non-structural .cdx that was emptied+deleted is no longer an open index.
+        if (!structural && !File.Exists(cdxPath))
+        {
+            var mm = Meta(area);
+            mm.ExtraIndexes?.RemoveAll(p => SamePath(p, cdxPath));
+        }
+
+        // If the controlling order was among the removed tags, VFP reverts to natural (record) order.
+        var m = Meta(area);
+        if (!string.IsNullOrEmpty(m.Order))
+        {
+            var src = OpenOrderSource(area, m.Order!);
+            if (src is null) { m.Order = null; ResetOrderState(m); }
+            else src.Dispose();
+        }
+    }
+
+    /// <summary>SET INDEX TO [cList] [ORDER …] [ADDITIVE] — open the listed non-structural index files in
+    /// the current work area. Without ADDITIVE the previously-opened non-structural indexes are closed
+    /// first; <c>SET INDEX TO</c> (no args) closes them all. ORDER selects the controlling tag.</summary>
+    private void ExecSetIndex(SetIndexStmt si)
+    {
+        int area = Session.CurrentArea;
+        var wa = Session.AreaAt(area);
+        if (wa?.Table.SourcePath is not string path)
+            throw new MicroVfpRuntimeException("SET INDEX TO: no table is open in the current work area.");
+        var m = Meta(area);
+
+        if (!si.Additive)
+            m.ExtraIndexes = null;   // replace: close previously-opened non-structural indexes.
+
+        foreach (var f in si.Files)
+        {
+            string fp = ResolveExistingIndexPath(path, NameOf(f).Trim());
+            if (!File.Exists(fp))
+                throw new MicroVfpRuntimeException($"SET INDEX TO: index file '{NameOf(f)}' was not found.");
+            AddExtraIndex(area, fp);
+        }
+
+        if (si.Order is not null)
+        {
+            m.Order = ResolveOrderName(area, NameOf(si.Order).Trim());
+            if (si.Direction is bool wantDesc)
+            {
+                bool tagDesc = MasterDescending(area);
+                m.OrderReversed = wantDesc != tagDesc;
+            }
+            else m.OrderReversed = false;
+            m.Ordered = null; m.OrderedFor = null; m.OrderPos = -1;
+            m.KeySet = false; m.KeyRange = false; m.KeyLow = null; m.KeyHigh = null; m.KeyVisible = null;
+            GoTop(area);
+        }
+        else if (!string.IsNullOrEmpty(m.Order))
+        {
+            // Closing indexes may have invalidated the controlling order → revert to natural order.
+            if (OpenOrderSource(area, m.Order!) is { } src) src.Dispose();
+            else { m.Order = null; ResetOrderState(m); }
+        }
+    }
+
+    // ─────────────────────────── multi-index inventory + order resolution ───────────────────────────
+
+    /// <summary>One addressable index in a work area's OPEN SET, in tag-number order.</summary>
+    private sealed class IndexSlot
+    {
+        public string Name = "";       // tag name (CDX) or file stem uppercased (standalone IDX).
+        public string FilePath = "";   // owning index file.
+        public bool IsIdx;
+        public bool Structural;
+        public string KeyExpr = "";
+        public string ForExpr = "";
+        public bool Descending;
+        public bool Unique;
+        public string Collation = "MACHINE";
+    }
+
+    /// <summary>The area's open index set in TAG-NUMBER order: standalone <c>.idx</c> files (open order)
+    /// first, then the structural <c>.cdx</c> tags (creation/header-layout order), then each additional
+    /// <c>.cdx</c>'s tags (open order). Opens the extra files on demand — never held long-term.</summary>
+    private List<IndexSlot> IndexInventory(int area)
+    {
+        var slots = new List<IndexSlot>();
+        var wa = Session.AreaAt(area);
+        if (wa is null) return slots;
+        var extras = _meta.TryGetValue(area, out var m) ? m.ExtraIndexes : null;
+
+        // 1) standalone .idx files (open order).
+        if (extras is not null)
+            foreach (var p in extras)
+                if (IsIdxPath(p))
+                    try
+                    {
+                        using var idx = IdxFile.Open(p);
+                        var h = idx.Header;
+                        slots.Add(new IndexSlot
+                        {
+                            Name = IdxOrderName(p), FilePath = p, IsIdx = true,
+                            KeyExpr = h.KeyExpression.Trim(), ForExpr = h.ForExpression.Trim(),
+                            Descending = false, Unique = h.IsUnique, Collation = "MACHINE",
+                        });
+                    }
+                    catch { /* unreadable idx → skip */ }
+
+        // 2) structural .cdx tags (creation order = ascending root-page offset).
+        if (wa.Cdx is not null)
+            foreach (var tag in TagsInLayoutOrder(wa.Cdx))
+                slots.Add(SlotForTag(tag, wa.Cdx.SourcePath ?? string.Empty, structural: true));
+
+        // 3) additional .cdx tags (open order).
+        if (extras is not null)
+            foreach (var p in extras)
+                if (!IsIdxPath(p))
+                    try
+                    {
+                        using var cdx = CdxFile.Open(p, wa.Table);
+                        foreach (var tag in TagsInLayoutOrder(cdx))
+                            slots.Add(SlotForTag(tag, p, structural: false));
+                    }
+                    catch { /* unreadable cdx → skip */ }
+
+        return slots;
+    }
+
+    private static IndexSlot SlotForTag(Index.CdxTag tag, string filePath, bool structural) => new()
+    {
+        Name = tag.Name, FilePath = filePath, IsIdx = false,
+        KeyExpr = tag.KeyExpression.Trim(), ForExpr = tag.ForExpression.Trim(),
+        Descending = tag.Descending, Unique = tag.IsUnique,
+        Collation = string.IsNullOrEmpty(tag.Collation) ? "MACHINE" : tag.Collation,
+        Structural = structural,
+    };
+
+    /// <summary>The tags of a compound index in CREATION (header-page layout) order — ascending root-page
+    /// offset (the directory enumerates them by NAME, but VFP numbers by layout order).</summary>
+    private static IEnumerable<Index.CdxTag> TagsInLayoutOrder(CdxFile cdx)
+        => cdx.TagNames.Select(n => cdx.Tag(n)).Where(t => t is not null).Select(t => t!)
+              .OrderBy(t => t.RootPageOffset);
+
+    private static bool IsIdxPath(string p)
+        => string.Equals(Path.GetExtension(p), ".idx", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Resolve an index-file name for SET INDEX / USE … INDEX: an explicit extension wins, else an
+    /// existing <c>.cdx</c> then <c>.idx</c> beside the table, defaulting to <c>.cdx</c>.</summary>
+    private static string ResolveExistingIndexPath(string tablePath, string name)
+    {
+        if (Path.HasExtension(name)) return ResolveSidecarPath(tablePath, name, Path.GetExtension(name));
+        foreach (var ext in new[] { ".cdx", ".idx" })
+        {
+            string cand = ResolveSidecarPath(tablePath, name, ext);
+            if (File.Exists(cand)) return cand;
+        }
+        return ResolveSidecarPath(tablePath, name, ".cdx");
+    }
+
+    /// <summary>A live handle on a controlling ORDER (a CDX tag or a standalone IDX), plus the temp file
+    /// handle to release when done (null for the structural <c>.cdx</c>, which the work area owns).</summary>
+    private sealed class OrderSource : IDisposable
+    {
+        public Index.CdxTag? CdxTag;
+        public IdxFile? Idx;
+        public IndexKeyType IdxKeyType;
+        public bool Descending;
+        public string Name = "";
+        private readonly IDisposable? _owner;
+        public OrderSource(IDisposable? owner) => _owner = owner;
+        public void Dispose() => _owner?.Dispose();
+
+        // ── uniform key metadata across a CDX tag OR a standalone .idx (legacy .idx is always MACHINE-
+        // collated raw code-page bytes, ascending) so the SET KEY / master-tag callers work regardless
+        // of which open index the controlling order was sourced from. ──
+        public bool IsCharacterKey => CdxTag?.IsCharacterKey ?? (IdxKeyType == IndexKeyType.Character);
+        public IndexKeyType KeyType => CdxTag?.KeyType ?? IdxKeyType;
+        public int KeyLength => CdxTag?.KeyLength ?? (Idx?.KeyLength ?? 0);
+        public string CollationName =>
+            CdxTag is { } t && !string.IsNullOrEmpty(t.Collation) ? t.Collation : "MACHINE";
+        public IndexKey DecodeKey(byte[] keyBytes) =>
+            CdxTag is { } t ? t.DecodeKey(keyBytes) : IndexKey.Decode(keyBytes, IdxKeyType);
+    }
+
+    /// <summary>Resolve an ORDER identity (tag name or standalone-IDX stem) to a live <see cref="OrderSource"/>
+    /// across the FULL open index set (structural <c>.cdx</c>, then extra <c>.idx</c>/<c>.cdx</c>), or null
+    /// when unresolved. The caller MUST dispose the result.</summary>
+    private OrderSource? OpenOrderSource(int area, string identity)
+    {
+        var wa = Session.AreaAt(area);
+        if (wa is null || string.IsNullOrEmpty(identity)) return null;
+
+        // structural .cdx first (owner null — the work area keeps it open).
+        if (wa.Cdx is not null)
+        {
+            var t = wa.Cdx.Tag(identity) ?? wa.Cdx.Tag(identity.ToUpperInvariant());
+            if (t is not null) return new OrderSource(null) { CdxTag = t, Descending = t.Descending, Name = t.Name };
+        }
+
+        var extras = _meta.TryGetValue(area, out var m) ? m.ExtraIndexes : null;
+        if (extras is null) return null;
+        foreach (var p in extras)
+        {
+            if (IsIdxPath(p))
+            {
+                if (string.Equals(IdxOrderName(p), identity, StringComparison.OrdinalIgnoreCase))
+                {
+                    var idx = IdxFile.Open(p);
+                    return new OrderSource(idx)
+                    {
+                        Idx = idx, Name = IdxOrderName(p),
+                        IdxKeyType = IndexKey.ResolveType(idx.Header.KeyExpression.Trim(), wa.Table),
+                    };
+                }
+            }
+            else
+            {
+                var cdx = CdxFile.Open(p, wa.Table);
+                var t = cdx.Tag(identity) ?? cdx.Tag(identity.ToUpperInvariant());
+                if (t is not null)
+                    return new OrderSource(cdx) { CdxTag = t, Descending = t.Descending, Name = t.Name };
+                cdx.Dispose();
+            }
+        }
+        return null;
+    }
+
+    /// <summary>The default controlling-order identity for a SEEK with no explicit tag and no active order:
+    /// the current order, else the first structural tag, else the first inventory slot.</summary>
+    private string? DefaultOrderIdentity(int area)
+    {
+        var m = Meta(area);
+        if (!string.IsNullOrEmpty(m.Order)) return m.Order;
+        var inv = IndexInventory(area);
+        return inv.Count > 0 ? inv[0].Name : null;
+    }
+
+    /// <summary>The (key, recno) entries of an order in CONTROLLING order (a CDX tag reverses for a
+    /// DESCENDING tag; a standalone IDX is ascending).</summary>
+    private static IEnumerable<(byte[] Key, int Recno)> OrderedEntries(OrderSource src)
+    {
+        if (src.CdxTag is { } t)
+            return t.EnumerateEntries().Select(e => (e.Key, (int)e.RecordNumber));
+        if (src.Idx is { } idx)
+            return idx.EnumerateEntries().Select(e => (e.Key, (int)e.RecordNumber));
+        return Array.Empty<(byte[], int)>();
     }
 
     private void ExecReindex(ReindexStmt rix)
@@ -1057,18 +1409,23 @@ public sealed class VfpInterpreter
             return;
         }
 
-        if (MasterTag(area) is not { } master)
-            throw new MicroVfpRuntimeException(
-                "SET KEY TO: no controlling index is active in the current work area (SET ORDER first).");
+        // The controlling order may be sourced from ANY open index (structural/extra .cdx or standalone
+        // .idx), so resolve the master through the full-inventory path — not just the structural .cdx.
+        using (var master = OpenMasterOrder(area))
+        {
+            if (master is null)
+                throw new MicroVfpRuntimeException(
+                    "SET KEY TO: no controlling index is active in the current work area (SET ORDER first).");
 
-        // A NON-character key whose logical type cannot be resolved (a composite expression that isn't a
-        // bare numeric/date field) cannot be decoded into a comparable value, so a range over it would
-        // silently mismatch. Refuse LOUDLY rather than produce a wrong (empty / full) visible set.
-        // Character keys are always handled byte-wise (below) — including UPPER(name)-style expressions
-        // and GENERAL-collated weights — so they never hit this guard.
-        if (!master.IsCharacterKey && master.KeyType == IndexKeyType.Unknown)
-            throw new MicroVfpRuntimeException(
-                "SET KEY TO: the controlling index key type cannot be decoded for a range restriction.");
+            // A NON-character key whose logical type cannot be resolved (a composite expression that isn't a
+            // bare numeric/date field) cannot be decoded into a comparable value, so a range over it would
+            // silently mismatch. Refuse LOUDLY rather than produce a wrong (empty / full) visible set.
+            // Character keys are always handled byte-wise (below) — including UPPER(name)-style expressions
+            // and GENERAL-collated weights — so they never hit this guard.
+            if (!master.IsCharacterKey && master.KeyType == IndexKeyType.Unknown)
+                throw new MicroVfpRuntimeException(
+                    "SET KEY TO: the controlling index key type cannot be decoded for a range restriction.");
+        }
 
         bool rangeKw = PrgScan.FirstWord(rest).Equals("RANGE", StringComparison.OrdinalIgnoreCase);
         if (rangeKw) rest = PrgScan.AfterFirstWord(rest).Trim();
@@ -1092,13 +1449,21 @@ public sealed class VfpInterpreter
         m.KeyVisible = null;   // rebuilt lazily by Visible().
     }
 
-    /// <summary>The controlling (master) tag of <paramref name="area"/>, or null when none is active.</summary>
-    private CdxTag? MasterTag(int area)
+    /// <summary>Open the controlling (master) ORDER of <paramref name="area"/> across the FULL open index
+    /// set (structural <c>.cdx</c>, extra <c>.cdx</c>, standalone <c>.idx</c>), or null when none is active.
+    /// The caller MUST dispose the result (it may own a temp file handle).</summary>
+    private OrderSource? OpenMasterOrder(int area)
     {
-        var wa = Session.AreaAt(area);
         var m = Meta(area);
-        if (wa?.Cdx is null || string.IsNullOrEmpty(m.Order)) return null;
-        return wa.Cdx.Tag(m.Order!) ?? wa.Cdx.Tag(m.Order!.ToUpperInvariant());
+        return string.IsNullOrEmpty(m.Order) ? null : OpenOrderSource(area, m.Order!);
+    }
+
+    /// <summary>The STORED traversal direction of the controlling order, resolved over the full open set
+    /// (a standalone <c>.idx</c> is always ascending). Feeds the SET ORDER … ASCENDING|DESCENDING override.</summary>
+    private bool MasterDescending(int area)
+    {
+        using var src = OpenMasterOrder(area);
+        return src?.Descending ?? false;
     }
 
     /// <summary>Build the set of recnos whose master-index key falls in the area's active SET KEY range.
@@ -1109,34 +1474,36 @@ public sealed class VfpInterpreter
     private HashSet<int> BuildKeyVisible(VfpSession.WorkArea wa, AreaMeta m)
     {
         var set = new HashSet<int>();
-        var tag = MasterTag(wa.Area);
-        if (tag is null)
+        // Resolve the controlling order across the FULL open index set (structural/extra .cdx or
+        // standalone .idx), not just the structural .cdx, so SET KEY works for any open index.
+        using var src = OpenMasterOrder(wa.Area);
+        if (src is null)
         {
             for (int r = 1; r <= wa.Table.RecordCount; r++) set.Add(r);
             return set;
         }
 
-        if (tag.IsCharacterKey)
+        if (src.IsCharacterKey)
         {
-            var coll = VfpCollations.FromSortSequence(tag.Collation);
+            var coll = VfpCollations.FromSortSequence(src.CollationName);
             // Encode each bound the SAME way the tag stores keys: collated weights padded (0x20) to the
             // tag key length. Comparing bytes then mirrors the on-disk sort order exactly (this is what
             // SEEK does), so a GENERAL tag's weight keys and a MACHINE tag's raw bytes both match.
-            byte[]? loBytes = m.KeyLow is { } lo ? CollatedBoundKey(coll, lo, tag.KeyLength) : null;
-            byte[]? hiBytes = m.KeyRange && m.KeyHigh is { } hi ? CollatedBoundKey(coll, hi, tag.KeyLength) : null;
+            byte[]? loBytes = m.KeyLow is { } lo ? CollatedBoundKey(coll, lo, src.KeyLength) : null;
+            byte[]? hiBytes = m.KeyRange && m.KeyHigh is { } hi ? CollatedBoundKey(coll, hi, src.KeyLength) : null;
             byte[]? loNatural = !m.KeyRange && m.KeyLow is { } lo1 ? coll.GetCollatedKey((lo1.AsString ?? string.Empty).AsSpan()) : null;
-            foreach (var e in tag.EnumerateEntries())
+            foreach (var (key, recno) in OrderedEntries(src))
             {
-                if (CharKeyInRange(m, e.Key, loBytes, hiBytes, loNatural))
-                    set.Add((int)e.RecordNumber);
+                if (CharKeyInRange(m, key, loBytes, hiBytes, loNatural))
+                    set.Add(recno);
             }
             return set;
         }
 
-        foreach (var e in tag.EnumerateEntries())
+        foreach (var (keyBytes, recno) in OrderedEntries(src))
         {
-            var key = tag.DecodeKey(e.Key);
-            if (KeyInRange(m, key)) set.Add((int)e.RecordNumber);
+            var key = src.DecodeKey(keyBytes);
+            if (KeyInRange(m, key)) set.Add(recno);
         }
         return set;
     }
@@ -1248,6 +1615,7 @@ public sealed class VfpInterpreter
             case "COLLATE": SetCollate(arg); break;             // baked into the next INDEX tag; SET("COLLATE").
             case "UNIQUE": Runtime.Unique = OnOff(arg); break;  // session default for a clause-less INDEX; SET("UNIQUE").
             case "KEY": SetKey(arg); break;                     // master-index visible key range; feeds Visible().
+            case "NEAR": _setNear = OnOff(arg); break;          // failed-SEEK pointer parking; SET("NEAR").
             case "DATASESSION": SetDataSession(arg); break;     // single-session stub; TO 1 no-op, else err 1540.
             default: break; // TALK / COMPATIBLE / DATA / PROCEDURE / … — irrelevant to results.
         }
@@ -1898,6 +2266,11 @@ public sealed class VfpInterpreter
 
         // ── SET RELATION (this area as PARENT; microVFP P1 gap #2) ──
         public List<Relation>? Relations; // child relations set on THIS area (null ⇒ none).
+
+        // ── multi-index model (microVFP INDEX/ORDER MODEL) ──
+        // Non-structural index files opened via SET INDEX TO / USE … INDEX, in OPEN order (full paths).
+        // The structural .cdx (auto-opened on USE) is held by WorkArea.Cdx and is NOT listed here.
+        public List<string>? ExtraIndexes;
     }
 
     /// <summary>One parent→child link of a <c>SET RELATION</c>: the key expression (evaluated in the
@@ -2006,18 +2379,17 @@ public sealed class VfpInterpreter
     {
         var m = Meta(area);
         var wa = Session.AreaAt(area);
-        if (wa?.Cdx is null || string.IsNullOrEmpty(m.Order)) return null;
-        var tag = wa.Cdx.Tag(m.Order!) ?? wa.Cdx.Tag(m.Order!.ToUpperInvariant());
-        if (tag is null) return null;
-        if (m.Ordered is null || m.OrderedFor != tag.Name)
-        {
-            var ordered = tag.EnumerateEntries().Select(e => (int)e.RecordNumber).ToList();
-            // A SET ORDER … DESCENDING|ASCENDING override reverses the tag's own traversal direction.
-            if (m.OrderReversed) ordered.Reverse();
-            m.Ordered = ordered;
-            m.OrderedFor = tag.Name;
-            m.OrderPos = -1;
-        }
+        if (wa is null || string.IsNullOrEmpty(m.Order)) return null;
+        if (m.Ordered is not null && m.OrderedFor == m.Order) return m.Ordered;
+
+        using var src = OpenOrderSource(area, m.Order!);   // structural cdx, extra cdx, or standalone idx.
+        if (src is null) return null;
+        var ordered = OrderedEntries(src).Select(e => e.Recno).ToList();
+        // A SET ORDER … DESCENDING|ASCENDING override reverses the order's own traversal direction.
+        if (m.OrderReversed) ordered.Reverse();
+        m.Ordered = ordered;
+        m.OrderedFor = m.Order;
+        m.OrderPos = -1;
         return m.Ordered;
     }
 
@@ -2184,32 +2556,154 @@ public sealed class VfpInterpreter
     {
         var m = Meta(area);
         var wa = Session.AreaAt(area);
-        if (wa?.Cdx is null) { m.Found = false; return false; }
-        var cdxTag = (tag is null ? (m.Order is null ? wa.Cdx.TagNames.FirstOrDefault() : m.Order) : tag);
-        CdxTag? t = cdxTag is null ? null : (wa.Cdx.Tag(cdxTag) ?? wa.Cdx.Tag(cdxTag.ToUpperInvariant()));
-        if (t is null) { m.Found = false; return false; }
-        // Character keys seek by RAW BYTES (a prefix seek): this lets a SHORT value match a COMPOSITE
-        // character tag (e.g. relate on `cust_id`, tag `cust_id+ord_id`) — the P1-gap-#2 prefix quirk —
-        // which the value-typed Seek(object) cannot do (a composite expression resolves to KeyType.Unknown,
-        // so its Encode returns null). A single-field character key is unaffected (same raw bytes).
-        // The RELATION reposition seek honours SET EXACT (hackfox quirk 1): under EXACT ON a prefix-only
-        // hit on a composite child key is NOT a match (→ child EOF), matching VFP9; the SEEK command path
-        // keeps its always-prefix behaviour.
-        uint? recno = (t.IsCharacterKey && key.Type == VfpType.Character)
-            ? t.Seek(Encoding.Latin1.GetBytes(key.AsString).AsSpan(), relationSeek && _ctx.Exact)
-            : t.Seek(key.ToClr() ?? string.Empty);
+        if (wa is null) { m.Found = false; return false; }
+        string? identity = tag ?? DefaultOrderIdentity(area);
+        if (identity is null) { m.Found = false; return false; }
+
+        using var src = OpenOrderSource(area, identity);
+        if (src is null) { m.Found = false; return false; }
+
+        uint? recno = null;
+        if (src.CdxTag is { } t)
+        {
+            // Character keys seek by RAW BYTES (a prefix seek): this lets a SHORT value match a COMPOSITE
+            // character tag (e.g. relate on `cust_id`, tag `cust_id+ord_id`) — the P1-gap-#2 prefix quirk —
+            // which the value-typed Seek(object) cannot do (a composite expression resolves to
+            // KeyType.Unknown, so its Encode returns null). A single-field character key is unaffected.
+            // The RELATION reposition seek honours SET EXACT (hackfox quirk 1): under EXACT ON a prefix-only
+            // hit on a composite child key is NOT a match (→ child EOF); the SEEK command path keeps its
+            // always-prefix behaviour.
+            recno = (t.IsCharacterKey && key.Type == VfpType.Character)
+                ? t.Seek(Encoding.Latin1.GetBytes(key.AsString).AsSpan(), relationSeek && _ctx.Exact)
+                : t.Seek(key.ToClr() ?? string.Empty);
+        }
+        else if (src.Idx is not null)
+        {
+            recno = SeekIdx(src, key);
+        }
+
         m.OldVals = null;                 // a record move re-bases the OLDVAL() buffer (per-record buffering).
         if (recno is uint r && r >= 1 && r <= (uint)wa.Table.RecordCount)
         {
             m.RecNo = (int)r; m.Eof = false; m.Bof = false; m.Found = true; m.Cached = null;
-            // Anchor the index position so a following SCAN WHILE / SKIP walks forward in index order.
             var ord = ActiveOrder(area);
             if (ord is not null) m.OrderPos = ord.IndexOf((int)r);
             return true;
         }
+
+        // Miss: SET NEAR ON leaves the pointer on the record just past where the key would sort
+        // (s4g268 — SEEK only, not relation repositioning); NEAR OFF (default) parks at EOF.
+        if (_setNear && !relationSeek)
+        {
+            int nearRec = NearRecord(src, key, area);
+            if (nearRec >= 1)
+            {
+                m.RecNo = nearRec; m.Eof = false; m.Bof = false; m.Found = false; m.Cached = null;
+                var ord = ActiveOrder(area);
+                if (ord is not null) m.OrderPos = ord.IndexOf(nearRec);
+                return false;
+            }
+        }
         m.RecNo = wa.Table.RecordCount + 1; m.Eof = true; m.Found = false; m.Cached = null;
         return false;
     }
+
+    /// <summary>Seek <paramref name="key"/> in a standalone <c>.idx</c> order by decoding each entry's key
+    /// and comparing by VALUE (first match wins); returns the recno, or null when absent.</summary>
+    private static uint? SeekIdx(OrderSource src, VfpValue key)
+    {
+        if (src.Idx is null) return null;
+        foreach (var e in src.Idx.EnumerateEntries())
+        {
+            var decoded = IndexKey.Decode(e.Key, src.IdxKeyType);
+            if (SeekValueMatches(decoded, src.IdxKeyType, key))
+                return e.RecordNumber;
+        }
+        return null;
+    }
+
+    private static bool SeekValueMatches(IndexKey decoded, IndexKeyType type, VfpValue key)
+    {
+        switch (type)
+        {
+            case IndexKeyType.Character:
+                string dk = decoded.AsString ?? string.Empty;
+                string want = key.AsString ?? string.Empty;
+                return dk.StartsWith(want.TrimEnd(), StringComparison.Ordinal);   // prefix seek.
+            case IndexKeyType.Integer:
+                return decoded.AsInt32 is int di && di == (int)key.AsNumber;
+            case IndexKeyType.Numeric:
+                return decoded.AsDouble is double dd && dd == (double)key.AsNumber;
+            case IndexKeyType.Date:
+            {
+                var b = key.ToClr();
+                DateOnly? bo = b as DateOnly? ?? (b is DateTime bt ? DateOnly.FromDateTime(bt) : null);
+                return decoded.AsDate is { } dv && bo is { } bb && dv == bb;
+            }
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>SET NEAR: the record the pointer parks on after a failed SEEK — the first entry that sorts
+    /// AFTER the seek key in the CONTROLLING order that is in-range and visible; −1 when past the end.</summary>
+    private int NearRecord(OrderSource src, VfpValue key, int area)
+    {
+        var wa = Session.AreaAt(area);
+        if (wa is null) return -1;
+        bool reversed = _meta.TryGetValue(area, out var m) && m.OrderReversed;
+        bool descending = src.Descending;
+        if (reversed) descending = !descending;
+
+        // Walk the ACTUAL (possibly-overridden) traversal order — the SAME sequence ActiveOrder builds:
+        // the order's stored order, reversed when a SET ORDER … ASCENDING|DESCENDING override flipped it.
+        // Scanning the un-reversed base with the flipped comparison would return the FARTHEST match, not
+        // the nearest (s4g268: NEAR parks on the record JUST past where the key would sort).
+        var entries = OrderedEntries(src);
+        if (reversed) entries = entries.Reverse();
+
+        foreach (var (keyBytes, recno) in entries)
+        {
+            int cmp = CompareStoredKeyToSeek(keyBytes, key, src);
+            bool after = descending ? cmp < 0 : cmp > 0;   // sorts strictly after the seek key.
+            if (after && recno >= 1 && recno <= wa.Table.RecordCount && Visible(wa, recno))
+                return recno;
+        }
+        return -1;
+    }
+
+    /// <summary>Three-way compare a STORED key (index bytes) against the SEEK value: &gt;0 when the stored
+    /// key sorts after the seek value, &lt;0 before, 0 equal — in the key's own encoding.</summary>
+    private static int CompareStoredKeyToSeek(byte[] keyBytes, VfpValue key, OrderSource src)
+    {
+        if (src.Idx is not null)
+        {
+            var decoded = IndexKey.Decode(keyBytes, src.IdxKeyType);
+            return CompareDecodedToValue(decoded, src.IdxKeyType, key);
+        }
+        // CDX: compare the raw stored bytes against the seek needle (unsigned byte order).
+        var t = src.CdxTag!;
+        byte[] needle = t.IsCharacterKey && key.Type == VfpType.Character
+            ? Encoding.Latin1.GetBytes(key.AsString)
+            : (IndexKey.Decode(keyBytes, t.KeyType).Value is null ? Array.Empty<byte>() : keyBytes); // fallback
+        if (t.IsCharacterKey && key.Type == VfpType.Character)
+        {
+            int n = Math.Min(keyBytes.Length, needle.Length);
+            for (int i = 0; i < n; i++) { int d = keyBytes[i] - needle[i]; if (d != 0) return d; }
+            return keyBytes.Length - needle.Length;
+        }
+        return CompareDecodedToValue(IndexKey.Decode(keyBytes, t.KeyType), t.KeyType, key);
+    }
+
+    private static int CompareDecodedToValue(IndexKey decoded, IndexKeyType type, VfpValue key) => type switch
+    {
+        IndexKeyType.Integer => (decoded.AsInt32 ?? 0).CompareTo((int)key.AsNumber),
+        IndexKeyType.Numeric => (decoded.AsDouble ?? 0d).CompareTo((double)key.AsNumber),
+        IndexKeyType.Character => string.CompareOrdinal(decoded.AsString ?? string.Empty, key.AsString ?? string.Empty),
+        IndexKeyType.Date => (decoded.AsDate ?? default).CompareTo(
+            key.ToClr() is DateOnly d ? d : (key.ToClr() is DateTime dt ? DateOnly.FromDateTime(dt) : default)),
+        _ => 0,
+    };
 
     // ─────────────────────────── SET RELATION / SET SKIP (microVFP P1 gap #2) ───────────────────────────
     //
@@ -2575,6 +3069,24 @@ public sealed class VfpInterpreter
             case "RELATION": r = FnRelation(a); return true;
             case "TARGET": r = FnTarget(a); return true;
             case "SYS": r = FnSys(a); return true;
+            // ── index introspection (microVFP INDEX/ORDER MODEL) ──
+            case "TAGCOUNT": r = VfpValue.Integer(FnTagCount(a)); return true;
+            case "TAG": r = VfpValue.Character(FnTag(a)); return true;
+            case "TAGNO": r = VfpValue.Integer(FnTagNo(a)); return true;
+            case "CDX": case "MDX": r = VfpValue.Character(FnCdx(a)); return true;
+            case "NDX": r = VfpValue.Character(FnNdx(a)); return true;
+            case "ORDER": r = VfpValue.Character(FnOrder(a)); return true;
+            // KEY()/FOR() return the key/filter expression ALL-CAPS (hackfox s4g266 — same quirk SYS(14)
+            // honours), so KEY(n) and SYS(14,n) stay internally consistent for any lowercase-typed expr.
+            case "KEY": r = VfpValue.Character(ResolveSlot(a)?.KeyExpr.ToUpperInvariant() ?? string.Empty); return true;
+            case "FOR": r = VfpValue.Character(ResolveSlot(a)?.ForExpr.ToUpperInvariant() ?? string.Empty); return true;
+            case "UNIQUE": r = VfpValue.Logical(ResolveSlot(a)?.Unique ?? false); return true;
+            case "DESCENDING": r = VfpValue.Logical(ResolveSlot(a)?.Descending ?? false); return true;
+            case "CANDIDATE": r = VfpValue.Logical(false); return true;   // no DBC index catalog → never a candidate.
+            case "PRIMARY": r = VfpValue.Logical(false); return true;     // primary keys are a DBC-bound concept only.
+            case "IDXCOLLATE": r = VfpValue.Character(ResolveSlot(a)?.Collation ?? string.Empty); return true;
+            case "ATAGINFO": r = VfpValue.Integer(FnATagInfo(a)); return true;
+            case "LOOKUP": r = FnLookup(a); return true;
             case "SECONDS": r = VfpValue.Number(DateTime.Now.TimeOfDay.TotalSeconds); return true;
             // Single-user model: there is no lock contention, so a lock is always granted (.T.). The
             // SET REPROCESS TO 0 + ON-ERROR fail-fast branch (Runtime.LockFailFast) governs RETRY
@@ -2693,6 +3205,7 @@ public sealed class VfpInterpreter
             "ANSI" => VfpValue.Character(_ctx.Ansi ? "ON" : "OFF"),
             "COLLATE" => VfpValue.Character(_ctx.Collation?.Name ?? "MACHINE"),
             "UNIQUE" => VfpValue.Character(Runtime.Unique ? "ON" : "OFF"),
+            "NEAR" => VfpValue.Character(_setNear ? "ON" : "OFF"),
             "RELATION" => VfpValue.Character(RelationSetString(Session.CurrentArea)),  // reproduces the SET RELATION args.
             "SKIP" => VfpValue.Character(SkipSetString(Session.CurrentArea)),          // comma-list of 1:n aliases.
             "DATASESSION" => VfpValue.Number(1m),   // NUMERIC (verified vs vfp9.exe) — single public session.
@@ -2714,10 +3227,198 @@ public sealed class VfpInterpreter
             // equal VFP9's. Stable + non-crashing: both halves come from the OS identity.
             case 0: return VfpValue.Character($"{Environment.MachineName} # {Environment.UserName}");
             case 1: return VfpValue.Character(JulianDay(DateTime.Today).ToString(CultureInfo.InvariantCulture));
+            // SYS(14, nIndexNumber [, area]) — the KEY expression of the nth open index, ALL-CAPS (s4g266).
+            // Unlike KEY(), SYS(14) REQUIRES the index number; an out-of-range number yields "" (no error).
+            case 14:
+            {
+                if (a.Length < 2) return VfpValue.Character(string.Empty);
+                var slot = ResolveSlot(a.Skip(1).ToArray());
+                return VfpValue.Character(slot?.KeyExpr.ToUpperInvariant() ?? string.Empty);
+            }
             case 2007: return VfpValue.Character(Crc16Ccitt(a.Length > 1 ? a[1].AsString : string.Empty).ToString(CultureInfo.InvariantCulture));
             case 2015: return VfpValue.Character("_" + Guid.NewGuid().ToString("N")[..9].ToUpperInvariant());
             default: return VfpValue.Character(string.Empty);
         }
+    }
+
+    // ─────────────────────────── index-introspection functions ───────────────────────────
+
+    /// <summary>Parse the shared <c>[cIndexFile,] nIndexNumber [, cAlias|nWorkArea]</c> argument shape and
+    /// resolve the addressed <see cref="IndexSlot"/> from the area's open set — null when the number is
+    /// absent (except a master-tag fallback), out of range, or no index is open.</summary>
+    private IndexSlot? ResolveSlot(VfpValue[] a)
+    {
+        int ai = 0, area = Session.CurrentArea;
+        string? file = null;
+        int? n = null;
+        if (ai < a.Length && a[ai].Type == VfpType.Character) { file = a[ai].AsString; ai++; }
+        if (ai < a.Length && IsNumeric(a[ai])) { n = (int)a[ai].AsNumber; ai++; }
+        if (ai < a.Length) area = AreaNumber(a[ai]);
+
+        var inv = FilterInventory(IndexInventory(area), file);
+        if (n is null)   // no number ⇒ the master (controlling) tag.
+        {
+            string? ord = Meta(area).Order;
+            return ord is null ? null : inv.FirstOrDefault(s => string.Equals(s.Name, ord, StringComparison.OrdinalIgnoreCase));
+        }
+        return n >= 1 && n <= inv.Count ? inv[n.Value - 1] : null;
+    }
+
+    /// <summary>Narrow an inventory to a single named index file (by file name, extension optional); the
+    /// whole set when <paramref name="file"/> is null/empty.</summary>
+    private static List<IndexSlot> FilterInventory(List<IndexSlot> inv, string? file)
+    {
+        if (string.IsNullOrEmpty(file)) return inv;
+        string want = Path.GetFileNameWithoutExtension(file);
+        return inv.Where(s => string.Equals(Path.GetFileNameWithoutExtension(s.FilePath), want, StringComparison.OrdinalIgnoreCase)).ToList();
+    }
+
+    private int FnTagCount(VfpValue[] a)
+    {
+        int area = Session.CurrentArea;
+        string? file = null;
+        if (a.Length >= 1) { if (a[0].Type == VfpType.Character) file = a[0].AsString; else area = AreaNumber(a[0]); }
+        if (a.Length >= 2) area = AreaNumber(a[1]);
+        return FilterInventory(IndexInventory(area), file).Count;
+    }
+
+    private string FnTag(VfpValue[] a)
+    {
+        int ai = 0, area = Session.CurrentArea;
+        string? file = null;
+        int? n = null;
+        if (ai < a.Length && a[ai].Type == VfpType.Character) { file = a[ai].AsString; ai++; }
+        if (ai < a.Length && IsNumeric(a[ai])) { n = (int)a[ai].AsNumber; ai++; }
+        if (ai < a.Length) area = AreaNumber(a[ai]);
+        var inv = FilterInventory(IndexInventory(area), file);
+        if (n is null) return Meta(area).Order ?? string.Empty;   // master tag name.
+        return n >= 1 && n <= inv.Count ? inv[n.Value - 1].Name : string.Empty;
+    }
+
+    private int FnTagNo(VfpValue[] a)
+    {
+        int ai = 0, area = Session.CurrentArea;
+        string? tagName = null, file = null;
+        if (ai < a.Length && a[ai].Type == VfpType.Character) { tagName = a[ai].AsString; ai++; }
+        if (ai < a.Length && a[ai].Type == VfpType.Character) { file = a[ai].AsString; ai++; }
+        if (ai < a.Length) area = AreaNumber(a[ai]);
+        var inv = FilterInventory(IndexInventory(area), file);
+        string? target = tagName ?? Meta(area).Order;   // no name ⇒ the controlling order.
+        if (string.IsNullOrEmpty(target)) return 0;
+        for (int i = 0; i < inv.Count; i++)
+            if (string.Equals(inv[i].Name, target, StringComparison.OrdinalIgnoreCase)) return i + 1;
+        return 0;
+    }
+
+    private string FnCdx(VfpValue[] a)
+    {
+        if (a.Length == 0 || !IsNumeric(a[0])) return string.Empty;
+        int n = (int)a[0].AsNumber;
+        int area = a.Length > 1 ? AreaNumber(a[1]) : Session.CurrentArea;
+        var files = FileInventory(area);
+        return n >= 1 && n <= files.Count ? files[n - 1] : string.Empty;
+    }
+
+    private string FnNdx(VfpValue[] a)
+    {
+        if (a.Length == 0 || !IsNumeric(a[0])) return string.Empty;
+        int n = (int)a[0].AsNumber;
+        int area = a.Length > 1 ? AreaNumber(a[1]) : Session.CurrentArea;
+        var idxFiles = IdxFileInventory(area);
+        return n >= 1 && n <= idxFiles.Count ? idxFiles[n - 1] : string.Empty;
+    }
+
+    private string FnOrder(VfpValue[] a)
+    {
+        int area = a.Length > 0 ? AreaNumber(a[0]) : Session.CurrentArea;
+        return Meta(area).Order ?? string.Empty;
+    }
+
+    /// <summary>Open index FILES of an area for CDX()/MDX(): the structural <c>.cdx</c> (index 1, if any),
+    /// then the additional <c>.cdx</c>/<c>.idx</c> in open order.</summary>
+    private List<string> FileInventory(int area)
+    {
+        var files = new List<string>();
+        var wa = Session.AreaAt(area);
+        if (wa?.Cdx?.SourcePath is { } sp) files.Add(Path.GetFullPath(sp));
+        if (_meta.TryGetValue(area, out var m) && m.ExtraIndexes is { } ex)
+            files.AddRange(ex.Select(Path.GetFullPath));
+        return files;
+    }
+
+    /// <summary>Open standalone <c>.idx</c> files of an area (in open order) — the NDX() domain.</summary>
+    private List<string> IdxFileInventory(int area)
+        => _meta.TryGetValue(area, out var m) && m.ExtraIndexes is { } ex
+            ? ex.Where(IsIdxPath).Select(Path.GetFullPath).ToList()
+            : new List<string>();
+
+    /// <summary>ATAGINFO(ArrayName [, cTagFile [, area]]) — fill a (n×6) array with one row per open tag
+    /// ([1] name, [2] type, [3] key, [4] filter, [5] direction, [6] collation) and return the tag count.</summary>
+    private int FnATagInfo(VfpValue[] a)
+    {
+        if (a.Length == 0) return 0;
+        string arrName = a[0].AsString;
+        int ai = 1, area = Session.CurrentArea;
+        string? file = null;
+        if (ai < a.Length && a[ai].Type == VfpType.Character) { file = a[ai].AsString; ai++; }
+        if (ai < a.Length) area = AreaNumber(a[ai]);
+
+        var inv = FilterInventory(IndexInventory(area), file);
+        if (inv.Count == 0) return 0;
+        var arr = Memory.RedimOrCreateArray(arrName, inv.Count, 6);
+        for (int i = 0; i < inv.Count; i++)
+        {
+            var s = inv[i];
+            arr.Set(i + 1, 1, VfpValue.Character(s.Name));
+            arr.Set(i + 1, 2, VfpValue.Character(s.Unique ? "UNIQUE" : "REGULAR"));
+            arr.Set(i + 1, 3, VfpValue.Character(s.KeyExpr));
+            arr.Set(i + 1, 4, VfpValue.Character(s.ForExpr));
+            arr.Set(i + 1, 5, VfpValue.Character(s.Descending ? "DESCENDING" : "ASCENDING"));
+            arr.Set(i + 1, 6, VfpValue.Character(s.Collation));
+        }
+        return inv.Count;
+    }
+
+    /// <summary>LOOKUP(rReturn, eSearch, rSearched [, cTag]) — seek <paramref name="a"/>[1] (via the tag
+    /// when given, else a sequential scan on rSearched) and return the rReturn field value at the hit; a
+    /// miss parks the pointer (per SET NEAR) / at EOF and returns a blank. The field-name arguments arrive
+    /// as quoted names (MicroVfpExprRewrite).</summary>
+    private VfpValue FnLookup(VfpValue[] a)
+    {
+        if (a.Length < 3) return VfpValue.Logical(false);
+        string returnField = a[0].AsString;
+        VfpValue searchVal = a[1];
+        string searchField = a[2].AsString;
+        string? tag = a.Length > 3 ? a[3].AsString : null;
+        int area = Session.CurrentArea;
+
+        bool found = !string.IsNullOrEmpty(tag)
+            ? DoSeek(searchVal, area, tag)
+            : LookupSequential(area, searchField, searchVal);
+
+        if (found) return EvalText(returnField);
+        return VfpValue.Character(string.Empty);   // miss ⇒ blank (FOUND() stays .F.).
+    }
+
+    /// <summary>Sequential LOCATE for <c>field = value</c> from the top of the work area; leaves the
+    /// pointer on the first match (or EOF).</summary>
+    private bool LookupSequential(int area, string field, VfpValue value)
+    {
+        GoTop(area);
+        while (!Meta(area).Eof)
+        {
+            var cur = EvalText(field);
+            if (ValuesLooseEqual(cur, value)) return true;
+            Skip(area, 1);
+        }
+        return false;
+    }
+
+    private static bool ValuesLooseEqual(VfpValue x, VfpValue y)
+    {
+        if (x.Type == VfpType.Character || y.Type == VfpType.Character)
+            return string.Equals(x.AsString?.TrimEnd(), y.AsString?.TrimEnd(), StringComparison.Ordinal);
+        return x.AsNumber == y.AsNumber;
     }
 
     // ALEN(arr[,n]) — total elements (no n / n<=0), rows (n=1) or columns (n=2; 0 for 1-D). The array name

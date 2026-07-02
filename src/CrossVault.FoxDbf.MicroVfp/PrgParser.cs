@@ -482,6 +482,7 @@ public static class PrgParser
             var toks = PrgScan.ClauseTokens(rest);
             string? database = null;
             NameRef? table = null, alias = null, order = null, inArea = null;
+            var index = new List<NameRef>();
             bool again = false, noUpdate = false;
             var mode = UseMode.Default;
 
@@ -513,11 +514,23 @@ public static class PrgParser
                     case "SHARED":
                     case "SHARE": mode = UseMode.Shared; idx++; break;
                     case "NOUPDATE": noUpdate = true; idx++; break;
-                    case "INDEX": NextTok(toks, ref idx); break; // skip index list
+                    case "INDEX":
+                        // Collect the comma-separated index-file list up to the next USE keyword and
+                        // open+track each (was a parse-and-discard no-op).
+                        idx++;
+                        var sbIdx = new StringBuilder();
+                        while (idx < toks.Count && !IsUseKeyword(toks[idx]))
+                            sbIdx.Append(toks[idx++]).Append(' ');
+                        foreach (var piece in PrgScan.SplitTopCommas(sbIdx.ToString()))
+                        {
+                            string tok = FirstToken(piece);
+                            if (tok.Length > 0) index.Add(ToNameRef(tok));
+                        }
+                        break;
                     default: idx++; break;
                 }
             }
-            return new UseStmt(database, table, again, alias, order, inArea, mode, noUpdate, table is null);
+            return new UseStmt(database, table, again, alias, order, inArea, mode, noUpdate, table is null, index);
         }
 
         private static SeekStmt BuildSeek(string text)
@@ -626,6 +639,8 @@ public static class PrgParser
             string args = rest.Substring(setting.Length).Trim();
             if (setting == "ORDER")
                 return BuildSetOrder(args);
+            if (setting == "INDEX")
+                return BuildSetIndex(args);
             if (setting == "RELATION")
                 return BuildSetRelation(args);
             if (setting == "SKIP")
@@ -768,9 +783,12 @@ public static class PrgParser
             return (null, s);
         }
 
-        private static DeleteStmt BuildDelete(string text)
+        private static PrgStatement BuildDelete(string text)
         {
-            string rest = PrgScan.AfterFirstWord(text);
+            string rest0 = PrgScan.AfterFirstWord(text);
+            if (PrgScan.FirstWord(rest0).Equals("TAG", StringComparison.OrdinalIgnoreCase))
+                return BuildDeleteTag(PrgScan.AfterFirstWord(rest0));
+            string rest = rest0;
             var (head, segs) = Carve(rest, "FOR", "WHILE", "IN");
             string? scope = head.Trim().Length == 0 ? null : head.Trim();
             PrgExpr? forE = null;
@@ -781,6 +799,64 @@ public static class PrgParser
                 else if (k == "IN") inArea = ToNameRef(FirstToken(b));
             }
             return new DeleteStmt(scope, forE, inArea);
+        }
+
+        /// <summary><c>DELETE TAG &lt;name&gt;[, …] | ALL [OF &lt;cdx&gt;] [IN area]</c>. A single trailing
+        /// <c>OF &lt;cdx&gt;</c> applies to the whole (structural-by-default) tag list; <c>ALL</c> removes
+        /// every tag.</summary>
+        private static DeleteTagStmt BuildDeleteTag(string rest)
+        {
+            var (head, segs) = Carve(rest, "OF", "IN");
+            NameRef? ofCdx = null, inArea = null;
+            foreach (var (k, body) in segs)
+            {
+                if (k == "OF") ofCdx = ToNameRef(FirstToken(body));
+                else if (k == "IN") inArea = ToNameRef(FirstToken(body));
+            }
+            head = head.Trim();
+            if (PrgScan.FirstWord(head).Equals("ALL", StringComparison.OrdinalIgnoreCase))
+                return new DeleteTagStmt(Array.Empty<string>(), All: true, ofCdx, inArea);
+            var tags = new List<string>();
+            foreach (var piece in PrgScan.SplitTopCommas(head))
+            {
+                string tok = FirstToken(piece);
+                if (tok.Length > 0) tags.Add(tok.Trim('\'', '"'));
+            }
+            return new DeleteTagStmt(tags, All: false, ofCdx, inArea);
+        }
+
+        /// <summary><c>SET INDEX TO [&lt;list&gt;] [ORDER &lt;tag|n&gt; [ASCENDING|DESCENDING]]
+        /// [ADDITIVE]</c>.</summary>
+        private static SetIndexStmt BuildSetIndex(string args)
+        {
+            if (PrgScan.FirstWord(args).Equals("TO", StringComparison.OrdinalIgnoreCase))
+                args = PrgScan.AfterFirstWord(args);
+            args = args.Trim();
+
+            bool additive = false;
+            var words = PrgScan.TopWords(args);
+            if (words.Count > 0 && words[^1].Upper == "ADDITIVE")
+            {
+                additive = true;
+                args = args.Substring(0, words[^1].Start).TrimEnd();
+            }
+
+            var (head, segs) = Carve(args, "ORDER", "ASCENDING", "DESCENDING");
+            NameRef? order = null;
+            bool? direction = null;
+            foreach (var (k, body) in segs)
+            {
+                if (k == "ORDER" && body.Trim().Length > 0) order = ToNameRef(FirstToken(body));
+                else if (k == "ASCENDING") direction = false;
+                else if (k == "DESCENDING") direction = true;
+            }
+            var files = new List<NameRef>();
+            foreach (var piece in PrgScan.SplitTopCommas(head))
+            {
+                string tok = FirstToken(piece);
+                if (tok.Length > 0) files.Add(ToNameRef(tok));
+            }
+            return new SetIndexStmt(files, order, direction, additive);
         }
 
         private static RecallStmt BuildRecall(string text)

@@ -148,7 +148,9 @@ public sealed record ExprStatement(PrgExpr Expression) : PrgStatement;
 
 public enum UseMode { Default, Shared, Exclusive }
 
-/// <summary>USE — open/close a table in a work area.</summary>
+/// <summary>USE — open/close a table in a work area. <see cref="Index"/> is the optional
+/// <c>INDEX &lt;list&gt;</c> clause (additional <c>.idx</c>/<c>.cdx</c> files opened alongside the
+/// structural <c>.cdx</c>); empty when absent.</summary>
 public sealed record UseStmt(
     string? Database,
     NameRef? Table,
@@ -158,7 +160,8 @@ public sealed record UseStmt(
     NameRef? In,
     UseMode Mode,
     bool NoUpdate,
-    bool IsClose) : PrgStatement;
+    bool IsClose,
+    IReadOnlyList<NameRef>? Index = null) : PrgStatement;
 
 /// <summary>The work-area form <c>SELECT n | alias | 0 | (expr)</c> (NOT a SQL query).</summary>
 public sealed record SelectAreaStmt(NameRef Area) : PrgStatement;
@@ -202,6 +205,24 @@ public sealed record IndexStmt(
 /// <summary><c>REINDEX [IN area]</c> — rebuild every open tag of a work area from live data.
 /// microVFP P1 gap #1 — INDEX/ORDER WRITE model.</summary>
 public sealed record ReindexStmt(NameRef? In) : PrgStatement;
+
+/// <summary><c>DELETE TAG &lt;name&gt;[, …] | ALL [OF &lt;cdx&gt;]</c> — remove tag(s) from a compound
+/// <c>.cdx</c> (structural, or the named <see cref="OfCdx"/>). <see cref="All"/> removes every tag.
+/// microVFP INDEX/ORDER MODEL.</summary>
+public sealed record DeleteTagStmt(
+    IReadOnlyList<string> Tags,
+    bool All,
+    NameRef? OfCdx,
+    NameRef? In) : PrgStatement;
+
+/// <summary><c>SET INDEX TO [&lt;idx/cdx list&gt;] [ORDER &lt;tag|n&gt; [ASCENDING|DESCENDING]]
+/// [ADDITIVE]</c> — open additional (non-structural) index files in the current work area. An empty
+/// <see cref="Files"/> list is the clear form (<c>SET INDEX TO</c>). microVFP INDEX/ORDER MODEL.</summary>
+public sealed record SetIndexStmt(
+    IReadOnlyList<NameRef> Files,
+    NameRef? Order,
+    bool? Direction,
+    bool Additive) : PrgStatement;
 
 /// <summary>Generic <c>SET &lt;setting&gt; …</c>. <see cref="Arguments"/> is the raw remainder
 /// (<c>ON</c>/<c>OFF</c>/<c>TO …</c>). SET ORDER is modelled separately as
