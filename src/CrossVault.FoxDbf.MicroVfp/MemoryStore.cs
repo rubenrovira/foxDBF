@@ -97,6 +97,67 @@ public sealed class VfpArray
         if (i >= 0 && i < _data.Length) _data[i] = value;
     }
 
+    /// <summary>Reads element <paramref name="n"/> (1-based) by LINEAR (row-major) position — the numbering
+    /// ACOPY/ASORT/AELEMENT/ASUBSCRIPT use; out-of-range ⇒ <c>.F.</c>.</summary>
+    public VfpValue GetLinear(int n) => n >= 1 && n <= _data.Length ? _data[n - 1] : VfpValue.Logical(false);
+
+    /// <summary>Writes element <paramref name="n"/> (1-based) by LINEAR (row-major) position; out-of-range
+    /// writes are ignored.</summary>
+    public void SetLinear(int n, VfpValue value) { if (n >= 1 && n <= _data.Length) _data[n - 1] = value; }
+
+    // ── ADEL / AINS element·row·column (size UNCHANGED; VFP fills/loses at the tail) ──────────────
+    // hackfox s4g211: ADEL/AINS "don't affect the size of the array, only its contents". ADEL shifts
+    // toward the front and .F.-fills the freed LAST slot; AINS shifts toward the back, .F.-fills the
+    // inserted slot and DROPS the original last element/row/column (data loss — kept 1:1, not "fixed").
+    // A 1-D array has no columns: a "row" is a single element and RowWidth is 1.
+    private int RowWidth => Is2D ? Cols : 1;
+
+    /// <summary>ADEL row/element: shift rows (or, for a 1-D array, elements) at/after <paramref name="row"/>
+    /// one position toward the front; the freed last row is <c>.F.</c>-filled.</summary>
+    public void DeleteRow(int row)
+    {
+        int w = RowWidth;
+        if (row < 1 || row > Rows) return;
+        for (int r = row; r < Rows; r++)
+            for (int c = 0; c < w; c++) _data[(r - 1) * w + c] = _data[r * w + c];
+        for (int c = 0; c < w; c++) _data[(Rows - 1) * w + c] = VfpValue.Logical(false);
+    }
+
+    /// <summary>AINS row/element: shift rows (or, for a 1-D array, elements) at/after <paramref name="row"/>
+    /// one position toward the back; the inserted row is <c>.F.</c>-filled and the original last row is lost.</summary>
+    public void InsertRow(int row)
+    {
+        int w = RowWidth;
+        if (row < 1 || row > Rows) return;
+        for (int r = Rows - 1; r >= row; r--)
+            for (int c = 0; c < w; c++) _data[r * w + c] = _data[(r - 1) * w + c];
+        for (int c = 0; c < w; c++) _data[(row - 1) * w + c] = VfpValue.Logical(false);
+    }
+
+    /// <summary>ADEL column (2-D only): in every row, shift columns at/after <paramref name="col"/> one
+    /// position left; the freed last column is <c>.F.</c>-filled.</summary>
+    public void DeleteColumn(int col)
+    {
+        if (!Is2D || col < 1 || col > Cols) return;
+        for (int r = 0; r < Rows; r++)
+        {
+            for (int c = col; c < Cols; c++) _data[r * Cols + (c - 1)] = _data[r * Cols + c];
+            _data[r * Cols + (Cols - 1)] = VfpValue.Logical(false);
+        }
+    }
+
+    /// <summary>AINS column (2-D only): in every row, shift columns at/after <paramref name="col"/> one
+    /// position right; the inserted column is <c>.F.</c>-filled and the original last column is lost.</summary>
+    public void InsertColumn(int col)
+    {
+        if (!Is2D || col < 1 || col > Cols) return;
+        for (int r = 0; r < Rows; r++)
+        {
+            for (int c = Cols - 1; c >= col; c--) _data[r * Cols + c] = _data[r * Cols + (c - 1)];
+            _data[r * Cols + (col - 1)] = VfpValue.Logical(false);
+        }
+    }
+
     /// <summary>DIMENSION / REDIMENSION: resize, PRESERVING existing elements by linear position and
     /// <c>.F.</c>-filling any growth.</summary>
     public void Redim(int rows, int cols)

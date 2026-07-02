@@ -42,6 +42,7 @@ public sealed class VfpSession : IDisposable
     private int _currentArea = 1; // VFP selects work area 1 by default.
     private DbfDatabase? _db;
     private string? _dataDir;
+    private string? _dbcPath;
     private bool _disposed;
 
     /// <summary>Creates a session with VFP-default evaluation settings.</summary>
@@ -139,6 +140,10 @@ public sealed class VfpSession : IDisposable
     /// DBC-member CREATE / DROP semantics. Exposed for schema enumeration by the ADO.NET provider.</summary>
     public DbfDatabase? Database => _db;
 
+    /// <summary>The full path of the open VFP database container (<c>.dbc</c>), or <see langword="null"/>
+    /// in free-table (directory) mode. Backs the microVFP <c>ADATABASES()</c> array-filler.</summary>
+    internal string? DatabasePath => _dbcPath;
+
     // ---- data sources ---------------------------------------------------------------------
 
     /// <summary>Opens a VFP database container (<c>.dbc</c>) as the session's data source: bare
@@ -148,8 +153,9 @@ public sealed class VfpSession : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(dbcPath);
         _db = DbfDatabase.OpenFoxpro(dbcPath);
+        _dbcPath = Path.GetFullPath(dbcPath);
         // free-table fallback resolves against the .dbc's own directory.
-        _dataDir = Path.GetDirectoryName(Path.GetFullPath(dbcPath));
+        _dataDir = Path.GetDirectoryName(_dbcPath);
     }
 
     /// <summary>Opens a directory of free <c>.dbf</c> tables as the session's data source: bare

@@ -3135,6 +3135,18 @@ public sealed class VfpInterpreter
             case "TEXTMERGE": r = VfpValue.Character(FnTextMerge(a)); return true;
             case "ALINES": r = VfpValue.Integer(FnAlines(a)); return true;
 
+            // ─── P2 array batch (MICROVFP_EXTENSIONS_BACKLOG C.1/C.7) — STUBS, RED until implemented ───
+            case "ACOPY": r = VfpValue.Integer(FnACopy(a)); return true;
+            case "ADEL": r = VfpValue.Integer(FnADel(a)); return true;
+            case "AINS": r = VfpValue.Integer(FnAIns(a)); return true;
+            case "AELEMENT": r = VfpValue.Integer(FnAElement(a)); return true;
+            case "ASUBSCRIPT": r = VfpValue.Integer(FnASubscript(a)); return true;
+            case "AFIELDS": r = VfpValue.Integer(FnAFields(a)); return true;
+            case "ASORT": r = VfpValue.Integer(FnASort(a)); return true;
+            case "ADATABASES": r = VfpValue.Integer(FnADatabases(a)); return true;
+            case "AUSED": r = VfpValue.Integer(FnAUsed(a)); return true;
+            case "ASESSIONS": r = VfpValue.Integer(FnASessions(a)); return true;
+
             default: r = VfpValue.Null; return false;
         }
     }
@@ -3477,6 +3489,316 @@ public sealed class VfpInterpreter
         arr.Set(1, 6, VfpValue.Null);                                                                // [6] .NULL.
         arr.Set(1, 7, VfpValue.Null);                                                                // [7] .NULL.
         return VfpValue.Integer(1);
+    }
+
+    // ─────────────────────────── P2 array batch (MICROVFP_EXTENSIONS_BACKLOG C.1/C.7) ───────────────────────────
+    // Authoritative semantics: backlog C.1/C.7 + hackfox s4g210/211/213/292/666, verified byte-for-byte
+    // against the VFP9 runtime. VFP arrays are 1-BASED, ROW-MAJOR; a "2-D" array is rows×cols with a
+    // parallel LINEAR (row-major) element view. Array NAMES arrive as strings (MicroVfpExprRewrite quotes
+    // the reference argument(s)); an unknown array is a silent 0 (except ASUBSCRIPT, which errors — s4g213).
+
+    /// <summary>ACOPY(aSource, aDest [, nStart [, nCount [, nDestStart]]]) — LINEAR (row-major) copy. When
+    /// aDest does not yet exist it is created MATCHING aSource's dimensions (hackfox s4g210 quirk), even for
+    /// a partial-range copy. Returns the number of elements copied.</summary>
+    private int FnACopy(VfpValue[] a)
+    {
+        if (a.Length < 2) return 0;
+        var src = Memory.FindArray(a[0].AsString);
+        if (src is null) return 0;
+        int srcLen = src.Length;
+
+        int start = a.Length > 2 && IsNumeric(a[2]) ? (int)a[2].AsNumber : 1;
+        if (start < 1) start = 1;
+        int count = a.Length > 3 && IsNumeric(a[3]) ? (int)a[3].AsNumber : srcLen - start + 1;
+        if (count < 0) count = srcLen - start + 1;
+        int destStart = a.Length > 4 && IsNumeric(a[4]) ? (int)a[4].AsNumber : 1;
+        if (destStart < 1) destStart = 1;
+
+        string destName = a[1].AsString;
+        var dest = Memory.FindArray(destName);
+        bool destPreexisted = dest is not null;
+        // The auto-create-matching-source-dims quirk (s4g210) applies ONLY when aDest does not yet exist.
+        dest ??= Memory.RedimOrCreateArray(destName, src.Rows, src.Cols);
+
+        int copied = 0;
+        for (int k = 0; k < count; k++)
+        {
+            int sIdx = start + k, dIdx = destStart + k;
+            if (sIdx < 1 || sIdx > srcLen) break;
+            if (dIdx < 1 || dIdx > dest.Length)
+            {
+                // A PRE-EXISTING dest is never grown: VFP9 raises (verified live) rather than clipping.
+                if (destPreexisted) throw new MicroVfpRuntimeException("Subscript is outside defined range.");
+                break;
+            }
+            dest.SetLinear(dIdx, src.GetLinear(sIdx));
+            copied++;
+        }
+        return copied;
+    }
+
+    /// <summary>ADEL(ArrayName, nElement [, nRowOrColumn]) — delete an element/row (default) or a column
+    /// (3rd arg &gt; 1); size UNCHANGED, the freed tail slot(s) <c>.F.</c>-filled (hackfox s4g211). Returns 1.
+    /// An out-of-range or non-positive index is a runtime ERROR in VFP9 (verified live), not a silent no-op.</summary>
+    private int FnADel(VfpValue[] a)
+    {
+        if (a.Length < 2) return 0;
+        var arr = Memory.FindArray(a[0].AsString);
+        if (arr is null) return 0;
+        int idx = (int)a[1].AsNumber;
+        if (IsColumnMode(arr, a))
+        {
+            if (idx < 1 || idx > arr.Cols) throw new MicroVfpRuntimeException("Subscript is outside defined range.");
+            arr.DeleteColumn(idx);
+        }
+        else
+        {
+            if (idx < 1 || idx > arr.Rows) throw new MicroVfpRuntimeException("Subscript is outside defined range.");
+            arr.DeleteRow(idx);
+        }
+        return 1;                                            // s4g211: the error-return VALUE is unreliable; on success ⇒ 1.
+    }
+
+    /// <summary>AINS(ArrayName, nElement [, nRowOrColumn]) — insert a blank (<c>.F.</c>) element/row (default)
+    /// or column (3rd arg &gt; 1); size UNCHANGED, the original last element/row/column is LOST (hackfox
+    /// s4g211 — kept 1:1, not "protected against"). Returns 1.</summary>
+    private int FnAIns(VfpValue[] a)
+    {
+        if (a.Length < 2) return 0;
+        var arr = Memory.FindArray(a[0].AsString);
+        if (arr is null) return 0;
+        int idx = (int)a[1].AsNumber;
+        if (IsColumnMode(arr, a))
+        {
+            if (idx < 1 || idx > arr.Cols) throw new MicroVfpRuntimeException("Subscript is outside defined range.");
+            arr.InsertColumn(idx);
+        }
+        else
+        {
+            if (idx < 1 || idx > arr.Rows) throw new MicroVfpRuntimeException("Subscript is outside defined range.");
+            arr.InsertRow(idx);
+        }
+        return 1;
+    }
+
+    // ADEL/AINS 3rd parameter: column mode only for a 2-D array and a value > 1 (s4g211: "a number less
+    // than or equal to 1 is identical to omitting the parameter"; 2 is the only documented column trigger).
+    private static bool IsColumnMode(VfpArray arr, VfpValue[] a)
+        => arr.Is2D && a.Length > 2 && IsNumeric(a[2]) && (int)a[2].AsNumber > 1;
+
+    /// <summary>AELEMENT(ArrayName, nRow [, nCol]) — the LINEAR (row-major) element number for the given
+    /// subscripts. With BOTH subscripts on a 2-D array it is (nRow-1)*Cols+nCol. With a SINGLE subscript on
+    /// a 2-D array VFP treats it as an index validated against Rows and returns the subscript itself (an
+    /// out-of-range value is a runtime ERROR, not 0). For a 1-D array an out-of-range subscript ⇒ 0
+    /// (hackfox s4g213: no error).</summary>
+    private int FnAElement(VfpValue[] a)
+    {
+        if (a.Length < 2) return 0;
+        var arr = Memory.FindArray(a[0].AsString);
+        if (arr is null) return 0;
+        int r = (int)a[1].AsNumber;
+        if (arr.Is2D)
+        {
+            if (a.Length > 2 && IsNumeric(a[2]))
+            {
+                int c = (int)a[2].AsNumber;
+                if (r < 1 || r > arr.Rows || c < 1 || c > arr.Cols) return 0;
+                return (r - 1) * arr.Cols + c;
+            }
+            // Single subscript on a 2-D array: validated against Rows, returns the subscript itself.
+            if (r < 1 || r > arr.Rows)
+                throw new MicroVfpRuntimeException("Subscript is outside defined range.");
+            return r;
+        }
+        return r >= 1 && r <= arr.Length ? r : 0;
+    }
+
+    /// <summary>ASUBSCRIPT(ArrayName, nElement, nSubscript) — the row (nSubscript=1) or column (2) subscript
+    /// for a LINEAR element number. Unlike AELEMENT, an out-of-range element (or a column subscript on a 1-D
+    /// array) is a REAL runtime ERROR, NOT a 0 fallback (hackfox s4g213 — deliberately reproduced).</summary>
+    private int FnASubscript(VfpValue[] a)
+    {
+        if (a.Length < 3) throw new MicroVfpRuntimeException("ASUBSCRIPT() requires three arguments.");
+        var arr = Memory.FindArray(a[0].AsString)
+                  ?? throw new MicroVfpRuntimeException("ASUBSCRIPT(): the variable is not an array.");
+        int n = (int)a[1].AsNumber;
+        int sub = (int)a[2].AsNumber;
+        if (n < 1 || n > arr.Length)
+            throw new MicroVfpRuntimeException("ASUBSCRIPT(): element number is out of range.");
+        if (arr.Is2D)
+            return sub switch
+            {
+                1 => (n - 1) / arr.Cols + 1,
+                2 => (n - 1) % arr.Cols + 1,
+                _ => throw new MicroVfpRuntimeException("ASUBSCRIPT(): invalid subscript selector."),
+            };
+        if (sub == 1) return n;
+        throw new MicroVfpRuntimeException("ASUBSCRIPT(): a 1-D array has no column subscript.");
+    }
+
+    /// <summary>AFIELDS(ArrayName [, cAlias | nWorkArea]) — (re)dimension ArrayName to (nFields × 18) and
+    /// fill one row per field: [1] name, [2] type, [3] length, [4] decimals, [5] nullable, [6] NOCPTRANS
+    /// (binary), [7]-[18] the DBC-property columns (blank for a free table). The hidden <c>_NullFlags</c>
+    /// system field is NOT reported (hackfox s4g292). Returns the field count.</summary>
+    private int FnAFields(VfpValue[] a)
+    {
+        if (a.Length == 0) return 0;
+        VfpSession.WorkArea? wa;
+        if (a.Length > 1)
+        {
+            var v = a[1];
+            wa = v.Type == VfpType.Character
+                ? Session.FindAreaByAlias(v.AsString)
+                : Session.AreaAt((int)v.AsNumber);
+        }
+        else wa = Session.AreaAt(Session.CurrentArea);
+        if (wa is null) return 0;
+
+        var fields = new List<DbfColumn>();
+        foreach (var c in wa.Table.Columns) if (!c.IsSystem) fields.Add(c);
+        int n = fields.Count;
+        if (n == 0) return 0;
+
+        var arr = Memory.RedimOrCreateArray(a[0].AsString, n, 18);
+        for (int i = 0; i < n; i++)
+        {
+            var c = fields[i];
+            arr.Set(i + 1, 1, VfpValue.Character(c.Name));
+            arr.Set(i + 1, 2, VfpValue.Character(c.Type.ToString()));
+            arr.Set(i + 1, 3, VfpValue.Integer(c.Length));
+            arr.Set(i + 1, 4, VfpValue.Integer(c.Decimal));
+            arr.Set(i + 1, 5, VfpValue.Logical(c.IsNullable));
+            arr.Set(i + 1, 6, VfpValue.Logical(c.IsBinary));
+            for (int col = 7; col <= 18; col++) arr.Set(i + 1, col, VfpValue.Character(string.Empty));
+        }
+        return n;
+    }
+
+    /// <summary>ASORT(ArrayName [, nStart [, nCount [, nSortOrder [, nFlags]]]]) — in-place sort. For a 2-D
+    /// array nStart identifies both the starting row AND the KEY COLUMN (its column), whole rows move with
+    /// the key. nSortOrder any NONZERO value ⇒ descending (0/omitted ⇒ ascending). nFlags bit 1 ⇒
+    /// case-insensitive C compare. All
+    /// sorted elements must share a data type. Returns 1.</summary>
+    private int FnASort(VfpValue[] a)
+    {
+        if (a.Length == 0) return 0;
+        var arr = Memory.FindArray(a[0].AsString);
+        if (arr is null) return 0;
+
+        int startEl = a.Length > 1 && IsNumeric(a[1]) ? (int)a[1].AsNumber : 1;
+        if (startEl < 1) startEl = 1;
+        int numSorted = a.Length > 2 && IsNumeric(a[2]) ? (int)a[2].AsNumber : -1;
+        bool desc = a.Length > 3 && IsNumeric(a[3]) && (int)a[3].AsNumber != 0; // VFP: ANY nonzero ⇒ descending.
+        bool ci = a.Length > 4 && IsNumeric(a[4]) && ((int)a[4].AsNumber & 1) != 0;
+
+        if (arr.Is2D)
+        {
+            int cols = arr.Cols;
+            int keyCol = (startEl - 1) % cols + 1;
+            int startRow = (startEl - 1) / cols + 1;
+            int rowCount = numSorted < 0 ? arr.Rows - startRow + 1 : numSorted;
+            SortRowRange(arr, startRow, rowCount, keyCol, desc, ci);
+        }
+        else
+        {
+            int count = numSorted < 0 ? arr.Length - startEl + 1 : numSorted;
+            SortElementRange(arr, startEl, count, desc, ci);
+        }
+        return 1;
+    }
+
+    private void SortElementRange(VfpArray arr, int start, int count, bool desc, bool ci)
+    {
+        if (count <= 1) return;
+        var items = new VfpValue[count];
+        for (int i = 0; i < count; i++) items[i] = arr.GetLinear(start + i);
+        Array.Sort(items, (x, y) => (desc ? -1 : 1) * SortCompare(x, y, ci));
+        for (int i = 0; i < count; i++) arr.SetLinear(start + i, items[i]);
+    }
+
+    private void SortRowRange(VfpArray arr, int startRow, int rowCount, int keyCol, bool desc, bool ci)
+    {
+        if (rowCount <= 1) return;
+        int cols = arr.Cols;
+        var rows = new VfpValue[rowCount][];
+        for (int r = 0; r < rowCount; r++)
+        {
+            rows[r] = new VfpValue[cols];
+            for (int c = 1; c <= cols; c++) rows[r][c - 1] = arr.Get(startRow + r, c);
+        }
+        Array.Sort(rows, (x, y) => (desc ? -1 : 1) * SortCompare(x[keyCol - 1], y[keyCol - 1], ci));
+        for (int r = 0; r < rowCount; r++)
+            for (int c = 1; c <= cols; c++) arr.Set(startRow + r, c, rows[r][c - 1]);
+    }
+
+    // Type-homogeneous compare using the session collation (reused from the expression engine's decision:
+    // MACHINE/GENERAL). Mixed data types are a VFP error 9/11 (backlog C.1) — reproduced as a runtime error.
+    private int SortCompare(VfpValue x, VfpValue y, bool ci)
+    {
+        int cx = SortClass(x), cy = SortClass(y);
+        if (cx != cy)
+            throw new MicroVfpRuntimeException("ASORT(): array elements are not the same data type.");
+        return cx switch
+        {
+            0 => ci
+                ? _ctx.Collation.Compare(x.AsString.ToUpperInvariant().AsSpan(), y.AsString.ToUpperInvariant().AsSpan())
+                : _ctx.Collation.Compare(x.AsString.AsSpan(), y.AsString.AsSpan()),
+            1 => x.AsNumber.CompareTo(y.AsNumber),
+            2 => x.AsDateTime.CompareTo(y.AsDateTime),
+            3 => x.AsLogical.CompareTo(y.AsLogical),
+            _ => 0,
+        };
+    }
+
+    private static int SortClass(VfpValue v) => v.Type switch
+    {
+        VfpType.Character => 0,
+        VfpType.Numeric or VfpType.Integer or VfpType.Currency => 1,
+        VfpType.Date or VfpType.DateTime => 2,
+        VfpType.Logical => 3,
+        _ => 4,
+    };
+
+    /// <summary>ADATABASES(ArrayName) — fill (1 × 2) [name, full DBC path] for the open database container,
+    /// or return 0 when none is open. microVFP has a single open DBC (backlog C.7). hackfox s4g666: column 2
+    /// is always the full path regardless of SET FULLPATH.</summary>
+    private int FnADatabases(VfpValue[] a)
+    {
+        if (a.Length == 0) return 0;
+        string? dbc = Session.DatabasePath;
+        if (Session.Database is null || string.IsNullOrEmpty(dbc)) return 0;
+        var arr = Memory.RedimOrCreateArray(a[0].AsString, 1, 2);
+        arr.Set(1, 1, VfpValue.Character(Path.GetFileNameWithoutExtension(dbc)));
+        arr.Set(1, 2, VfpValue.Character(dbc));
+        return 1;
+    }
+
+    /// <summary>AUSED(ArrayName [, nDataSessionId]) — fill (nAreas × 2) [alias, work-area number] for every
+    /// open work area (ordered by area number), or return 0 when none is open. Single data session, so the
+    /// optional session id is ignored (backlog C.7).</summary>
+    private int FnAUsed(VfpValue[] a)
+    {
+        if (a.Length == 0) return 0;
+        var areas = new List<VfpSession.WorkArea>(Session.OpenAreas);
+        if (areas.Count == 0) return 0;
+        areas.Sort((x, y) => x.Area.CompareTo(y.Area));
+        var arr = Memory.RedimOrCreateArray(a[0].AsString, areas.Count, 2);
+        for (int i = 0; i < areas.Count; i++)
+        {
+            arr.Set(i + 1, 1, VfpValue.Character(areas[i].Alias));
+            arr.Set(i + 1, 2, VfpValue.Integer(areas[i].Area));
+        }
+        return areas.Count;
+    }
+
+    /// <summary>ASESSIONS(ArrayName) — fill a 1-D array with the open data-session ids. microVFP is a SINGLE
+    /// data session (see the SET DATASESSION stub), so this is always [1] with a return of 1 (backlog C.1).</summary>
+    private int FnASessions(VfpValue[] a)
+    {
+        if (a.Length == 0) return 0;
+        var arr = Memory.RedimOrCreateArray(a[0].AsString, 1, 0);
+        arr.SetLinear(1, VfpValue.Integer(1));
+        return 1;
     }
 
     private VfpValue FnCoCreateGuid()

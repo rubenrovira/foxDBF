@@ -44,6 +44,18 @@ internal static class MicroVfpExprRewrite
         s = QuoteArrayFnArg(s, "AERROR");
         s = QuoteArrayFnArg(s, "ATAGINFO");   // ATAGINFO(ArrayName [, cTagFile [, area]]) — name by reference.
         s = QuoteArrayFnArg(s, "ALINES");     // ALINES(ArrayName, cExpr [, …]) — array name by reference.
+        // P2 array batch — every one takes the (destination) array NAME as its FIRST argument.
+        s = QuoteArrayFnArg(s, "ADEL");       // ADEL(ArrayName, nElement [, 2])
+        s = QuoteArrayFnArg(s, "AINS");       // AINS(ArrayName, nElement [, 2])
+        s = QuoteArrayFnArg(s, "AELEMENT");   // AELEMENT(ArrayName, nRow [, nCol])
+        s = QuoteArrayFnArg(s, "ASUBSCRIPT"); // ASUBSCRIPT(ArrayName, nElement, nSubscript)
+        s = QuoteArrayFnArg(s, "AFIELDS");    // AFIELDS(ArrayName [, cAlias | nArea])
+        s = QuoteArrayFnArg(s, "ASORT");      // ASORT(ArrayName [, nStart [, nCount [, nOrder [, nFlags]]]])
+        s = QuoteArrayFnArg(s, "ADATABASES"); // ADATABASES(ArrayName)
+        s = QuoteArrayFnArg(s, "AUSED");      // AUSED(ArrayName [, nDataSessionId])
+        s = QuoteArrayFnArg(s, "ASESSIONS");  // ASESSIONS(ArrayName)
+        // ACOPY takes TWO array names by reference (source AND destination).
+        s = QuoteArrayFn2Args(s, "ACOPY");    // ACOPY(aSource, aDest [, nStart [, nCount [, nDestStart]]])
         s = QuoteLookupArgs(s);               // LOOKUP(rReturn, eSearch, rSearched [, cTag]) — field names by reference.
         return s;
     }
@@ -112,6 +124,81 @@ internal static class MicroVfpExprRewrite
             i++;
         }
         return sb.ToString();
+    }
+
+    /// <summary>Like <see cref="QuoteArrayFnArg"/> but wraps the first TWO bare-identifier arguments of
+    /// every <paramref name="fn"/><c>( … )</c> call in quotes — for ACOPY, whose SOURCE and DESTINATION are
+    /// both array names by reference. String-literal aware.</summary>
+    private static string QuoteArrayFn2Args(string s, string fn)
+    {
+        if (s.Length == 0) return s;
+        var sb = new StringBuilder(s.Length + 8);
+        int i = 0;
+        while (i < s.Length)
+        {
+            char c = s[i];
+            if (c == '\'' || c == '"')                        // copy quoted string verbatim.
+            {
+                char q = c; sb.Append(c); i++;
+                while (i < s.Length) { sb.Append(s[i]); if (s[i] == q) break; i++; }
+                i++;
+                continue;
+            }
+            if (char.IsAsciiLetter(c) || c == '_')            // an identifier run.
+            {
+                int start = i;
+                i++;
+                while (i < s.Length && IsIdentChar(s[i])) i++;
+                string ident = s.Substring(start, i - start);
+                sb.Append(ident);
+                if (ident.Equals(fn, StringComparison.OrdinalIgnoreCase))
+                    i = EmitQuotedLeadingArgs(s, i, sb, 2);
+                continue;
+            }
+            sb.Append(c);
+            i++;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Having just emitted the function name (cursor at <paramref name="i"/>), quote up to
+    /// <paramref name="maxArgs"/> LEADING bare-identifier arguments of the following <c>( … )</c> call and
+    /// return the cursor past the last one it emitted; a non-call or a non-bare first argument leaves the
+    /// builder untouched and returns <paramref name="i"/>. Trailing arguments are left for the caller's
+    /// verbatim copy.</summary>
+    private static int EmitQuotedLeadingArgs(string s, int i, StringBuilder sb, int maxArgs)
+    {
+        int p = i;
+        while (p < s.Length && char.IsWhiteSpace(s[p])) p++;
+        if (p >= s.Length || s[p] != '(') return i;          // not a call.
+        int open = p;
+
+        var local = new StringBuilder();
+        local.Append(s, i, open - i + 1);                    // any spaces + '('
+        int q = open + 1;
+        int quoted = 0;
+        for (int arg = 0; arg < maxArgs; arg++)
+        {
+            int save = q;
+            while (q < s.Length && char.IsWhiteSpace(s[q])) q++;
+            if (q >= s.Length || !(char.IsAsciiLetter(s[q]) || s[q] == '_')) break;  // arg not bare.
+            int idStart = q; q++;
+            while (q < s.Length && IsIdentChar(s[q])) q++;
+            int idEnd = q;
+            int after = idEnd;
+            while (after < s.Length && char.IsWhiteSpace(s[after])) after++;
+            if (after >= s.Length || (s[after] != ',' && s[after] != ')')) break;    // not a lone identifier.
+
+            local.Append(s, save, idStart - save);           // leading ws after '(' or ','
+            local.Append('\'').Append(s, idStart, idEnd - idStart).Append('\'');
+            quoted++;
+            if (s[after] == ')') { q = idEnd; break; }        // last arg — caller copies " )".
+            local.Append(s, idEnd, after - idEnd).Append(','); // ws before comma + comma
+            q = after + 1;
+        }
+        if (quoted == 0) return i;
+        sb.Append(local);
+        return q;
     }
 
     /// <summary>Quote the field-NAME arguments of every <c>LOOKUP( … )</c> call — the 1st (rReturn) and
