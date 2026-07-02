@@ -157,6 +157,39 @@ internal static class PrgScan
         return tokens;
     }
 
+    /// <summary>True when <paramref name="s"/> contains a top-level (depth-0, outside string) macro
+    /// reference <c>&amp;ident</c> — a runtime textual substitution. A <c>&amp;&amp;</c> (already a stripped
+    /// comment) never counts. Drives the generalised statement-level macro expansion.</summary>
+    public static bool ContainsTopLevelMacro(string s)
+    {
+        int depth = 0;
+        bool inStr = false;
+        char q = '\0';
+        for (int i = 0; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (inStr) { if (c == q) inStr = false; continue; }
+            switch (c)
+            {
+                case '\'':
+                case '"': inStr = true; q = c; continue;
+                case '(':
+                case '[':
+                case '{': depth++; continue;
+                case ')':
+                case ']':
+                case '}': if (depth > 0) depth--; continue;
+                case '&':
+                    if (depth != 0) continue;
+                    char next = i + 1 < s.Length ? s[i + 1] : '\0';
+                    if (next == '&') { i++; continue; }        // a comment marker, not a macro.
+                    if (IsIdentStart(next)) return true;
+                    continue;
+            }
+        }
+        return false;
+    }
+
     /// <summary>The first identifier word of a logical line, UPPER-cased. Lines that begin
     /// with <c>=</c>, <c>&amp;</c> or <c>#</c> report that symbol as their "word".</summary>
     public static string FirstWord(string s)

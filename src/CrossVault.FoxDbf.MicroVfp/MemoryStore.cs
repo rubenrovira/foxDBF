@@ -319,6 +319,15 @@ public sealed class MemoryStore
         return arr;
     }
 
+    /// <summary>CLEAR MEMORY / CLEAR ALL: release EVERY memory-variable binding (scalars + arrays, every
+    /// scope) in every live frame — the whole-store counterpart of <see cref="Release(string)"/>. The frame
+    /// STACK itself is preserved (an in-flight call keeps its frames; only their bindings are dropped) so a
+    /// later assignment re-creates variables from scratch, exactly as VFP's post-CLEAR "U" state behaves.</summary>
+    public void ClearAll()
+    {
+        foreach (var f in _frames) f.Vars.Clear();
+    }
+
     /// <summary>RELEASE <paramref name="name"/> (no error if absent): drop the nearest visible binding.</summary>
     public void Release(string name)
     {

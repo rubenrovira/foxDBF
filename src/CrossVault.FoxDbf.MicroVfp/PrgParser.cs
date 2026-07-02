@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using CrossVault.FoxDbf.Expressions;
 using CrossVault.FoxDbf.Sql;
 
 namespace CrossVault.FoxDbf.MicroVfp;
@@ -20,7 +21,7 @@ public static class PrgParser
     public static PrgProgram Parse(string source)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
-        var lines = BuildLogicalLines(source);
+        var lines = PreprocessConditionals(BuildLogicalLines(source));
         return new Impl(lines).ParseProgram();
     }
 
@@ -78,6 +79,198 @@ public static class PrgParser
             }
         }
         return result;
+    }
+
+    // ── #IF / #IFDEF / #IFNDEF / #ELIF / #ELSE / #ENDIF preprocessor ─────────────
+
+    /// <summary>Compile-time conditional inclusion (VFP preprocessor, runs BEFORE p-code compilation): drops
+    /// the logical lines inside a <c>#IF</c>/<c>#IFDEF</c>/<c>#IFNDEF</c> branch whose (constant) condition is
+    /// false, evaluating <c>#IF</c>/<c>#ELIF</c> expressions after substituting the <c>#DEFINE</c> constants
+    /// seen so far. Surviving <c>#DEFINE</c> lines are KEPT so the interpreter's runtime <c>#DEFINE</c> pass
+    /// still records them (macro-in-expression); the conditional directives themselves are consumed here.
+    /// Lenient by design — an unbalanced <c>#ELSE</c>/<c>#ENDIF</c> is ignored, never a parse error.</summary>
+    internal static List<LogicalLine> PreprocessConditionals(List<LogicalLine> lines)
+    {
+        // Fast path: nothing to do when the source carries no conditional directive at all.
+        bool anyCond = false;
+        foreach (var l in lines)
+            if (IsConditionalDirective(l.Text)) { anyCond = true; break; }
+        if (!anyCond) return lines;
+
+        var defines = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        var stack = new Stack<CondFrame>();
+        var outp = new List<LogicalLine>(lines.Count);
+
+        foreach (var ll in lines)
+        {
+            bool emittingNow = stack.Count == 0 || stack.Peek().Emitting;
+            string t = ll.Text.TrimStart();
+
+            if (t.Length > 0 && t[0] == '#' && TryDirective(t, out string dir, out string rest))
+            {
+                switch (dir)
+                {
+                    case "IF":
+                    case "IFDEF":
+                    case "IFNDEF":
+                    {
+                        bool parent = emittingNow;
+                        bool cond = parent && dir switch
+                        {
+                            "IFDEF" => defines.ContainsKey(FirstIdent(rest)),
+                            "IFNDEF" => !defines.ContainsKey(FirstIdent(rest)),
+                            _ => EvalConstCondition(rest, defines),
+                        };
+                        stack.Push(new CondFrame { Emitting = cond, AnyTaken = cond, ParentEmitting = parent });
+                        continue;
+                    }
+                    case "ELIF":
+                    {
+                        if (stack.Count == 0) continue;
+                        var fr = stack.Peek();
+                        bool cond = fr.ParentEmitting && !fr.AnyTaken && EvalConstCondition(rest, defines);
+                        fr.Emitting = cond;
+                        if (cond) fr.AnyTaken = true;
+                        continue;
+                    }
+                    case "ELSE":
+                    {
+                        if (stack.Count == 0) continue;
+                        var fr = stack.Peek();
+                        fr.Emitting = fr.ParentEmitting && !fr.AnyTaken;
+                        fr.AnyTaken = true;
+                        continue;
+                    }
+                    case "ENDIF":
+                        if (stack.Count > 0) stack.Pop();
+                        continue;
+                    case "DEFINE":
+                        if (emittingNow)
+                        {
+                            RecordDefine(rest, defines);
+                            outp.Add(ll);                 // keep for the runtime #DEFINE pass.
+                        }
+                        continue;
+                    case "UNDEF":
+                        if (emittingNow) defines.Remove(FirstIdent(rest));
+                        continue;
+                    default:
+                        // #INCLUDE / other → pass through (only when emitting) as before (runtime no-op).
+                        if (emittingNow) outp.Add(ll);
+                        continue;
+                }
+            }
+
+            if (emittingNow) outp.Add(ll);
+        }
+
+        return outp;
+    }
+
+    private sealed class CondFrame
+    {
+        public bool Emitting;        // this branch is active AND the parent is emitting.
+        public bool AnyTaken;        // some branch of this #IF chain has been selected.
+        public bool ParentEmitting;  // the enclosing scope was emitting when this #IF opened.
+    }
+
+    private static bool IsConditionalDirective(string text)
+    {
+        string t = text.TrimStart();
+        return t.Length > 0 && t[0] == '#' && TryDirective(t, out string dir, out _) &&
+               dir is "IF" or "IFDEF" or "IFNDEF" or "ELIF" or "ELSE" or "ENDIF";
+    }
+
+    /// <summary>Splits a <c>#</c> line into its UPPER-cased directive word and the remaining text.</summary>
+    private static bool TryDirective(string t, out string dir, out string rest)
+    {
+        dir = string.Empty; rest = string.Empty;
+        if (t.Length == 0 || t[0] != '#') return false;
+        int i = 1;
+        while (i < t.Length && char.IsWhiteSpace(t[i])) i++;
+        int start = i;
+        while (i < t.Length && (char.IsAsciiLetterOrDigit(t[i]) || t[i] == '_')) i++;
+        if (i == start) return false;
+        dir = t.Substring(start, i - start).ToUpperInvariant();
+        rest = t.Substring(i).Trim();
+        return true;
+    }
+
+    private static string FirstIdent(string s)
+    {
+        s = s.TrimStart();
+        int j = 0;
+        while (j < s.Length && (char.IsAsciiLetterOrDigit(s[j]) || s[j] == '_')) j++;
+        return s.Substring(0, j);
+    }
+
+    // #DEFINE NAME [value] — record NAME → value text (null when value-less).
+    private static void RecordDefine(string rest, Dictionary<string, string?> defines)
+    {
+        string name = FirstIdent(rest);
+        if (name.Length == 0) return;
+        string val = rest.Substring(name.Length).Trim();
+        defines[name] = val.Length == 0 ? null : val;
+    }
+
+    // Evaluate a #IF / #ELIF constant boolean condition: substitute the known #DEFINE constants textually,
+    // then evaluate with the shared expression engine over an empty row. Non-zero numeric ⇒ true.
+    private static bool EvalConstCondition(string expr, Dictionary<string, string?> defines)
+    {
+        string sub = SubstituteDefines(expr, defines);
+        try
+        {
+            var v = VfpExpression.Parse(MicroVfpExprRewrite.Normalize(sub)).Evaluate(NullRow.Instance);
+            return v.Type switch
+            {
+                VfpType.Logical => v.AsLogical,
+                VfpType.Numeric or VfpType.Integer or VfpType.Currency => v.AsNumber != 0m,
+                _ => false,
+            };
+        }
+        catch { return false; }
+    }
+
+    // Replace every identifier that names a #DEFINE constant with its value text (value-less ⇒ ".T.").
+    // Bounded iteration handles a define whose value references another define.
+    private static string SubstituteDefines(string expr, Dictionary<string, string?> defines)
+    {
+        if (defines.Count == 0) return expr;
+        for (int pass = 0; pass < 10; pass++)
+        {
+            var sb = new StringBuilder(expr.Length);
+            bool changed = false;
+            bool inStr = false; char q = '\0';
+            for (int i = 0; i < expr.Length;)
+            {
+                char c = expr[i];
+                if (inStr) { sb.Append(c); if (c == q) inStr = false; i++; continue; }
+                if (c == '\'' || c == '"') { inStr = true; q = c; sb.Append(c); i++; continue; }
+                if (char.IsAsciiLetter(c) || c == '_')
+                {
+                    int s = i; i++;
+                    while (i < expr.Length && (char.IsAsciiLetterOrDigit(expr[i]) || expr[i] == '_')) i++;
+                    string word = expr.Substring(s, i - s);
+                    if (defines.TryGetValue(word, out var val)) { sb.Append(string.IsNullOrEmpty(val) ? ".T." : val); changed = true; }
+                    else sb.Append(word);
+                    continue;
+                }
+                sb.Append(c); i++;
+            }
+            expr = sb.ToString();
+            if (!changed) break;
+        }
+        return expr;
+    }
+
+    /// <summary>An empty row for constant #IF evaluation — no fields, no record.</summary>
+    private sealed class NullRow : IRowContext
+    {
+        public static readonly NullRow Instance = new();
+        public object? GetField(string name) => null;
+        public int RecNo => 0;
+        public bool Deleted => false;
+        public int RecCount => 0;
     }
 
     // ── the recursive-descent parser ───────────────────────────────────────────
@@ -191,7 +384,7 @@ public static class PrgParser
             switch (kw)
             {
                 case "IF": return ParseIf();
-                case "FOR": return ParseFor();
+                case "FOR": return PrgScan.SecondWord(ll.Text) == "EACH" ? ParseForEach() : ParseFor();
                 case "SCAN": return ParseScan();
                 case "DO":
                     string sw = PrgScan.SecondWord(ll.Text);
@@ -293,6 +486,30 @@ public static class PrgParser
             return new ForStmt(variable, PrgExpr.Parse(fromText), PrgExpr.Parse(toText), step, body) { Line = ll.LineNo };
         }
 
+        // FOR EACH uVar IN aArrayOrCollection [FOXORDER] … ENDFOR|NEXT
+        private ForEachStmt ParseForEach()
+        {
+            var ll = Next();
+            // Drop the leading "FOR" then "EACH", leaving "uVar IN aArray [FOXORDER]".
+            string rest = PrgScan.AfterFirstWord(PrgScan.AfterFirstWord(ll.Text));
+            int inPos = PrgScan.IndexOfKeyword(rest, "IN");
+            if (inPos < 0) throw new MicroVfpSyntaxException("Malformed FOR EACH (missing IN).", ll.LineNo);
+            string variable = rest.Substring(0, inPos).Trim();
+            if (variable.Length == 0) throw new MicroVfpSyntaxException("Malformed FOR EACH (missing loop variable).", ll.LineNo);
+            string collection = rest.Substring(inPos + 2).Trim();
+            // Strip a trailing FOXORDER keyword (2-D traversal-order flag) — microVFP iterates linear order.
+            var words = PrgScan.TopWords(collection);
+            if (words.Count > 0 && words[^1].Upper == "FOXORDER")
+                collection = collection.Substring(0, words[^1].Start).TrimEnd();
+            if (collection.Length == 0) throw new MicroVfpSyntaxException("Malformed FOR EACH (missing collection).", ll.LineNo);
+
+            var body = ParseBlock("ENDFOR", "NEXT");
+            if (!Eof && PeekWord is "ENDFOR" or "NEXT") Next();
+            else throw new MicroVfpSyntaxException("Missing ENDFOR/NEXT.", ll.LineNo);
+
+            return new ForEachStmt(variable, PrgExpr.Parse(collection), body) { Line = ll.LineNo };
+        }
+
         private ScanStmt ParseScan()
         {
             var ll = Next();
@@ -314,6 +531,11 @@ public static class PrgParser
         private PrgStatement BuildSimple(string text, int line)
         {
             string kw = PrgScan.FirstWord(text);
+            // Generalised &macro: any line (other than the already-macro-aware forms — a line that STARTS
+            // with '&', ON ERROR &var, or a # directive) that embeds a top-level &var[.] is deferred as a
+            // MacroSubstStmt and expanded+re-parsed at RUNTIME (textual substitution before execution).
+            if (kw is not ("&" or "ON" or "#") && PrgScan.ContainsTopLevelMacro(text))
+                return new MacroSubstStmt(new MacroSubst(text.Trim())) { Line = line };
             PrgStatement node = kw switch
             {
                 "LOCAL" => BuildVarDecl(DeclScope.Local, text),
@@ -353,6 +575,7 @@ public static class PrgParser
                 "CREATE" => BuildCreate(text),
                 "FLUSH" => BuildFlush(text),
                 "SUM" => BuildSum(text),
+                "CLEAR" => BuildClear(text),
                 "UNLOCK" => BuildUnlock(text),
                 "ROLLBACK" => new RollbackStmt(),
                 "BEGIN" => PrgScan.SecondWord(text) == "TRANSACTION"
@@ -392,6 +615,20 @@ public static class PrgParser
             string rest = PrgScan.AfterFirstWord(text);
             var (all, like, except, names, _) = ParseDeclBody(rest);
             return new ReleaseStmt(names, all, like, except);
+        }
+
+        // CLEAR [MEMORY | ALL | WINDOWS | GETS | …]. MEMORY/ALL release memory; every other form is a UI
+        // subsystem reset with no headless-interpreter effect (flagged as a no-op ClearKind.Ui).
+        private static ClearStmt BuildClear(string text)
+        {
+            string what = PrgScan.FirstWord(PrgScan.AfterFirstWord(text));
+            var kind = what switch
+            {
+                "MEMORY" => ClearKind.Memory,
+                "ALL" => ClearKind.All,
+                _ => ClearKind.Ui,
+            };
+            return new ClearStmt(kind);
         }
 
         private static DimensionStmt BuildDimension(string text)

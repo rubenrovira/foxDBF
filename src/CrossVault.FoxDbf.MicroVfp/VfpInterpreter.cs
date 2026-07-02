@@ -67,6 +67,18 @@ public sealed class VfpInterpreter
     // microVFP writes through on every REPLACE/DELETE, so this only feeds SET("AUTOSAVE"). Default OFF.
     private bool _setAutosave;
 
+    // SET DATABASE TO [name] — the CURRENT-database designation over the single open DBC. An open DBC is
+    // current by default (VFP: OPEN DATABASE makes it current); `SET DATABASE TO` with no name clears the
+    // designation (DBC()/SET("DATABASE") = ""); `SET DATABASE TO name` re-selects it. Multi-DBC is out of
+    // scope (single-DBC session — see the backlog SET DATABASE entry).
+    private bool _currentDbCleared;
+
+    // &macro re-entrancy guard: a self-/mutually-referential macro (pcmd='&pcmd' then &pcmd) survives
+    // ExpandMacrosInLine unchanged (its 10-pass loop only bounds textual expansion WITHIN one line), so
+    // Exec re-enters ExecMacroSubst unboundedly → StackOverflowException (uncatchable, kills the host).
+    // VFP9 instead raises a graceful error, so we bound the runtime re-parse depth and throw.
+    private int _macroDepth;
+
     // ── SET RELATION (multi-table relation model; microVFP P1 gap #2) ──
     // Re-entrancy guard: while a parent move is repositioning its children, the child moves (SEEK/GOTO)
     // must NOT themselves re-fire the reposition hook — chaining is driven explicitly by
@@ -476,6 +488,7 @@ public sealed class VfpInterpreter
             case DoCaseStmt dc: ExecDoCase(dc); break;
             case DoWhileStmt dw: ExecDoWhile(dw); break;
             case ForStmt f: ExecFor(f); break;
+            case ForEachStmt fe: ExecForEach(fe); break;
             case ScanStmt sc: ExecScan(sc); break;
             case DoCall dca: ExecDoCall(dca); break;
             case ExprStatement es: Eval(es.Expression); break;
@@ -516,7 +529,9 @@ public sealed class VfpInterpreter
             case RenameTableStmt rt: ExecRenameTable(rt); break;
             case SqlPassthroughStmt sp: ExecSqlPassthrough(sp); break;
             case FlushStmt: break;                           // write-through model — persisted already; no-op.
-            case LocateStmt or ContinueStmt or MacroSubstStmt or UnknownCommand or ProcDef: break;
+            case ClearStmt cl: ExecClear(cl); break;
+            case MacroSubstStmt ms: ExecMacroSubst(ms); break;
+            case LocateStmt or ContinueStmt or UnknownCommand or ProcDef: break;
             default: break;
         }
     }
@@ -612,6 +627,27 @@ public sealed class VfpInterpreter
             catch (LoopSignal) { /* fall through to increment */ }
             cur = Memory.Get(f.Variable).AsDouble + step;       // body may mutate the loop var.
             Memory.Set(f.Variable, VfpValue.Number(cur));
+        }
+    }
+
+    // FOR EACH uVar IN aArray … ENDFOR — iterate the array's elements in LINEAR (row-major) order, binding
+    // uVar to a VALUE COPY of each element (no write-back into the array; hackfox s4g688). The element set is
+    // snapshotted once up front so a resize inside the body does not change the count mid-loop. Non-array /
+    // unbound collections iterate zero times (no user Collection object model in microVFP).
+    private void ExecForEach(ForEachStmt fe)
+    {
+        var arr = Memory.FindArray(fe.Collection.Text.Trim());
+        if (arr is null) return;
+        int n = arr.Length;
+        var snapshot = new VfpValue[n];
+        for (int i = 0; i < n; i++) snapshot[i] = arr.GetLinear(i + 1);
+
+        foreach (var el in snapshot)
+        {
+            Memory.Set(fe.Variable, el);
+            try { ExecBlock(fe.Body); }
+            catch (ExitSignal) { break; }
+            catch (LoopSignal) { /* next element */ }
         }
     }
 
@@ -1634,6 +1670,7 @@ public sealed class VfpInterpreter
             case "NULL": _ctx.NullSetting = OnOff(arg); break;  // CREATE/ALTER TABLE default nullability; SET("NULL").
             case "AUTOSAVE": _setAutosave = OnOff(arg); break;  // header-buffer flush policy; SET("AUTOSAVE").
             case "DATASESSION": SetDataSession(arg); break;     // single-session stub; TO 1 no-op, else err 1540.
+            case "DATABASE": SetDatabase(arg); break;           // current-DBC designation; feeds DBC()/SET("DATABASE").
             default: break; // TALK / COMPATIBLE / DATA / PROCEDURE / … — irrelevant to results.
         }
     }
@@ -1655,6 +1692,29 @@ public sealed class VfpInterpreter
         if (n == 1) return;   // the only session microVFP has → no-op.
         throw new MicroVfpRuntimeException("Session number is invalid.");   // VFP error 1540.
     }
+
+    // SET DATABASE TO [name]. With NO name → clear the current-database designation (DBC()/SET("DATABASE")
+    // return ""). WITH a name → (re)select the single open DBC as current. Multi-DBC selection is out of
+    // scope (single-DBC session), so any name simply restores the current designation.
+    private void SetDatabase(string arg)
+    {
+        string s = arg.Trim();
+        if (s.StartsWith("TO", StringComparison.OrdinalIgnoreCase)) s = s.Substring(2).Trim();
+        if (s.Length == 0) { _currentDbCleared = true; return; }   // TO (no name) clears the designation.
+        // A NAME must reference the actually-open DBC (VFP raises "Database 'X' is not open." otherwise —
+        // verified against vfp9.exe). Compare path/extension-insensitively (bare DBC name) case-insensitively.
+        s = s.Trim('\'', '"', ' ');
+        string requested = Path.GetFileNameWithoutExtension(s);
+        string open = Session.Database is not null ? Path.GetFileNameWithoutExtension(Session.DatabasePath ?? string.Empty) : string.Empty;
+        if (open.Length == 0 || !string.Equals(requested, open, StringComparison.OrdinalIgnoreCase))
+            throw new MicroVfpRuntimeException($"Database '{requested}' is not open.");
+        _currentDbCleared = false;   // re-select the open DBC as current.
+    }
+
+    // The current DBC's name (no path/extension) when one is open AND not cleared, else "". Backs both
+    // DBC() (full path) and SET("DATABASE") (bare name) — see DbcPath / FnSet.
+    private string CurrentDbPath()
+        => (!_currentDbCleared && Session.Database is not null) ? (Session.DatabasePath ?? string.Empty) : string.Empty;
 
     private void SetReprocess(string arg)
     {
@@ -1715,6 +1775,80 @@ public sealed class VfpInterpreter
         if (t.EndsWith('.')) t = t.Substring(0, t.Length - 1);
         t = t.Trim();
         return t.Length == 0 ? string.Empty : Memory.Get(t).AsString;
+    }
+
+    // Generalised &macro execution: expand EVERY &var[.] in the captured line to the variable's CURRENT
+    // string content (textual substitution BEFORE execution), then re-parse the result and run it as an
+    // embedded statement. Reuses ExpandMacro's single-token rule + ParseSingle. An empty/unparseable
+    // expansion is a no-op (an undefined macro expands to "" — VFP treats a blank macro line as nothing).
+    private void ExecMacroSubst(MacroSubstStmt ms)
+    {
+        string expanded = ExpandMacrosInLine(ms.Macro.Text).Trim();
+        if (expanded.Length == 0) return;
+        // Depth guard: ExpandMacrosInLine bounds textual expansion within one line only, so a self-
+        // referential macro (&pcmd where pcmd='&pcmd') re-parses to another MacroSubstStmt and re-enters
+        // here forever → StackOverflowException (uncatchable). Bound the nesting and raise VFP-style.
+        if (_macroDepth >= 16)
+            throw new MicroVfpRuntimeException("Nesting level too deep.");
+        var stmt = ParseSingle(expanded);
+        if (stmt is null) return;
+        _macroDepth++;
+        try { Exec(stmt); }
+        finally { _macroDepth--; }
+    }
+
+    // Replace every top-level (outside string literals) &ident[.] occurrence with the memvar's string value.
+    // The optional trailing '.' terminator is consumed. Bounded iteration expands a macro whose expansion
+    // itself contains a further macro reference.
+    private string ExpandMacrosInLine(string line)
+    {
+        for (int pass = 0; pass < 10; pass++)
+        {
+            var sb = new StringBuilder(line.Length);
+            bool changed = false;
+            bool inStr = false; char q = '\0';
+            for (int i = 0; i < line.Length;)
+            {
+                char c = line[i];
+                if (inStr) { sb.Append(c); if (c == q) inStr = false; i++; continue; }
+                if (c == '\'' || c == '"') { inStr = true; q = c; sb.Append(c); i++; continue; }
+                if (c == '&' && i + 1 < line.Length && (char.IsAsciiLetter(line[i + 1]) || line[i + 1] == '_'))
+                {
+                    int j = i + 1;
+                    while (j < line.Length && (char.IsAsciiLetterOrDigit(line[j]) || line[j] == '_')) j++;
+                    string name = line.Substring(i + 1, j - (i + 1));
+                    if (j < line.Length && line[j] == '.') j++;   // consume the '.' terminator.
+                    sb.Append(Memory.Get(name).AsString);
+                    changed = true;
+                    i = j;
+                    continue;
+                }
+                sb.Append(c); i++;
+            }
+            line = sb.ToString();
+            if (!changed) break;
+        }
+        return line;
+    }
+
+    // CLEAR MEMORY / CLEAR ALL. MEMORY releases every memvar + array; ALL additionally closes every open
+    // work area (a program-start reset). The bare/UI forms (ClearKind.Ui) have no headless effect.
+    private void ExecClear(ClearStmt cl)
+    {
+        switch (cl.Kind)
+        {
+            case ClearKind.Memory:
+                Memory.ClearAll();
+                break;
+            case ClearKind.All:
+                Memory.ClearAll();
+                Session.CloseAllHandles();   // close every open work area (keeps the data-source binding).
+                _meta.Clear();               // drop the per-area record pointers/relations too.
+                _currentDbCleared = true;    // CLEAR ALL closes all files incl. databases ⇒ DBC()/SET("DATABASE")="".
+                break;
+            default:
+                break;   // CLEAR / CLEAR WINDOWS / GETS / … — no UI model; flagged no-op.
+        }
     }
 
     // Parse a single command line into one PrgStatement (the ON ERROR handler body); null when it does not
@@ -3540,7 +3674,10 @@ public sealed class VfpInterpreter
             case "USED": r = VfpValue.Logical(a.Length > 0 && Session.FindAreaByAlias(a[0].AsString) is not null); return true;
             case "ALIAS": r = FnAlias(a); return true;
             case "DBF": r = VfpValue.Character(AreaArg(a, 0)?.Table.SourcePath ?? string.Empty); return true;
-            case "DBC": r = VfpValue.Character(string.Empty); return true;
+            case "DBC": r = VfpValue.Character(CurrentDbPath()); return true;
+            case "INDBC": r = VfpValue.Logical(FnInDbc(a)); return true;
+            case "ISEXCLUSIVE": r = VfpValue.Logical(AreaArg(a, 0)?.Exclusive ?? false); return true;
+            case "ISREADONLY": r = VfpValue.Logical(AreaArg(a, 0)?.NoUpdate ?? false); return true;
             case "RECNO": r = VfpValue.Integer(FnRecno(a)); return true;
             case "HEADER": r = VfpValue.Integer(AreaArg(a, 0)?.Table.HeaderLength ?? 0); return true;
             case "LUPDATE": r = FnLupdate(a); return true;
@@ -3731,10 +3868,56 @@ public sealed class VfpInterpreter
             "RELATION" => VfpValue.Character(RelationSetString(Session.CurrentArea)),  // reproduces the SET RELATION args.
             "SKIP" => VfpValue.Character(SkipSetString(Session.CurrentArea)),          // comma-list of 1:n aliases.
             "DATASESSION" => VfpValue.Number(1m),   // NUMERIC (verified vs vfp9.exe) — single public session.
+            // SET("DATABASE") — the current DBC's NAME only (no drive/path/extension), "" when none current.
+            "DATABASE" => VfpValue.Character(CurrentDbPath() is { Length: > 0 } p ? Path.GetFileNameWithoutExtension(p) : string.Empty),
             "TALK" => VfpValue.Character("OFF"),
             "COMPATIBLE" => VfpValue.Character("OFF"),
             _ => VfpValue.Character(string.Empty),
         };
+    }
+
+    // INDBC(cObjectName, cObjectType) — is a named object present in the CURRENT database container?
+    // TABLE: matched against the DBC's long table names. FIELD: cObjectName MUST be alias.field (an
+    // unqualified name returns .F. even when the field exists — hackfox s4g436 quirk); matched against
+    // that table's long field names. INDEX/VIEW/CONNECTION are not modelled by microVFP's DBC reader → .F.
+    private bool FnInDbc(VfpValue[] a)
+    {
+        if (a.Length < 2) return false;
+        var db = _currentDbCleared ? null : Session.Database;
+        if (db is null) return false;
+
+        string name = a[0].AsString.Trim();
+        string type = a[1].AsString.Trim().ToUpperInvariant();
+
+        switch (type)
+        {
+            case "TABLE":
+                foreach (var t in db.TableNames)
+                    if (string.Equals(t, name, StringComparison.OrdinalIgnoreCase)) return true;
+                return false;
+
+            case "FIELD":
+            {
+                int dot = name.IndexOf('.');
+                if (dot <= 0 || dot >= name.Length - 1) return false;   // must be alias.field.
+                string table = name[..dot], field = name[(dot + 1)..];
+                bool known = false;
+                foreach (var t in db.TableNames)
+                    if (string.Equals(t, table, StringComparison.OrdinalIgnoreCase)) { table = t; known = true; break; }
+                if (!known) return false;
+                try
+                {
+                    foreach (var f in db.GetTableRules(table).Fields)
+                        if (string.Equals(f.FieldName, field, StringComparison.OrdinalIgnoreCase)) return true;
+                }
+                catch { return false; }
+                return false;
+            }
+
+            // INDEX (no DBC tag model), VIEW / CONNECTION (not parsed) — flagged as unsupported → .F.
+            default:
+                return false;
+        }
     }
 
     private VfpValue FnSys(VfpValue[] a)
@@ -5092,6 +5275,7 @@ public sealed class VfpInterpreter
                 case IfStmt i: foreach (var x in Walk(i.Then)) yield return x; foreach (var x in Walk(i.Else)) yield return x; break;
                 case DoWhileStmt w: foreach (var x in Walk(w.Body)) yield return x; break;
                 case ForStmt f: foreach (var x in Walk(f.Body)) yield return x; break;
+                case ForEachStmt fe: foreach (var x in Walk(fe.Body)) yield return x; break;
                 case ScanStmt sc: foreach (var x in Walk(sc.Body)) yield return x; break;
                 case DoCaseStmt dc:
                     foreach (var c in dc.Cases) foreach (var x in Walk(c.Body)) yield return x;

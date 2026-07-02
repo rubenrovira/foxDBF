@@ -131,6 +131,15 @@ public sealed record ScanStmt(
     PrgExpr? While,
     IReadOnlyList<PrgStatement> Body) : PrgStatement;
 
+/// <summary><c>FOR EACH uVar IN aArray … ENDFOR|NEXT</c> — iterate every element of a memory ARRAY (in
+/// LINEAR row-major order), binding <see cref="Variable"/> to the element VALUE on each pass (a value COPY,
+/// not an alias — assigning <see cref="Variable"/> does NOT write back into the array, per hackfox s4g688).
+/// Supports <c>EXIT</c>/<c>LOOP</c> like the other loops. microVFP FINAL P2 — §C.3.</summary>
+public sealed record ForEachStmt(
+    string Variable,
+    PrgExpr Collection,
+    IReadOnlyList<PrgStatement> Body) : PrgStatement;
+
 public sealed record ReturnStmt(PrgExpr? Value) : PrgStatement;
 public sealed record ExitStmt : PrgStatement;
 public sealed record LoopStmt : PrgStatement;
@@ -287,6 +296,16 @@ public sealed record SumStmt(
     IReadOnlyList<string> To) : PrgStatement;
 
 public sealed record UnlockStmt(bool All, NameRef? Record, NameRef? In) : PrgStatement;
+
+/// <summary>The scope of a <c>CLEAR</c> command. <see cref="Memory"/> = <c>CLEAR MEMORY</c> (release all
+/// memvars + arrays); <see cref="All"/> = <c>CLEAR ALL</c> (memvars + arrays AND close every work area);
+/// <see cref="Ui"/> = the screen/window/menu/GETS/… forms — FLAGGED (no UI model), executed as a no-op.</summary>
+public enum ClearKind { Memory, All, Ui }
+
+/// <summary><c>CLEAR [MEMORY|ALL|…]</c>. The bare <c>CLEAR</c> and the WINDOWS/MENUS/GETS/READ/TYPEAHEAD/…
+/// forms carry no memory-model effect in a headless interpreter (<see cref="ClearKind.Ui"/>, no-op).
+/// microVFP FINAL P2 — §C.4.</summary>
+public sealed record ClearStmt(ClearKind Kind) : PrgStatement;
 
 // ── transactions ─────────────────────────────────────────────────────────────
 
