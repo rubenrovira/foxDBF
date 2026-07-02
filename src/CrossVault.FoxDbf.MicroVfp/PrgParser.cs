@@ -343,6 +343,15 @@ public static class PrgParser
                 "DELETE" => BuildDelete(text),
                 "RECALL" => BuildRecall(text),
                 "INSERT" => new InsertStmt(text.Trim(), TrySql(text)),
+                "GATHER" => BuildGather(text),
+                "SCATTER" => BuildScatter(text),
+                "APPEND" => BuildAppend(text),
+                "COPY" => BuildCopy(text),
+                "TOTAL" => BuildTotal(text),
+                "PACK" => BuildPack(text),
+                "RENAME" => BuildRename(text),
+                "CREATE" => BuildCreate(text),
+                "FLUSH" => BuildFlush(text),
                 "SUM" => BuildSum(text),
                 "UNLOCK" => BuildUnlock(text),
                 "ROLLBACK" => new RollbackStmt(),
@@ -883,6 +892,173 @@ public static class PrgParser
             }
             return new SumStmt(exprs, null, forE, whileE, targets);
         }
+
+        // ---- P2 table/record movers + whole-table I/O ----
+
+        /// <summary><c>GATHER FROM aArray | MEMVAR | NAME oObj [FIELDS cList] [MEMO]</c>. The MEMVAR/NAME
+        /// forms may omit FROM (<c>GATHER MEMVAR</c>); the array form always carries FROM.</summary>
+        private static PrgStatement BuildGather(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);   // after GATHER
+            var (head, segs) = Carve(rest, "FROM", "FIELDS", "MEMO");
+            string srcSpec = SegBody(segs, "FROM") ?? head;
+            var (kind, name) = ParseScatterSpec(srcSpec);
+            return new GatherStmt(kind, name, FieldsOf(segs), HasKw(segs, "MEMO"));
+        }
+
+        /// <summary><c>SCATTER TO aArray | MEMVAR [BLANK] | NAME oObj [FIELDS cList] [MEMO]</c>. The array
+        /// form carries TO; MEMVAR/NAME may stand alone.</summary>
+        private static PrgStatement BuildScatter(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);   // after SCATTER
+            var (head, segs) = Carve(rest, "TO", "FIELDS", "MEMO", "BLANK", "ADDITIVE");
+            ScatterKind kind;
+            string? name;
+            if (SegBody(segs, "TO") is { } toBody)
+            {
+                kind = ScatterKind.Array;
+                name = FirstToken(toBody);
+            }
+            else
+            {
+                (kind, name) = ParseScatterSpec(head);
+            }
+            return new ScatterStmt(kind, name, FieldsOf(segs), HasKw(segs, "MEMO"), HasKw(segs, "BLANK"));
+        }
+
+        /// <summary>Resolve a GATHER/SCATTER source/target spec (<c>MEMVAR</c> / <c>NAME oObj</c> / an array
+        /// name) to its kind + name.</summary>
+        private static (ScatterKind Kind, string? Name) ParseScatterSpec(string spec)
+        {
+            spec = spec.Trim();
+            string fw = PrgScan.FirstWord(spec);
+            if (fw == "MEMVAR") return (ScatterKind.Memvar, null);
+            if (fw == "NAME") return (ScatterKind.Name, FirstToken(PrgScan.AfterFirstWord(spec)));
+            if (spec.Length == 0) return (ScatterKind.Memvar, null);
+            return (ScatterKind.Array, FirstToken(spec));
+        }
+
+        /// <summary><c>APPEND FROM cFile [FIELDS cList] [FOR lExpr] [TYPE cType]</c>. A bare
+        /// <c>APPEND</c>/<c>APPEND BLANK</c> (no FROM) is left un-modelled.</summary>
+        private static PrgStatement BuildAppend(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);   // after APPEND
+            if (PrgScan.FirstWord(rest) != "FROM")
+                return new UnknownCommand("APPEND", rest);
+            string body = PrgScan.AfterFirstWord(rest);   // after FROM
+            var (head, segs) = Carve(body, "FIELDS", "FOR", "WHILE", "TYPE");
+            var source = ToNameRef(FirstToken(head));
+            PrgExpr? forE = SegBody(segs, "FOR") is { Length: > 0 } fb ? PrgExpr.Parse(fb) : null;
+            string? type = SegBody(segs, "TYPE") is { } tb && tb.Length > 0 ? FirstToken(tb) : null;
+            return new AppendFromStmt(source, FieldsOf(segs), forE, type);
+        }
+
+        /// <summary><c>COPY STRUCTURE [EXTENDED] TO … / COPY TO … [FIELDS][FOR][TYPE] / COPY MEMO … TO …</c>.
+        /// Other COPY forms (COPY FILE / COPY PROCEDURES) are left un-modelled.</summary>
+        private static PrgStatement BuildCopy(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);   // after COPY
+            string fw = PrgScan.FirstWord(rest);
+            if (fw == "STRUCTURE")
+            {
+                string r2 = PrgScan.AfterFirstWord(rest);
+                bool extended = PrgScan.FirstWord(r2) == "EXTENDED";
+                if (extended) r2 = PrgScan.AfterFirstWord(r2);
+                var (_, segs) = Carve(r2, "TO", "FIELDS");
+                var target = ToNameRef(FirstToken(SegBody(segs, "TO") ?? string.Empty));
+                return new CopyStructureStmt(target, extended, FieldsOf(segs));
+            }
+            if (fw == "TO")
+            {
+                string r2 = PrgScan.AfterFirstWord(rest);   // after TO
+                var (head, segs) = Carve(r2, "FIELDS", "FOR", "WHILE", "TYPE");
+                var target = ToNameRef(FirstToken(head));
+                PrgExpr? forE = SegBody(segs, "FOR") is { Length: > 0 } fb ? PrgExpr.Parse(fb) : null;
+                string? type = SegBody(segs, "TYPE") is { } tb && tb.Length > 0 ? FirstToken(tb) : null;
+                return new CopyToStmt(target, FieldsOf(segs), forE, type, Memo: false, MemoField: null);
+            }
+            if (fw == "MEMO")
+            {
+                string r2 = PrgScan.AfterFirstWord(rest);   // after MEMO
+                var (head, segs) = Carve(r2, "TO", "ADDITIVE");
+                var memoField = ToNameRef(FirstToken(head));
+                var target = ToNameRef(FirstToken(SegBody(segs, "TO") ?? string.Empty));
+                return new CopyToStmt(target, Array.Empty<string>(), null, null, Memo: true, memoField);
+            }
+            return new UnknownCommand("COPY", rest);
+        }
+
+        /// <summary><c>TOTAL ON eKey TO cFile [FIELDS nList] [FOR lExpr]</c>.</summary>
+        private static PrgStatement BuildTotal(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);   // after TOTAL
+            if (PrgScan.FirstWord(rest) != "ON")
+                return new UnknownCommand("TOTAL", rest);
+            string body = PrgScan.AfterFirstWord(rest);   // after ON
+            var (head, segs) = Carve(body, "TO", "FIELDS", "FOR", "WHILE");
+            if (head.Trim().Length == 0)
+                return new UnknownCommand("TOTAL", rest);
+            var key = PrgExpr.Parse(head);
+            var target = ToNameRef(FirstToken(SegBody(segs, "TO") ?? string.Empty));
+            PrgExpr? forE = SegBody(segs, "FOR") is { Length: > 0 } fb ? PrgExpr.Parse(fb) : null;
+            return new TotalStmt(target, key, FieldsOf(segs), forE);
+        }
+
+        /// <summary><c>PACK [MEMO | DBF]</c>.</summary>
+        private static PrgStatement BuildPack(string text)
+        {
+            string kind = PrgScan.FirstWord(PrgScan.AfterFirstWord(text));
+            return new PackStmt(kind is "MEMO" or "DBF" ? kind : null);
+        }
+
+        /// <summary><c>RENAME TABLE cOld TO cNew</c> (the DBC-member form). A file-level
+        /// <c>RENAME cOld TO cNew</c> is left un-modelled.</summary>
+        private static PrgStatement BuildRename(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);   // after RENAME
+            if (PrgScan.FirstWord(rest) != "TABLE")
+                return new UnknownCommand("RENAME", rest);
+            string body = PrgScan.AfterFirstWord(rest);   // after TABLE
+            var (head, segs) = Carve(body, "TO");
+            var from = ToNameRef(FirstToken(head));
+            var to = ToNameRef(FirstToken(SegBody(segs, "TO") ?? string.Empty));
+            return new RenameTableStmt(from, to);
+        }
+
+        /// <summary><c>CREATE cTable FROM cStruct</c> (structure-descriptor form) or CREATE TABLE / CURSOR /
+        /// DATABASE (routed to the SQL/DDL executor).</summary>
+        private static PrgStatement BuildCreate(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);   // after CREATE
+            var (head, segs) = Carve(rest, "FROM");
+            if (SegBody(segs, "FROM") is { } fromBody
+                && PrgScan.FirstWord(fromBody) != "ARRAY")
+            {
+                var toks = PrgScan.ClauseTokens(head);
+                string name = toks.Count > 0 ? toks[^1] : string.Empty;   // last token before FROM (skips TABLE/DBF).
+                if (name.Length > 0 && !name.Equals("ARRAY", StringComparison.OrdinalIgnoreCase))
+                    return new CreateFromStmt(ToNameRef(name), ToNameRef(FirstToken(fromBody)));
+            }
+            return new SqlPassthroughStmt(text.Trim());
+        }
+
+        private static PrgStatement BuildFlush(string text)
+        {
+            string kind = PrgScan.FirstWord(PrgScan.AfterFirstWord(text));
+            return new FlushStmt(kind == "FORCE");
+        }
+
+        private static bool HasKw(List<(string Kw, string Body)> segs, string kw)
+            => segs.Any(s => s.Kw == kw);
+
+        private static string? SegBody(List<(string Kw, string Body)> segs, string kw)
+        {
+            foreach (var (k, b) in segs) if (k == kw) return b;
+            return null;
+        }
+
+        private static IReadOnlyList<string> FieldsOf(List<(string Kw, string Body)> segs)
+            => SegBody(segs, "FIELDS") is { } b ? IdentList(b) : Array.Empty<string>();
 
         private static UnlockStmt BuildUnlock(string text)
         {

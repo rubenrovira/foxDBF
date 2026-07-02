@@ -121,6 +121,14 @@ public sealed class EvaluationContext
     /// </summary>
     public bool SqlSemantics { get; set; }
 
+    /// <summary>
+    /// SET NULL. VFP default is OFF (<c>false</c>). Governs the DEFAULT nullability of a CREATE/ALTER
+    /// TABLE column that states neither NULL nor NOT NULL: ON ⇒ such a column is nullable (and an omitted
+    /// INSERT value becomes <c>.NULL.</c>), OFF ⇒ it is NOT NULL. An explicit NULL / NOT NULL clause always
+    /// wins over this default.
+    /// </summary>
+    public bool NullSetting { get; set; }
+
     /// <summary>Active collation; default MACHINE.</summary>
     public IVfpCollation Collation { get; set; } = VfpCollations.Machine;
 

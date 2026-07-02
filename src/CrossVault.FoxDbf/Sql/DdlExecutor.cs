@@ -71,8 +71,9 @@ internal sealed class DdlExecutor
 
     /// <summary>Map a parsed VFP <see cref="ColumnDefinition"/> onto a Core <see cref="DbfColumnDef"/>.
     /// Fixed-width types (I/B/Y/D/T/L/M/G/P) get their canonical width auto-filled by the column-def
-    /// constructor when the syntax states no length. Nullability defaults to NOT NULL (VFP SET NULL OFF).</summary>
-    private static DbfColumnDef ToColumnDef(ColumnDefinition c)
+    /// constructor when the syntax states no length. Nullability follows the column's explicit NULL /
+    /// NOT NULL clause; absent one, it defaults to the ambient <c>SET NULL</c> (VFP default OFF ⇒ NOT NULL).</summary>
+    private DbfColumnDef ToColumnDef(ColumnDefinition c)
     {
         char type = char.ToUpperInvariant(c.Type);
         // Varbinary (Q) and Blob (W) are NOCPTRANS binary types in VFP.
@@ -82,7 +83,7 @@ internal sealed class DdlExecutor
             type: type,
             length: c.Length ?? 0,
             decimalCount: DefaultDecimals(type, c.Decimals),
-            nullable: c.Nullable ?? false,
+            nullable: c.Nullable ?? _session.Context.NullSetting,
             binary: binary);
     }
 

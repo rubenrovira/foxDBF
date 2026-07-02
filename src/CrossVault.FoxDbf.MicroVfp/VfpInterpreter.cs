@@ -63,6 +63,10 @@ public sealed class VfpInterpreter
     // (EOF if past the end) instead of at EOF. Read back via SET("NEAR"). Scope: SEEK only.
     private bool _setNear;
 
+    // SET AUTOSAVE ON|OFF — VFP flushes header buffers on RETURN to the Command window / read events.
+    // microVFP writes through on every REPLACE/DELETE, so this only feeds SET("AUTOSAVE"). Default OFF.
+    private bool _setAutosave;
+
     // ── SET RELATION (multi-table relation model; microVFP P1 gap #2) ──
     // Re-entrancy guard: while a parent move is repositioning its children, the child moves (SEEK/GOTO)
     // must NOT themselves re-fire the reposition hook — chaining is driven explicitly by
@@ -501,6 +505,17 @@ public sealed class VfpInterpreter
             case RollbackStmt: RollbackTransaction(); break;
             case DirectiveStmt d: ProcessDefine(d.Text); break;
             case InsertStmt ins: ExecInsert(ins); break;
+            case GatherStmt g: ExecGather(g); break;
+            case ScatterStmt sc2: ExecScatter(sc2); break;
+            case AppendFromStmt af: ExecAppendFrom(af); break;
+            case CopyStructureStmt cs: ExecCopyStructure(cs); break;
+            case CopyToStmt ct: ExecCopyTo(ct); break;
+            case CreateFromStmt cf: ExecCreateFrom(cf); break;
+            case TotalStmt tot: ExecTotal(tot); break;
+            case PackStmt pk: ExecPack(pk); break;
+            case RenameTableStmt rt: ExecRenameTable(rt); break;
+            case SqlPassthroughStmt sp: ExecSqlPassthrough(sp); break;
+            case FlushStmt: break;                           // write-through model — persisted already; no-op.
             case LocateStmt or ContinueStmt or MacroSubstStmt or UnknownCommand or ProcDef: break;
             default: break;
         }
@@ -1616,6 +1631,8 @@ public sealed class VfpInterpreter
             case "UNIQUE": Runtime.Unique = OnOff(arg); break;  // session default for a clause-less INDEX; SET("UNIQUE").
             case "KEY": SetKey(arg); break;                     // master-index visible key range; feeds Visible().
             case "NEAR": _setNear = OnOff(arg); break;          // failed-SEEK pointer parking; SET("NEAR").
+            case "NULL": _ctx.NullSetting = OnOff(arg); break;  // CREATE/ALTER TABLE default nullability; SET("NULL").
+            case "AUTOSAVE": _setAutosave = OnOff(arg); break;  // header-buffer flush policy; SET("AUTOSAVE").
             case "DATASESSION": SetDataSession(arg); break;     // single-session stub; TO 1 no-op, else err 1540.
             default: break; // TALK / COMPATIBLE / DATA / PROCEDURE / … — irrelevant to results.
         }
@@ -2229,6 +2246,473 @@ public sealed class VfpInterpreter
         for (int k = 0; k < sum.To.Count && k < n; k++)
             Memory.Set(sum.To[k], VfpValue.Number(acc[k]));
     }
+
+    // ─────────────────────────── P2 table/record movers + whole-table I/O ───────────────────────────
+
+    /// <summary>The fields moved by a SCATTER/GATHER: an explicit FIELDS list (order preserved, unknown
+    /// names skipped) or every non-system column. Memo-like columns (M/G/P/W) are excluded unless MEMO.</summary>
+    private static List<DbfColumn> ScatterFields(DbfTable table, IReadOnlyList<string> requested, bool memo)
+    {
+        static bool IsMemoLike(char t) => t is 'M' or 'G' or 'P' or 'W';
+        var cols = table.Columns;
+        var result = new List<DbfColumn>();
+        if (requested.Count > 0)
+        {
+            foreach (var name in requested)
+            {
+                int idx = ColumnIndex(table, name);
+                if (idx < 0) continue;
+                var c = cols[idx];
+                if (c.IsSystem) continue;
+                if (!memo && IsMemoLike(c.Type)) continue;
+                result.Add(c);
+            }
+            return result;
+        }
+        foreach (var c in cols)
+        {
+            if (c.IsSystem) continue;
+            if (!memo && IsMemoLike(c.Type)) continue;
+            result.Add(c);
+        }
+        return result;
+    }
+
+    private void ExecScatter(ScatterStmt s)
+    {
+        if (s.Kind == ScatterKind.Name) return;            // NAME/object variant flagged — microVFP has no user objects.
+        var wa = Session.AreaAt(Session.CurrentArea);
+        if (wa is null) return;
+        var fields = ScatterFields(wa.Table, s.Fields, s.Memo);
+
+        if (s.Kind == ScatterKind.Array)
+        {
+            if (string.IsNullOrEmpty(s.Name)) return;
+            var arr = Memory.RedimOrCreateArray(s.Name, fields.Count, 0);
+            for (int i = 0; i < fields.Count; i++)
+                arr.SetLinear(i + 1, s.Blank ? BlankValueFor(fields[i]) : VfpValue.FromClr(ReadField(wa, fields[i].Name)));
+            return;
+        }
+
+        // MEMVAR: create/update a same-named memory variable per field.
+        foreach (var c in fields)
+            Memory.Set(c.Name, s.Blank ? BlankValueFor(c) : VfpValue.FromClr(ReadField(wa, c.Name)));
+    }
+
+    private void ExecGather(GatherStmt g)
+    {
+        if (g.Kind == ScatterKind.Name) return;            // NAME/object variant flagged.
+        var wa = Session.AreaAt(Session.CurrentArea);
+        if (wa is null) return;
+        var fields = ScatterFields(wa.Table, g.Fields, g.Memo);
+
+        var clauses = new List<ReplaceClause>();
+        if (g.Kind == ScatterKind.Array)
+        {
+            var arr = string.IsNullOrEmpty(g.Name) ? null : Memory.FindArray(g.Name);
+            if (arr is null) return;
+            int n = Math.Min(fields.Count, arr.Length);    // positional: element i → field i.
+            for (int i = 0; i < n; i++)
+                clauses.Add(new ReplaceClause(NameRef.OfName(fields[i].Name), PrgExpr.Parse($"{g.Name}({i + 1})"), false));
+        }
+        else // MEMVAR: replace each field that has a matching visible memvar (missing ones are left unchanged).
+        {
+            foreach (var c in fields)
+                if (Memory.IsDefined(c.Name))
+                    clauses.Add(new ReplaceClause(NameRef.OfName(c.Name), PrgExpr.Parse($"m.{c.Name}"), false));
+        }
+        if (clauses.Count == 0) return;
+        ExecReplace(new ReplaceStmt(clauses, null, null, null, null));
+    }
+
+    private void ExecAppendFrom(AppendFromStmt s)
+    {
+        if (s.Type is { } ty && !IsDbfType(ty))
+            throw new MicroVfpRuntimeException($"APPEND FROM TYPE '{ty}' (non-DBF) is not supported.");
+        var targetWa = Session.AreaAt(Session.CurrentArea);
+        string? targetPath = targetWa?.Table.SourcePath;
+        if (targetWa is null || targetPath is null) return;
+
+        string sourceName = NameOf(s.Source);
+        var fieldFilter = s.Fields.Count > 0 ? new HashSet<string>(s.Fields, StringComparer.OrdinalIgnoreCase) : null;
+
+        int save = Session.CurrentArea;
+        var before = Session.OpenAreas.Select(w => w.Area).ToHashSet();
+        try { Session.Use(sourceName, inArea: 0); } catch { return; }
+        int srcArea = Session.OpenAreas.Select(w => w.Area).FirstOrDefault(n => !before.Contains(n));
+        var srcWa = srcArea == 0 ? null : Session.AreaAt(srcArea);
+        if (srcWa is null) return;
+
+        var rows = new List<Dictionary<string, object?>>();
+        try
+        {
+            var sm = _meta[srcArea] = new AreaMeta();
+            Session.SelectArea(srcArea);                    // FOR is evaluated against the SOURCE record.
+            int rc = srcWa.Table.RecordCount;
+            for (int rec = 1; rec <= rc; rec++)
+            {
+                if (!Visible(srcWa, rec)) continue;
+                sm.RecNo = rec; sm.Cached = null; sm.Eof = false; sm.Bof = false;
+                if (s.For is not null && !Truth(Eval(s.For))) continue;
+                var map = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                foreach (var col in srcWa.Table.Columns)
+                {
+                    if (col.IsSystem) continue;
+                    if (fieldFilter is not null && !fieldFilter.Contains(col.Name)) continue;
+                    map[col.Name] = ReadField(srcWa, col.Name);
+                }
+                rows.Add(map);
+            }
+        }
+        finally
+        {
+            Session.CloseArea(srcArea); _meta.Remove(srcArea);
+            Session.SelectArea(save);
+        }
+
+        if (rows.Count == 0) return;
+        SnapshotForTxn(targetPath);
+        using (var writer = DbfWriter.Open(targetPath, new DbfOptions { LockMode = LockMode.Shared }))
+        {
+            foreach (var map in rows) writer.AppendRecord(map);
+            writer.Flush();
+        }
+        ReopenFileAreas(targetPath);
+    }
+
+    private void ExecCopyStructure(CopyStructureStmt s)
+    {
+        var wa = Session.AreaAt(Session.CurrentArea);
+        if (wa is null) return;
+        string targetPath = TargetDbfPath(NameOf(s.Target));
+
+        if (!s.Extended)
+        {
+            var cols = ScatterFields(wa.Table, s.Fields, memo: true);
+            var defs = cols.Select(ToColumnDef).ToList();
+            if (defs.Count == 0) return;
+            using (DbfWriter.Create(targetPath, defs, new DbfCreateOptions { Overwrite = true })) { }
+            return;
+        }
+
+        // EXTENDED: a structure-descriptor table — one row per source field.
+        var descCols = new[]
+        {
+            new DbfColumnDef("FIELD_NAME", 'C', 11),
+            new DbfColumnDef("FIELD_TYPE", 'C', 1),
+            new DbfColumnDef("FIELD_LEN", 'N', 3),
+            new DbfColumnDef("FIELD_DEC", 'N', 3),
+            new DbfColumnDef("FIELD_NULL", 'L'),
+            new DbfColumnDef("FIELD_NOCP", 'L'),
+        };
+        var srcCols = ScatterFields(wa.Table, s.Fields, memo: true);
+        using (var writer = DbfWriter.Create(targetPath, descCols, new DbfCreateOptions { Overwrite = true }))
+        {
+            foreach (var c in srcCols)
+                writer.AppendRecord(c.Name, c.Type.ToString(), (decimal)c.Length, (decimal)c.Decimal, c.IsNullable, c.IsBinary);
+            writer.Flush();
+        }
+    }
+
+    private void ExecCreateFrom(CreateFromStmt s)
+    {
+        string fromName = NameOf(s.From);
+        var defs = new List<DbfColumnDef>();
+        DbfTable descriptor;
+        try { (descriptor, _) = Session.OpenNamedTable(fromName); }
+        catch { return; }
+        using (descriptor)
+        {
+            for (int i = 0; i < descriptor.RecordCount; i++)
+            {
+                if (descriptor.GetRecord(i) is not { } rec) continue;
+                string name = (rec["FIELD_NAME"]?.ToString() ?? string.Empty).Trim();
+                string typeStr = (rec["FIELD_TYPE"]?.ToString() ?? string.Empty).Trim();
+                if (name.Length == 0 || typeStr.Length == 0) continue;
+                char type = char.ToUpperInvariant(typeStr[0]);
+                int len = ToInt(rec["FIELD_LEN"]);
+                int dec = ToInt(rec["FIELD_DEC"]);
+                bool nullable = rec["FIELD_NULL"] is bool bn && bn;
+                bool binary = rec["FIELD_NOCP"] is bool bc && bc;
+                defs.Add(new DbfColumnDef(name, type, len, dec, nullable, binary));
+            }
+        }
+        if (defs.Count == 0) return;
+        string targetPath = TargetDbfPath(NameOf(s.Table));
+        using (DbfWriter.Create(targetPath, defs, new DbfCreateOptions { Overwrite = true })) { }
+        OpenCreatedTable(NameOf(s.Table));
+    }
+
+    private void ExecCopyTo(CopyToStmt s)
+    {
+        if (s.Memo) { ExecCopyMemo(s); return; }
+        if (s.Type is { } ty && !IsDbfType(ty))
+            throw new MicroVfpRuntimeException($"COPY TO TYPE '{ty}' (non-DBF) is not supported.");
+
+        int area = Session.CurrentArea;
+        var wa = Session.AreaAt(area);
+        if (wa is null) return;
+        var m = Meta(area);
+        var cols = ScatterFields(wa.Table, s.Fields, memo: true);
+        var defs = cols.Select(ToColumnDef).ToList();
+        if (defs.Count == 0) return;
+        string targetPath = TargetDbfPath(NameOf(s.Target));
+
+        int savRec = m.RecNo; bool savEof = m.Eof, savBof = m.Bof;
+        try
+        {
+            using var writer = DbfWriter.Create(targetPath, defs, new DbfCreateOptions { Overwrite = true });
+            int rc = wa.Table.RecordCount;
+            for (int rec = 1; rec <= rc; rec++)
+            {
+                if (!Visible(wa, rec)) continue;
+                m.RecNo = rec; m.Cached = null; m.Eof = false; m.Bof = false;
+                if (s.For is not null && !Truth(Eval(s.For))) continue;
+                var vals = new object?[cols.Count];
+                for (int i = 0; i < cols.Count; i++) vals[i] = ReadField(wa, cols[i].Name);
+                writer.AppendRecord(vals);
+            }
+            writer.Flush();
+        }
+        finally
+        {
+            m.RecNo = savRec; m.Eof = savEof; m.Bof = savBof; m.Cached = null;
+        }
+    }
+
+    /// <summary><c>COPY MEMO mField TO cFile</c> — write the CURRENT record's memo field content to a text file.</summary>
+    private void ExecCopyMemo(CopyToStmt s)
+    {
+        var wa = Session.AreaAt(Session.CurrentArea);
+        if (wa is null || s.MemoField is null) return;
+        string field = StripQualifier(NameOf(s.MemoField));
+        string content = ReadField(wa, field)?.ToString() ?? string.Empty;
+        string target = NameOf(s.Target);
+        string path = Path.IsPathRooted(target)
+            ? target
+            : Path.Combine(Session.DataDirectory ?? Directory.GetCurrentDirectory(), target);
+        if (!Path.HasExtension(path)) path += ".txt";
+        try { File.WriteAllText(path, content); } catch { /* best-effort export */ }
+    }
+
+    private void ExecTotal(TotalStmt s)
+    {
+        int area = Session.CurrentArea;
+        var wa = Session.AreaAt(area);
+        if (wa is null) return;
+        var m = Meta(area);
+        var cols = wa.Table.Columns.Where(c => !c.IsSystem).ToList();
+        var defs = cols.Select(ToColumnDef).ToList();
+        if (defs.Count == 0) return;
+
+        var totalSet = s.Fields.Count > 0 ? new HashSet<string>(s.Fields, StringComparer.OrdinalIgnoreCase) : null;
+        var totalIdx = new List<int>();
+        for (int i = 0; i < cols.Count; i++)
+        {
+            bool numeric = cols[i].Type is 'N' or 'F' or 'I' or 'B' or 'Y';
+            if (numeric && (totalSet is null || totalSet.Contains(cols[i].Name))) totalIdx.Add(i);
+        }
+
+        string targetPath = TargetDbfPath(NameOf(s.Target));
+        int savRec = m.RecNo; bool savEof = m.Eof, savBof = m.Bof;
+        var groups = new List<object?[]>();
+        object?[]? rep = null;
+        string? curKey = null;
+        try
+        {
+            var order = ActiveOrder(area);
+            IEnumerable<int> Sequence()
+            {
+                if (order is not null) { foreach (var r in order) yield return r; }
+                else { for (int r = 1; r <= wa.Table.RecordCount; r++) yield return r; }
+            }
+            foreach (int rec in Sequence())
+            {
+                if (!Visible(wa, rec)) continue;
+                m.RecNo = rec; m.Cached = null; m.Eof = false; m.Bof = false;
+                if (s.For is not null && !Truth(Eval(s.For))) continue;
+                string key = KeyNorm(Eval(s.Key));
+                if (rep is null || key != curKey)
+                {
+                    if (rep is not null) groups.Add(rep);
+                    rep = new object?[cols.Count];
+                    for (int i = 0; i < cols.Count; i++) rep[i] = ReadField(wa, cols[i].Name);
+                    curKey = key;
+                }
+                else
+                {
+                    foreach (int ti in totalIdx)
+                        rep[ti] = Convert.ToDecimal(rep[ti] ?? 0m) + Convert.ToDecimal(ReadField(wa, cols[ti].Name) ?? 0m);
+                }
+            }
+            if (rep is not null) groups.Add(rep);
+        }
+        finally
+        {
+            m.RecNo = savRec; m.Eof = savEof; m.Bof = savBof; m.Cached = null;
+        }
+
+        using (var writer = DbfWriter.Create(targetPath, defs, new DbfCreateOptions { Overwrite = true }))
+        {
+            foreach (var g in groups) writer.AppendRecord(g);
+            writer.Flush();
+        }
+    }
+
+    private void ExecPack(PackStmt s)
+    {
+        int area = Session.CurrentArea;
+        var wa = Session.AreaAt(area);
+        string? path = wa?.Table.SourcePath;
+        if (wa is null || path is null) return;
+        string full = Path.GetFullPath(path);
+
+        SnapshotForTxn(path);
+        var reopen = Session.CloseAreasForPath(full);   // release read handles so Pack can truncate the file.
+        try
+        {
+            using var writer = DbfWriter.Open(path);
+            writer.Pack();                              // physical delete-compaction (+ memo relocation).
+        }
+        finally
+        {
+            Session.ReopenAreas(reopen);
+        }
+        foreach (var w in Session.OpenAreas)
+            if (SamePath(w.Table.SourcePath, path) && _meta.TryGetValue(w.Area, out var mm))
+            { mm.Cached = null; mm.Ordered = null; }
+        GoTop(area);
+    }
+
+    private void ExecRenameTable(RenameTableStmt s)
+    {
+        string? dbcPath = Session.DatabasePath;
+        if (Session.Database is null || dbcPath is null || !File.Exists(dbcPath)) return;
+        string oldName = NameOf(s.From).Trim();
+        string newName = NameOf(s.To).Trim();
+        if (oldName.Length == 0 || newName.Length == 0) return;
+
+        using (var writer = DbfWriter.Open(dbcPath, new DbfOptions { LockMode = LockMode.Shared }))
+        {
+            var schema = writer.Schema;
+            int nameIdx = ColumnIndex(schema, "OBJECTNAME");
+            if (nameIdx < 0) return;
+            for (int i = 0; i < schema.RecordCount; i++)
+            {
+                if (schema.GetRecord(i) is not { } rec) continue;
+                if (rec["OBJECTTYPE"]?.ToString()?.Trim() is not { } ot
+                    || !ot.Equals("Table", StringComparison.OrdinalIgnoreCase)) continue;
+                if (rec["OBJECTNAME"]?.ToString()?.Trim() is not { } on
+                    || !on.Equals(oldName, StringComparison.OrdinalIgnoreCase)) continue;
+                var values = new object?[schema.Columns.Count];
+                for (int k = 0; k < values.Length; k++) values[k] = DbfWriter.KeepValue;
+                values[nameIdx] = newName;
+                writer.UpdateRecord(i, values);
+                writer.Flush();
+                break;
+            }
+        }
+    }
+
+    private void ExecSqlPassthrough(SqlPassthroughStmt s)
+    {
+        var parsed = SafeParseSql(s.Sql);
+        try { Session.Execute(s.Sql); }
+        catch { return; }
+        // VFP opens a freshly CREATEd table in a work area; do the same so a follow-up USE/SELECT/field read works.
+        if (parsed is CreateTableStatement cts) OpenCreatedTable(cts.Table);
+    }
+
+    /// <summary>Open the just-created table <paramref name="name"/> in a fresh work area, seed its meta and
+    /// position at top (best-effort; a failure to open leaves the session unchanged).</summary>
+    private void OpenCreatedTable(string name)
+    {
+        try
+        {
+            Session.Use(name, inArea: 0);
+            var wa = Session.OpenAreas
+                .FirstOrDefault(w => SamePath(w.Table.SourcePath, TargetDbfPath(name)));
+            if (wa is not null)
+            {
+                _meta[wa.Area] = new AreaMeta();
+                Session.SelectArea(wa.Area);
+                GoTop(wa.Area);
+            }
+        }
+        catch { /* best-effort — the file exists on disk regardless. */ }
+    }
+
+    private VfpValue FnLupdate(VfpValue[] a)
+    {
+        var wa = AreaArg(a, 0);
+        string? path = wa?.Table.SourcePath;
+        if (path is null) return VfpValue.Date(default);
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            Span<byte> h = stackalloc byte[4];
+            if (fs.Read(h) < 4) return VfpValue.Date(default);
+            int yy = h[1], mm = h[2], dd = h[3];
+            if (mm is < 1 or > 12 || dd is < 1 or > 31) return VfpValue.Date(default);
+            // Two-digit header year → full year via the VFP 1950–2049 rollover window.
+            int year = yy >= 100 ? 1900 + yy : (yy <= 49 ? 2000 + yy : 1900 + yy);
+            return VfpValue.Date(new DateOnly(year, mm, dd));
+        }
+        catch { return VfpValue.Date(default); }
+    }
+
+    // ── shared little helpers for the whole-table commands ──
+
+    private static int ToInt(object? v) => v switch
+    {
+        null => 0,
+        int i => i,
+        long l => (int)l,
+        decimal d => (int)d,
+        double db => (int)db,
+        _ => int.TryParse(v.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var n) ? n : 0,
+    };
+
+    private static DbfColumnDef ToColumnDef(DbfColumn c)
+        => new(c.Name, c.Type, c.Length, c.Decimal, c.IsNullable, c.IsBinary);
+
+    private static VfpValue BlankValueFor(DbfColumn col) => col.Type switch
+    {
+        'C' or 'V' or 'M' or 'G' or 'P' or 'W' => VfpValue.Character(string.Empty),
+        'I' => VfpValue.Integer(0),
+        'N' or 'F' or 'B' or 'Y' => VfpValue.Number(0m),
+        'L' => VfpValue.Logical(false),
+        'D' => VfpValue.Date(default),
+        'T' => VfpValue.DateTime(default),
+        _ => VfpValue.Null,
+    };
+
+    /// <summary>A stable grouping signature for a TOTAL key value (right-trimmed for character keys).</summary>
+    private static string KeyNorm(VfpValue v)
+    {
+        if (v.IsNull) return "\0<null>";
+        return v.Type == VfpType.Character
+            ? v.AsString.TrimEnd()
+            : Convert.ToString(v.ToClr(), CultureInfo.InvariantCulture) ?? string.Empty;
+    }
+
+    /// <summary>Resolve a target table NAME to a full <c>.dbf</c> path in the session's data directory
+    /// (an absolute path is used as-is; a missing <c>.dbf</c> extension is appended).</summary>
+    private string TargetDbfPath(string name)
+    {
+        string file = name.EndsWith(".dbf", StringComparison.OrdinalIgnoreCase) ? name : name + ".dbf";
+        return Path.IsPathRooted(file)
+            ? file
+            : Path.Combine(Session.DataDirectory ?? Directory.GetCurrentDirectory(), file);
+    }
+
+    /// <summary>True when a COPY TO / APPEND FROM TYPE clause names a DBF (table) format (or is absent);
+    /// non-DBF export/import formats (SDF / DELIMITED / spreadsheet / XML) are flagged out of scope.</summary>
+    private static bool IsDbfType(string type) => type.ToUpperInvariant() switch
+    {
+        "DBF" or "FOX2X" or "FOXPLUS" or "VFP" => true,
+        _ => false,
+    };
 
     // ─────────────────────────── record-pointer model ───────────────────────────
 
@@ -3005,6 +3489,9 @@ public sealed class VfpInterpreter
         var col = wa.Table.Columns[idx];
         if (col.Type is 'C' or 'V')
         {
+            // Honour the _NullFlags bitmap FIRST: a NULL-able character field with its null bit set is a
+            // genuine .NULL. (ISNULL() true), not the blank string the raw bytes would decode to.
+            if (rec[idx] is null) return null;
             var raw = rec.GetRawField(col);
             return wa.Table.Encoding.GetString(raw).TrimEnd(' ', '\0');   // RIGHT-trim only (see header).
         }
@@ -3055,6 +3542,8 @@ public sealed class VfpInterpreter
             case "DBF": r = VfpValue.Character(AreaArg(a, 0)?.Table.SourcePath ?? string.Empty); return true;
             case "DBC": r = VfpValue.Character(string.Empty); return true;
             case "RECNO": r = VfpValue.Integer(FnRecno(a)); return true;
+            case "HEADER": r = VfpValue.Integer(AreaArg(a, 0)?.Table.HeaderLength ?? 0); return true;
+            case "LUPDATE": r = FnLupdate(a); return true;
             case "RECCOUNT": { var rcw = AreaArg(a, 0); r = VfpValue.Integer(rcw is null ? 0 : EffCount(rcw.Area, rcw)); return true; }
             case "EOF": r = VfpValue.Logical(MetaArg(a, 0)?.Eof ?? true); return true;
             case "BOF": r = VfpValue.Logical(MetaArg(a, 0)?.Bof ?? true); return true;
@@ -3237,6 +3726,8 @@ public sealed class VfpInterpreter
             "COLLATE" => VfpValue.Character(_ctx.Collation?.Name ?? "MACHINE"),
             "UNIQUE" => VfpValue.Character(Runtime.Unique ? "ON" : "OFF"),
             "NEAR" => VfpValue.Character(_setNear ? "ON" : "OFF"),
+            "NULL" => VfpValue.Character(_ctx.NullSetting ? "ON" : "OFF"),
+            "AUTOSAVE" => VfpValue.Character(_setAutosave ? "ON" : "OFF"),
             "RELATION" => VfpValue.Character(RelationSetString(Session.CurrentArea)),  // reproduces the SET RELATION args.
             "SKIP" => VfpValue.Character(SkipSetString(Session.CurrentArea)),          // comma-list of 1:n aliases.
             "DATASESSION" => VfpValue.Number(1m),   // NUMERIC (verified vs vfp9.exe) — single public session.

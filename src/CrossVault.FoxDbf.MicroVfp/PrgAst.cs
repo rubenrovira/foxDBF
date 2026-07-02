@@ -294,6 +294,86 @@ public sealed record BeginTxnStmt : PrgStatement;
 public sealed record EndTxnStmt : PrgStatement;
 public sealed record RollbackStmt : PrgStatement;
 
+// ── P2 table/record movers + whole-table I/O ─────────────────────────────────
+
+/// <summary>The source/destination class of a GATHER / SCATTER: a memory ARRAY, the same-named
+/// MEMVARs, or a NAME object (the object variant is FLAGGED — microVFP has no user objects).</summary>
+public enum ScatterKind { Array, Memvar, Name }
+
+/// <summary><c>GATHER FROM aArray | MEMVAR | NAME oObj [FIELDS cList] [MEMO]</c> — REPLACE the current
+/// record's fields from the array (positional), the same-named memvars, or a NAME object. <see cref="Name"/>
+/// is the array / object name (null for MEMVAR); <see cref="Memo"/> includes memo fields.</summary>
+public sealed record GatherStmt(
+    ScatterKind Kind,
+    string? Name,
+    IReadOnlyList<string> Fields,
+    bool Memo) : PrgStatement;
+
+/// <summary><c>SCATTER TO aArray | MEMVAR [BLANK] | NAME oObj [FIELDS cList] [MEMO]</c> — read the current
+/// record's fields into a fresh 1-D array (one element per field), the same-named memvars, or a NAME object.
+/// <see cref="Blank"/> produces type-appropriate EMPTY() values instead of the record's data.</summary>
+public sealed record ScatterStmt(
+    ScatterKind Kind,
+    string? Name,
+    IReadOnlyList<string> Fields,
+    bool Memo,
+    bool Blank) : PrgStatement;
+
+/// <summary><c>APPEND FROM cFile [FIELDS cList] [FOR lExpr] [TYPE cType]</c> — append the matching-named
+/// fields of another DBF's rows to the CURRENT work area. Non-DBF <see cref="Type"/> formats are FLAGGED.</summary>
+public sealed record AppendFromStmt(
+    NameRef Source,
+    IReadOnlyList<string> Fields,
+    PrgExpr? For,
+    string? Type) : PrgStatement;
+
+/// <summary><c>COPY STRUCTURE [EXTENDED] TO cFile [FIELDS cList]</c> — create an EMPTY same-structure table
+/// (<see cref="Extended"/> = false) or a one-row-per-field structure-descriptor table (EXTENDED).</summary>
+public sealed record CopyStructureStmt(
+    NameRef Target,
+    bool Extended,
+    IReadOnlyList<string> Fields) : PrgStatement;
+
+/// <summary><c>COPY TO cFile [FIELDS cList] [FOR lExpr] [TYPE cType]</c> and the <c>COPY MEMO mField TO cFile</c>
+/// variant. For the record-copy form <see cref="Memo"/> is false; non-DBF <see cref="Type"/> is FLAGGED. For the
+/// memo-export form <see cref="Memo"/> is true and <see cref="MemoField"/> names the memo field.</summary>
+public sealed record CopyToStmt(
+    NameRef Target,
+    IReadOnlyList<string> Fields,
+    PrgExpr? For,
+    string? Type,
+    bool Memo,
+    NameRef? MemoField) : PrgStatement;
+
+/// <summary><c>CREATE cTable FROM cStructureExtendedFile</c> — build a fresh EMPTY table from a
+/// structure-descriptor table (the inverse of <c>COPY STRUCTURE EXTENDED</c>).</summary>
+public sealed record CreateFromStmt(NameRef Table, NameRef From) : PrgStatement;
+
+/// <summary><c>TOTAL ON eKey TO cFile [FIELDS nList] [FOR lExpr]</c> — one output row per group of
+/// consecutive equal <see cref="Key"/> values, with the numeric <see cref="Fields"/> summed across the
+/// group (all numeric fields when the list is empty). Requires the source ordered on the key.</summary>
+public sealed record TotalStmt(
+    NameRef Target,
+    PrgExpr Key,
+    IReadOnlyList<string> Fields,
+    PrgExpr? For) : PrgStatement;
+
+/// <summary><c>PACK [MEMO | DBF]</c> — physical delete-compaction of the current table (wires to
+/// <c>DbfWriter.Pack</c>). <see cref="Kind"/> is MEMO / DBF / null (both).</summary>
+public sealed record PackStmt(string? Kind) : PrgStatement;
+
+/// <summary><c>RENAME TABLE cOld TO cNew</c> — rename the DBC member long-name (the <c>NAME</c>/OBJECTNAME
+/// catalog entry); the physical <c>.dbf</c> is untouched.</summary>
+public sealed record RenameTableStmt(NameRef From, NameRef To) : PrgStatement;
+
+/// <summary><c>FLUSH [FORCE]</c> — persist any pending writes. microVFP writes through on each REPLACE/
+/// DELETE, so this is a recognised no-op that succeeds. <see cref="Force"/> mirrors the FORCE keyword.</summary>
+public sealed record FlushStmt(bool Force) : PrgStatement;
+
+/// <summary>A CREATE TABLE / CREATE CURSOR / CREATE DATABASE command routed verbatim to the SQL/DDL
+/// executor (<see cref="Sql"/>). CREATE TABLE additionally opens the new table in a work area (VFP).</summary>
+public sealed record SqlPassthroughStmt(string Sql) : PrgStatement;
+
 // ── misc / fallback ──────────────────────────────────────────────────────────
 
 /// <summary>A standalone macro line <c>&amp;var.</c> (deferred; never expanded).</summary>
