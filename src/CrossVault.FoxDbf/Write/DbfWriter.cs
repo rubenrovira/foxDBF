@@ -220,6 +220,14 @@ public sealed partial class DbfWriter : IDisposable
     internal int AppendHeaderWriteCount { get; private set; }
     internal int AppendDataFlushCount { get; private set; }
 
+    // ---- incremental CDX maintenance test seam (project-review finding 5.1) -----
+    // Test-only fault injector: when true, the NEXT write-path index-maintenance pass MUST throw so
+    // the crash-safety backstop can be proven — the data row is written FIRST, then on a maintenance
+    // failure <see cref="ReindexNeeded"/> is raised (so the next ordered read / VFP USE rebuilds) and
+    // the exception is rethrown (never leave a half-edited page silently). Honoured by the incremental
+    // maintenance the implementer wires into AppendCore/UpdateCore; NEVER set outside tests.
+    internal bool FailIndexMaintenanceForTests { get; set; }
+
     /// <summary>The current number of physical records (the live header value, bytes 4–7).</summary>
     public int RecordCount
     {
@@ -474,6 +482,7 @@ public sealed partial class DbfWriter : IDisposable
         // (D4APPEND.C); we mirror that, including the 2 GB guard against the fresh value.
         long appendPos = VfpLock.AppendLockPosition(_usesStructuralScheme);
         int resultIndex = 0;
+        byte[]? appendedRecord = null;   // captured for incremental index maintenance (after the lock)
         WithLock(appendPos, 1, () =>
         {
             int diskCount = (int)ReadOnDiskRecordCount();
@@ -508,6 +517,7 @@ public sealed partial class DbfWriter : IDisposable
 
             byte[] record = RecordEncoder.Encode(_schema, positional, deleted: false);
             PatchMemoPointers(record, positional);
+            appendedRecord = record;   // the exact bytes just written — reused for index maintenance
 
             // Write the row (overwriting any pre-existing EOF byte), the fresh EOF, and pin the
             // exact file length so no stale trailing bytes survive.
@@ -531,6 +541,12 @@ public sealed partial class DbfWriter : IDisposable
             resultIndex = newCount - 1;
         });
 
+        // §5.1 incremental maintenance: the row is durably written above; now insert its key into every open
+        // structural tag. Runs OUTSIDE the append lock (the row is already committed); a failure here sets
+        // ReindexNeeded + rethrows so the tag can never be left silently stale.
+        if (appendedRecord is not null)
+            MaintainIndexesAfterAppend(resultIndex + 1, new DbfRecord(_schema, appendedRecord));
+
         return resultIndex;
     }
 
@@ -550,6 +566,12 @@ public sealed partial class DbfWriter : IDisposable
     private void UpdateCore(int index, object?[] positional)
     {
         long offset = _headerLength + (long)index * _recordLength;
+        // §5.1: the pre-image (old row) is needed to compute each tag's OLD key and the post-image for the
+        // NEW key. Read it when index maintenance is active, regardless of any KeepValue slot.
+        bool maintain = ShouldMaintainIndexes();
+        byte[]? oldRecordBytes = null;
+        byte[]? writtenRecord = null;
+
         // §D3: hold the RECORD lock for this row (1-based recNo) across the rewrite.
         long recPos = VfpLock.RecordLockPosition(index + 1, _usesStructuralScheme, _headerLength, _recordLength);
         WithLock(recPos, 1, () =>
@@ -558,25 +580,27 @@ public sealed partial class DbfWriter : IDisposable
 
             // KeepValue sentinel: a field whose EXISTING on-disk bytes must survive the full-row
             // rewrite (an FPT block pointer the UPDATE never touched). Read the live record so those
-            // fields — and the deletion flag — can be copied back after the row is re-encoded.
-            byte[]? existing = null;
+            // fields — and the deletion flag — can be copied back after the row is re-encoded. The same
+            // pre-image bytes feed index maintenance (the OLD key), so read them whenever maintaining too.
+            bool hasKeep = false;
             for (int i = 0; i < columns.Count && i < positional.Length; i++)
+                if (ReferenceEquals(positional[i], KeepValue)) { hasKeep = true; break; }
+
+            byte[]? existing = null;
+            if (hasKeep || maintain)
             {
-                if (ReferenceEquals(positional[i], KeepValue))
-                {
-                    existing = new byte[_recordLength];
-                    if (RandomAccess.Read(_handle, existing, offset) < _recordLength)
-                        throw new DbfWriteException(
-                            $"Could not read record {index} to preserve its existing field bytes.");
-                    break;
-                }
+                existing = new byte[_recordLength];
+                if (RandomAccess.Read(_handle, existing, offset) < _recordLength)
+                    throw new DbfWriteException(
+                        $"Could not read record {index} to preserve its existing field bytes.");
             }
+            oldRecordBytes = existing;
 
             // Encode the row. KeepValue slots are nulled for encoding so the memo-append path
             // (PatchMemoPointers) NEVER sees a read-back pointer/content as new blob data; their real
             // bytes are restored from `existing` below.
             object?[] toEncode = positional;
-            if (existing is not null)
+            if (hasKeep)
             {
                 toEncode = (object?[])positional.Clone();
                 for (int i = 0; i < toEncode.Length; i++)
@@ -587,7 +611,7 @@ public sealed partial class DbfWriter : IDisposable
             byte[] record = RecordEncoder.Encode(_schema, toEncode, deleted: false);
             PatchMemoPointers(record, toEncode);
 
-            if (existing is not null)
+            if (hasKeep && existing is not null)
             {
                 // Preserve the deletion mark (UPDATE modifies field data only) and each KeepValue
                 // field's existing bytes + its _NullFlags bit.
@@ -604,6 +628,7 @@ public sealed partial class DbfWriter : IDisposable
 
             _stream.Seek(offset, SeekOrigin.Begin);
             _stream.Write(record, 0, record.Length);
+            writtenRecord = record;   // the exact bytes just written — reused for index maintenance
 
             // Stamp the last-update date (bytes 1–3); the count is unchanged by an in-place update.
             WriteDate();
@@ -611,6 +636,12 @@ public sealed partial class DbfWriter : IDisposable
             _stream.Flush();
             _fpt?.Flush();
         });
+
+        // §5.1 incremental maintenance: the row is durably written; now update every open structural tag
+        // (delete the old key, insert the new one where they differ). A failure sets ReindexNeeded + rethrows.
+        if (maintain && oldRecordBytes is not null && writtenRecord is not null)
+            MaintainIndexesAfterUpdate(index + 1,
+                new DbfRecord(_schema, oldRecordBytes), new DbfRecord(_schema, writtenRecord));
     }
 
     /// <summary>Copy a single column's <c>_NullFlags</c> bit from <paramref name="from"/> to

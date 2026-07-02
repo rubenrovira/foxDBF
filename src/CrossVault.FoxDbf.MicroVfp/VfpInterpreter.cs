@@ -38,6 +38,13 @@ public sealed class VfpInterpreter
     private readonly Dictionary<int, AreaMeta> _meta = new();
     private readonly List<CallContext> _callStack = new();
 
+    // CANDIDATE tags are byte-identical to plain tags on disk for a FREE table (no DBC index catalog), so
+    // microVFP tracks candidacy in-session: full table path → the set of tag names created CANDIDATE. A
+    // write that introduces a duplicate key into any of these must RAISE (VFP behaviour), not silently
+    // corrupt the tag. Enforced around INSERT/REPLACE/APPEND (the writer itself only honours the on-disk
+    // UNIQUE bit). Lost when the session ends (no on-disk candidate signal) — a documented free-table limit.
+    private readonly Dictionary<string, HashSet<string>> _candidateTags = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>Hard cap on call nesting depth — a runaway recursive UDF throws a catchable
     /// <see cref="MicroVfpRuntimeException"/> at this depth rather than a fatal StackOverflowException.
     /// Each interpreter call spans MANY native frames (tree-walk → compiled-expression invoke →
@@ -829,6 +836,17 @@ public sealed class VfpInterpreter
         string? table = (ins.Parsed as InsertStatement)?.Table
                      ?? (SafeParseSql(ins.Sql) as InsertStatement)?.Table;
 
+        // CANDIDATE enforcement: if the target table has a tag created CANDIDATE, an INSERT that duplicates
+        // one of its keys must RAISE (VFP). The row is written (funnelling the incremental maintenance),
+        // then each candidate tag is re-checked; a violation rolls the write back + raises.
+        if (table is not null
+            && Session.FindAreaByAlias(table)?.Table.SourcePath is string candPath
+            && CandidateTagsFor(candPath) is not null)
+        {
+            EnforceCandidateInsert(ins, candPath);
+            return;
+        }
+
         if (!EnforceReferentialIntegrity || table is null)
         {
             try { Session.Execute(ins.Sql); } catch { /* best-effort; INSERT is not a target path */ }
@@ -1032,6 +1050,9 @@ public sealed class VfpInterpreter
                 throw new MicroVfpRuntimeException(
                     $"INDEX ON … TAG {tagName} CANDIDATE: uniqueness violated — a duplicate key value exists.");
             }
+            // The tag is now valid + candidate: remember its candidacy so a later write that duplicates a
+            // key raises (the on-disk tag looks plain for a free table, so nothing else could tell).
+            RegisterCandidateTag(path, tagName);
         }
 
         // The new tag becomes the controlling order (VFP behaviour) and the pointer goes to its top.
@@ -1376,6 +1397,62 @@ public sealed class VfpInterpreter
                 mm.Cached = null; mm.Ordered = null; mm.OrderedFor = null; mm.OrderPos = -1; mm.KeyVisible = null;
             }
     }
+
+    /// <summary>Remember that <paramref name="tag"/> on <paramref name="path"/> was created CANDIDATE.</summary>
+    private void RegisterCandidateTag(string path, string tag)
+    {
+        string key = Path.GetFullPath(path);
+        if (!_candidateTags.TryGetValue(key, out var set))
+            _candidateTags[key] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        set.Add(tag);
+    }
+
+    /// <summary>The CANDIDATE tag names registered for <paramref name="path"/>, or null when none.</summary>
+    private HashSet<string>? CandidateTagsFor(string path)
+        => _candidateTags.TryGetValue(Path.GetFullPath(path), out var set) && set.Count > 0 ? set : null;
+
+    /// <summary>Run an INSERT against a table carrying CANDIDATE tag(s): perform the append (which funnels the
+    /// incremental index maintenance), then re-check every candidate tag for a duplicate key. A violation
+    /// rolls the write back (the .dbf/.cdx pre-image) and raises the same catchable error INDEX ON … CANDIDATE
+    /// raises.</summary>
+    private void EnforceCandidateInsert(InsertStmt ins, string path)
+    {
+        var pre = CaptureSnapshot(path);
+        try { Session.Execute(ins.Sql); }
+        catch { RestoreSnapshot(pre); throw; }
+        ReopenFileAreas(path);
+
+        string? bad = FirstViolatedCandidate(path);
+        if (bad is not null)
+        {
+            RestoreSnapshot(pre);
+            throw new MicroVfpRuntimeException(
+                $"INSERT INTO {NameOfTable(ins)}: CANDIDATE tag {bad} uniqueness violated — a duplicate key value exists.");
+        }
+    }
+
+    /// <summary>The first registered CANDIDATE tag on <paramref name="path"/> that now holds a duplicate key,
+    /// or null when all are still unique. Opens the table + its structural <c>.cdx</c> read-only.</summary>
+    private string? FirstViolatedCandidate(string path)
+    {
+        var set = CandidateTagsFor(path);
+        if (set is null) return null;
+        string cdx = Path.ChangeExtension(path, ".cdx");
+        if (!File.Exists(cdx)) return null;
+        using var table = DbfTable.Open(path, new DbfOptions { LockMode = LockMode.Shared });
+        using var cdxFile = CdxFile.Open(cdx, table);
+        foreach (var name in set)
+        {
+            var tag = cdxFile.Tag(name) ?? cdxFile.Tag(name.ToUpperInvariant());
+            if (tag is not null && HasDuplicateKeys(tag))
+                return name;
+        }
+        return null;
+    }
+
+    /// <summary>The target table name of an INSERT for a diagnostic message (best-effort).</summary>
+    private static string NameOfTable(InsertStmt ins)
+        => (ins.Parsed as InsertStatement)?.Table ?? "?";
 
     /// <summary>True when <paramref name="tag"/> has two entries with identical key bytes — a CANDIDATE
     /// violation. The tag stores entries in key order, so any duplicate keys are adjacent.</summary>
@@ -2015,6 +2092,14 @@ public sealed class VfpInterpreter
         bool autoFireUpdate = EnforceReferentialIntegrity && ResolveTriggerProc(RiEvent.Update, wa) is not null;
         FileSnapshot? parentSnap = autoFireUpdate ? CaptureSnapshot(path) : null;
 
+        // CANDIDATE: a REPLACE that changes an indexed key to a duplicate of a CANDIDATE tag must RAISE
+        // (VFP error 1884), matching INDEX ON … CANDIDATE. The incremental cdx maintenance leaves the
+        // duplicate visible in the tag (a free-table candidate tag is plain/non-UNIQUE on disk), so we
+        // capture the pre-image up front and, after the maintained write, re-check every candidate tag —
+        // rolling the .dbf/.cdx back and raising on a violation (the same flow the INSERT path uses).
+        bool hasCandidate = CandidateTagsFor(path) is not null;
+        FileSnapshot? candSnap = hasCandidate ? CaptureSnapshot(path) : null;
+
         SnapshotForTxn(path);
 
         using (var writer = DbfWriter.Open(path, new DbfOptions { LockMode = LockMode.Shared }))
@@ -2043,6 +2128,13 @@ public sealed class VfpInterpreter
         // Refresh EVERY handle on this file (USE..AGAIN shares one buffer in VFP) so siblings see the write;
         // this also re-bases the writing area's own read handle and drops its caches (incl. index order).
         ReopenFileAreas(path);
+
+        if (hasCandidate && FirstViolatedCandidate(path) is string badReplaceTag)
+        {
+            RestoreSnapshot(candSnap!);
+            throw new MicroVfpRuntimeException(
+                $"REPLACE: CANDIDATE tag {badReplaceTag} uniqueness violated — a duplicate key value exists.");
+        }
         // P3b: a key-changing REPLACE on a parent fires its bound update trigger, cascading the new key
         // to children (the trigger reads OLDVAL() — captured above — for the OLD key). A .F./error return
         // is a RESTRICT/update abort: the trigger already rolled back its child cascade (riend(.F.) →
@@ -2207,28 +2299,39 @@ public sealed class VfpInterpreter
                 // trigger touches). On the FIRST RESTRICT abort we stop and roll EVERYTHING back, leaving the
                 // buffer INTACT and returning .F. — never a half-written table with a half-cleared buffer.
                 BeginTransaction();
-                var doneRows = new List<int>();
-                var doneApps = new List<AppendEntry>();
-                foreach (var kv in new List<KeyValuePair<int, RowEdit>>(buf.Rows))
+                try
                 {
-                    if (CommitExistingRow(area, wa, path, kv.Key, kv.Value)) doneRows.Add(kv.Key);
-                    else { ok = false; break; }
-                }
-                if (ok)
-                    foreach (var ae in new List<AppendEntry>(buf.Appends))
+                    var doneRows = new List<int>();
+                    var doneApps = new List<AppendEntry>();
+                    foreach (var kv in new List<KeyValuePair<int, RowEdit>>(buf.Rows))
                     {
-                        if (CommitAppend(ae)) doneApps.Add(ae);
+                        if (CommitExistingRow(area, wa, path, kv.Key, kv.Value)) doneRows.Add(kv.Key);
                         else { ok = false; break; }
                     }
-                if (ok)
-                {
-                    EndTransaction();                          // commit: the writes already landed on disk.
-                    foreach (var r in doneRows) buf.Rows.Remove(r);
-                    foreach (var ae in doneApps) buf.Appends.Remove(ae);
+                    if (ok)
+                        foreach (var ae in new List<AppendEntry>(buf.Appends))
+                        {
+                            if (CommitAppend(ae)) doneApps.Add(ae);
+                            else { ok = false; break; }
+                        }
+                    if (ok)
+                    {
+                        EndTransaction();                      // commit: the writes already landed on disk.
+                        foreach (var r in doneRows) buf.Rows.Remove(r);
+                        foreach (var ae in doneApps) buf.Appends.Remove(ae);
+                    }
+                    else
+                    {
+                        RollbackTransaction();                 // revert every already-written row/append.
+                    }
                 }
-                else
+                catch
                 {
-                    RollbackTransaction();                     // revert every already-written row/append.
+                    // A RAISED constraint violation (e.g. a CANDIDATE duplicate from CommitAppend) must roll
+                    // the transaction frame back — reverting every already-committed row/append and leaving
+                    // the buffer INTACT — instead of dangling the frame on the _txn stack.
+                    RollbackTransaction();
+                    throw;
                 }
             }
             else
@@ -2272,7 +2375,7 @@ public sealed class VfpInterpreter
         for (int i = 0; i < vals.Length; i++)
             vals[i] = ae.Fields.TryGetValue(i, out var v) ? v : BlankFor(wa.Table.Columns[i]);
 
-        FileSnapshot? snap = CaptureSnapshot(path);            // pre-image for a RESTRICT rollback.
+        FileSnapshot? snap = CaptureSnapshot(path);            // pre-image for a RESTRICT / candidate rollback.
         SnapshotForTxn(path);
         using (var writer = DbfWriter.Open(path, new DbfOptions { LockMode = LockMode.Shared }))
         {
@@ -2280,6 +2383,17 @@ public sealed class VfpInterpreter
             writer.Flush();
         }
         ReopenFileAreas(path);
+
+        // CANDIDATE: a buffered APPEND committed here (TABLEUPDATE) that duplicates a candidate key must
+        // RAISE — the same enforcement the write-through INSERT path applies. The maintained cdx now holds
+        // the duplicate; restore the pre-image and raise on a violation. (CommitBuffer's allRows transaction
+        // frame is rolled back by its catch so the raise leaves the buffer intact.)
+        if (CandidateTagsFor(path) is not null && FirstViolatedCandidate(path) is string badAppendTag)
+        {
+            if (snap is not null) RestoreSnapshot(snap);
+            throw new MicroVfpRuntimeException(
+                $"APPEND: CANDIDATE tag {badAppendTag} uniqueness violated — a duplicate key value exists.");
+        }
 
         // Deferred insert trigger / RI: positioned ON the new (last physical) record; .F. ⇒ RESTRICT abort.
         if (EnforceReferentialIntegrity && ResolveTriggerProc(RiEvent.Insert, wa) is not null)

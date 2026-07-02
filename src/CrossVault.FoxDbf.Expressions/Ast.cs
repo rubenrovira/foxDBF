@@ -23,6 +23,12 @@ internal abstract class AstNode
     /// <summary>Static type inference against a schema.</summary>
     public abstract VfpTypeInfo Infer(ISchema schema);
 
+    /// <summary>Add every FIELD name this node (transitively) reads to <paramref name="into"/>. Only bare
+    /// field references count — function names, literals and operators contribute nothing. Used by the
+    /// write-path index maintenance to decide whether a tag's KEY/FOR expression resolves against a table's
+    /// physical schema before it edits that tag's on-disk tree.</summary>
+    public virtual void CollectFields(ICollection<string> into) { }
+
     /// <summary>If this node is a numeric literal, returns its integer value.</summary>
     public virtual bool TryConstInt(out int value) { value = 0; return false; }
 }
@@ -74,6 +80,8 @@ internal sealed class FieldNode : AstNode
         return new VfpTypeInfo(VfpType.Unknown);
     }
 
+    public override void CollectFields(ICollection<string> into) => into.Add(_name);
+
     private static VfpType MapColumnType(char t) => char.ToUpperInvariant(t) switch
     {
         'C' or 'M' or 'V' => VfpType.Character,
@@ -102,6 +110,8 @@ internal sealed class UnaryNode : AstNode
 
     public override VfpTypeInfo Infer(ISchema schema)
         => _op == UnOp.Not ? new VfpTypeInfo(VfpType.Logical, 1) : _operand.Infer(schema);
+
+    public override void CollectFields(ICollection<string> into) => _operand.CollectFields(into);
 }
 
 internal sealed class BinaryNode : AstNode
@@ -149,6 +159,12 @@ internal sealed class BinaryNode : AstNode
             return new VfpTypeInfo(VfpType.Numeric);
         }
         return new VfpTypeInfo(VfpType.Numeric);
+    }
+
+    public override void CollectFields(ICollection<string> into)
+    {
+        _left.CollectFields(into);
+        _right.CollectFields(into);
     }
 }
 
@@ -232,6 +248,11 @@ internal sealed class FunctionNode : AstNode
             case "IIF": return ArgInfer(schema, 1);
             default: return new VfpTypeInfo(VfpType.Unknown);
         }
+    }
+
+    public override void CollectFields(ICollection<string> into)
+    {
+        foreach (var a in _args) a.CollectFields(into);
     }
 
     private VfpTypeInfo ArgInfer(ISchema schema, int i)

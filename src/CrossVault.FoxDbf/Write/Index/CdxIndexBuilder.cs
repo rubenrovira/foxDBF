@@ -145,10 +145,113 @@ internal static class CdxIndexBuilder
     private static TagPlan PlanTag(DbfTable schema, IReadOnlyList<BuildRow> rows, CdxTagDefinition def,
         EvaluationContext? evalContext, bool includeDeleted)
     {
+        // The per-row KEY/FOR derivation (collation, key type/length, FOR filter, encoding) is factored
+        // into a reusable TagKeyComputer — the SAME primitive the incremental write-path maintenance
+        // (DbfWriter index maintenance) drives, so a maintained entry is byte-identical to a bulk-built one.
+        var computer = CreateKeyComputer(schema, def, evalContext);
+
+        int recCount = rows.Count;
+        var entries = new List<Entry>(rows.Count);
+        foreach (var row in rows)
+        {
+            // VFP keeps index entries for DELETED records in the CDX (only PACK removes them). With
+            // SET DELETED OFF (includeDeleted) we index them too; the default (SET DELETED ON) skips them.
+            if (!includeDeleted && row.Record.IsDeleted)
+                continue;
+            if (computer.TryComputeKey(row.Record, row.RecNo, recCount, out var keyBytes))
+                entries.Add(new Entry(keyBytes, (uint)row.RecNo));
+        }
+
+        entries.Sort(EntryComparer.Instance);
+
+        if (def.Unique)
+            entries = DropDuplicateKeys(entries);
+
+        long recnoBasis = Math.Max(1, recCount);
+        var geom = LeafGeometry.For(computer.KeyLen, recnoBasis, entries);
+
+        byte options = (byte)0x60; // compound | compact
+        if (def.Unique) options |= 0x01;
+        bool hasFor = !string.IsNullOrWhiteSpace(def.ForExpression);
+        if (hasFor) options |= 0x08;
+
+        // Tag signature (byte 15): 0x01 for an IDENTITY/MACHINE collation, 0x02 only for a real
+        // named (GENERAL, …) weight collation. Verified against vfp_test/dbctest/ref.DCX (both DBC
+        // tags MACHINE ⇒ 0x01) and vfp_test/ligtest.CDX (GENERAL ⇒ 0x02).
+        byte tagSig = IsIdentityCollation(computer.Collation) ? (byte)1 : (byte)2;
+
+        return new TagPlan
+        {
+            Name = def.Name,
+            Entries = entries,
+            Geom = geom,
+            KeyLen = computer.KeyLen,
+            Pad = computer.Pad,
+            TreePageCount = CountTreePages(entries, computer.KeyLen, computer.Pad, geom),
+            Options = options,
+            Signature = tagSig,
+            SortOrder = computer.Collation.Name,
+            Descending = def.Descending,
+            KeyExpr = def.KeyExpression ?? string.Empty,
+            ForExpr = hasFor ? def.ForExpression! : string.Empty,
+        };
+    }
+
+    // ---- reusable per-tag key derivation (shared by bulk build + incremental maintenance) ----------
+
+    /// <summary>
+    /// The compiled, per-tag KEY/FOR derivation for one <see cref="CdxTagDefinition"/> over a
+    /// <see cref="DbfTable"/> schema: the resolved key type / stored key length / trailing pad /
+    /// collation, plus the compiled KEY and (optional) FOR functions. A single instance turns a
+    /// <see cref="DbfRecord"/> into the exact on-disk key bytes the bulk builder would produce, so the
+    /// incremental write-path maintenance and the fresh REINDEX stay in lock-step.
+    /// </summary>
+    internal sealed class TagKeyComputer
+    {
+        public required IndexKeyType KeyType;
+        public required int KeyLen;
+        public required bool IsChar;
+        public required byte Pad;
+        public required IVfpCollation Collation;
+        public required Func<IRowContext, VfpValue> KeyFn;
+        public required Func<IRowContext, VfpValue>? ForFn;
+        public required bool Unique;
+        public required bool Descending;
+
+        /// <summary>
+        /// Evaluate the tag's FOR filter and KEY over <paramref name="record"/>. Returns <see langword="true"/>
+        /// and the encoded key bytes when the record belongs in the tag (FOR passes / no FOR); returns
+        /// <see langword="false"/> (and an empty key) when a FOR filter excludes it. Deleted-record filtering
+        /// is the CALLER's concern (VFP keeps deleted entries in the CDX until PACK; the write path indexes
+        /// regardless of the deleted flag so an UPDATE keeps a deleted row's entry consistent).
+        /// </summary>
+        public bool TryComputeKey(DbfRecord record, int recNo, int recCount, out byte[] key)
+        {
+            var rc = new RowContext(record, recNo, recCount);
+            if (ForFn is not null)
+            {
+                var f = ForFn(rc);
+                if (!(f.Type == VfpType.Logical && f.AsLogical))
+                {
+                    key = Array.Empty<byte>();
+                    return false;
+                }
+            }
+            var value = KeyFn(rc);
+            key = EncodeKey(value, KeyType, KeyLen, Collation, Pad);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Build the <see cref="TagKeyComputer"/> for <paramref name="def"/> against <paramref name="schema"/>.
+    /// The per-tag collation ALWAYS wins (it is baked into the tag header), but the KEY/FOR expressions
+    /// otherwise honour the caller's LIVE SET EXACT / SET ANSI (via <paramref name="evalContext"/>) so a
+    /// character <c>=</c> inside a FOR/KEY filters exactly as a VFP run of the same program would.
+    /// </summary>
+    internal static TagKeyComputer CreateKeyComputer(DbfTable schema, CdxTagDefinition def, EvaluationContext? evalContext)
+    {
         var collation = VfpCollations.ByName(def.Collation);
-        // The per-tag collation ALWAYS wins (it is baked into the tag header), but the KEY/FOR
-        // expressions must otherwise honour the caller's LIVE SET EXACT / SET ANSI so a character `=`
-        // inside a FOR/KEY filters exactly as a VFP run of the same program would (review finding #6).
         var ctx = new EvaluationContext
         {
             Collation = collation,
@@ -167,62 +270,17 @@ internal static class CdxIndexBuilder
             ? VfpExpression.Parse(def.ForExpression!).Compile(ctx)
             : null;
 
-        int recCount = rows.Count;
-        var entries = new List<Entry>(rows.Count);
-        foreach (var row in rows)
+        return new TagKeyComputer
         {
-            // VFP keeps index entries for DELETED records in the CDX (only PACK removes them). With
-            // SET DELETED OFF (includeDeleted) we index them too; the default (SET DELETED ON) skips them.
-            if (!includeDeleted && row.Record.IsDeleted)
-                continue;
-            var rc = new RowContext(row.Record, row.RecNo, recCount);
-
-            if (forFn is not null)
-            {
-                var f = forFn(rc);
-                if (!(f.Type == VfpType.Logical && f.AsLogical))
-                    continue;
-            }
-
-            var value = keyFn(rc);
-            byte[] keyBytes = EncodeKey(value, keyType, keyLen, collation, pad);
-            entries.Add(new Entry(keyBytes, (uint)row.RecNo));
-        }
-
-        entries.Sort(EntryComparer.Instance);
-
-        if (def.Unique)
-            entries = DropDuplicateKeys(entries);
-
-        long recnoBasis = Math.Max(1, recCount);
-        var geom = LeafGeometry.For(keyLen, recnoBasis, entries);
-
-        byte options = (byte)0x60; // compound | compact
-        if (def.Unique) options |= 0x01;
-        bool hasFor = !string.IsNullOrWhiteSpace(def.ForExpression);
-        if (hasFor) options |= 0x08;
-
-        // Tag signature (byte 15): 0x01 for an IDENTITY/MACHINE collation, 0x02 only for a real
-        // named (GENERAL, …) weight collation. Verified against vfp_test/dbctest/ref.DCX (both DBC
-        // tags MACHINE ⇒ 0x01) and vfp_test/ligtest.CDX (GENERAL ⇒ 0x02). Deriving it from the
-        // collation (rather than the old hardcoded 2) makes the built .DCX byte-match VFP9 and fixes
-        // every caller (the DBC builder, DbfWriter.CreateTag, Reindex) at once.
-        byte tagSig = IsIdentityCollation(collation) ? (byte)1 : (byte)2;
-
-        return new TagPlan
-        {
-            Name = def.Name,
-            Entries = entries,
-            Geom = geom,
+            KeyType = keyType,
             KeyLen = keyLen,
+            IsChar = isChar,
             Pad = pad,
-            TreePageCount = CountTreePages(entries, keyLen, pad, geom),
-            Options = options,
-            Signature = tagSig,
-            SortOrder = collation.Name,
+            Collation = collation,
+            KeyFn = keyFn,
+            ForFn = forFn,
+            Unique = def.Unique,
             Descending = def.Descending,
-            KeyExpr = def.KeyExpression ?? string.Empty,
-            ForExpr = hasFor ? def.ForExpression! : string.Empty,
         };
     }
 
@@ -449,6 +507,93 @@ internal static class CdxIndexBuilder
             Array.Copy(item.Fresh, 0, page, tail, item.Fresh.Length);
         }
     }
+
+    // ---- incremental-edit encoding primitives (shared with the write-path CDX maintenance) ---------
+
+    /// <summary>One re-encoded leaf page image plus its MAX (key, recno) separator — the unit the
+    /// incremental B-tree editor splices into the tree. <see cref="Page"/> is a 512-byte page with
+    /// sibling pointers left as <c>0xFFFFFFFF</c> for the caller to patch.</summary>
+    internal sealed class LeafImage
+    {
+        public required byte[] Page;
+        public required byte[] MaxKey;
+        public required uint MaxRecno;
+        public required bool IsEmpty;
+    }
+
+    /// <summary>A branch child slot: the child's MAX (separator) key + that key's recno, and the child
+    /// node's byte offset. Mirrors one on-disk branch entry <c>[key][recno BE][child BE]</c>.</summary>
+    internal readonly record struct BranchChild(byte[] SepKey, uint SepRecno, uint Child);
+
+    /// <summary>
+    /// Re-encode a sorted (ascending unsigned-key, recno-tiebreak) entry list into one or more compact
+    /// leaf page images — the exact inverse of <see cref="CompactLeaf"/>.Decode and byte-compatible with a
+    /// bulk build. Uses the SAME <see cref="LeafGeometry"/> / <see cref="PackLeaves"/> / <see cref="WriteLeaf"/>
+    /// path as the builder so a maintained leaf reads back identically. More than one image is returned only
+    /// when the entries overflow a page (a split); each image's sibling pointers are <c>0xFFFFFFFF</c> and the
+    /// root/leaf attribute carries only the leaf (+ data) bits — the caller patches links + the root bit.
+    /// </summary>
+    internal static List<LeafImage> PackLeafImages(IReadOnlyList<(byte[] Key, uint Recno)> entries, int keyLen, byte pad, long recnoBasis)
+    {
+        var list = new List<Entry>(entries.Count);
+        foreach (var e in entries)
+            list.Add(new Entry(e.Key, e.Recno));
+
+        var geom = LeafGeometry.For(keyLen, Math.Max(1, recnoBasis), list);
+        var leaves = PackLeaves(list, keyLen, pad, geom);
+        ushort leafExtra = (ushort)(geom.BytesPerEntry <= 2 ? AttrData : 0);
+
+        var result = new List<LeafImage>(leaves.Count);
+        foreach (var leaf in leaves)
+        {
+            var page = new byte[Page];
+            WriteLeaf(page, leaf, keyLen, geom, (ushort)(AttrLeaf | leafExtra), left: NoPtr, right: NoPtr);
+            bool empty = leaf.Items.Count == 0;
+            result.Add(new LeafImage
+            {
+                Page = page,
+                MaxKey = empty ? Array.Empty<byte>() : leaf.LastKey,
+                MaxRecno = leaf.LastRecno,
+                IsEmpty = empty,
+            });
+        }
+        return result;
+    }
+
+    /// <summary>Maximum branch entries that fit one 512-byte page for the given key length.</summary>
+    internal static int BranchCapacity(int keyLen)
+    {
+        int entrySize = keyLen + 8;
+        int maxPer = (Page - StdHeader) / entrySize;
+        return maxPer < 1 ? 1 : maxPer;
+    }
+
+    /// <summary>Encode a branch (interior) page from <paramref name="kids"/> — the inverse of
+    /// <see cref="IndexFile.ReadBranchEntries"/>. Sibling pointers and the attribute word are supplied by
+    /// the caller (the incremental editor manages the root bit + sibling chain).</summary>
+    internal static byte[] EncodeBranchPage(IReadOnlyList<BranchChild> kids, int keyLen, ushort attr, uint left, uint right)
+    {
+        var page = new byte[Page];
+        BinaryPrimitives.WriteUInt16LittleEndian(page.AsSpan(0), attr);
+        BinaryPrimitives.WriteUInt16LittleEndian(page.AsSpan(2), (ushort)kids.Count);
+        BinaryPrimitives.WriteUInt32LittleEndian(page.AsSpan(4), left);
+        BinaryPrimitives.WriteUInt32LittleEndian(page.AsSpan(8), right);
+
+        int off = StdHeader;
+        foreach (var k in kids)
+        {
+            int copy = Math.Min(keyLen, k.SepKey.Length);
+            k.SepKey.AsSpan(0, copy).CopyTo(page.AsSpan(off, keyLen));
+            BinaryPrimitives.WriteUInt32BigEndian(page.AsSpan(off + keyLen, 4), k.SepRecno);
+            BinaryPrimitives.WriteUInt32BigEndian(page.AsSpan(off + keyLen + 4, 4), k.Child);
+            off += keyLen + 8;
+        }
+        return page;
+    }
+
+    /// <summary>The node-attribute / sentinel constants the incremental editor needs for page patching.</summary>
+    internal const ushort AttrRootBit = AttrRoot;
+    internal const uint NoPointer = NoPtr;
 
     // ---- key encoding ----------------------------------------------------------
 

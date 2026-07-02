@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq.Expressions;
 
 namespace CrossVault.FoxDbf.Expressions;
@@ -79,4 +80,17 @@ public sealed class VfpExpression
     /// <summary>Static type inference against a schema.</summary>
     public VfpTypeInfo InferType(ISchema schema)
         => _root.Infer(schema);
+
+    /// <summary>
+    /// Every distinct FIELD name this expression reads (case-insensitive; function names and literals
+    /// excluded). Lets a host verify that a KEY/FOR expression only references columns that actually exist
+    /// in a given physical schema — e.g. the write-path index maintenance rejects a tag whose expression
+    /// names a field absent from the raw <c>.dbf</c> (a DBC long name) rather than derive wrong key bytes.
+    /// </summary>
+    public IReadOnlyCollection<string> ReferencedFields()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _root.CollectFields(set);
+        return set;
+    }
 }
