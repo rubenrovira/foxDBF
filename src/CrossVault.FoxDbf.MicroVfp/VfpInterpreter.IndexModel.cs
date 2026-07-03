@@ -147,7 +147,7 @@ public sealed partial class VfpInterpreter
             {
                 RollbackFiles(pre!, path);
                 throw new MicroVfpRuntimeException(
-                    $"INDEX ON … TAG {tagName} CANDIDATE: uniqueness violated — a duplicate key value exists.");
+                    $"INDEX ON … TAG {tagName} CANDIDATE: uniqueness violated — a duplicate key value exists.", 1884); // VFP err 1884 (oracle-pinned).
             }
             // The tag is now valid + candidate: remember its candidacy so a later write that duplicates a
             // key raises (the on-disk tag looks plain for a free table, so nothing else could tell).
@@ -526,7 +526,7 @@ public sealed partial class VfpInterpreter
         {
             RestoreSnapshot(pre);
             throw new MicroVfpRuntimeException(
-                $"INSERT INTO {NameOfTable(ins)}: CANDIDATE tag {bad} uniqueness violated — a duplicate key value exists.");
+                $"INSERT INTO {NameOfTable(ins)}: CANDIDATE tag {bad} uniqueness violated — a duplicate key value exists.", 1884); // VFP err 1884 (oracle-pinned).
         }
     }
 

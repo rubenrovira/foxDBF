@@ -491,7 +491,7 @@ public sealed class VfpSession : IDisposable
             string? path = ResolveFreePath(name);
             if (path is null)
                 throw new FoxDbfSqlException(
-                    $"Table '{name}' was not found in the open database or data directory.");
+                    $"Table '{name}' was not found in the open database or data directory.") { VfpErrorNumber = 1 }; // VFP err 1 "does not exist".
             // COPY-ON-WRITE: inside a transaction that has already written this table, reads go to its
             // private working copy (read-your-writes); otherwise the live path is returned unchanged.
             if (TxRedirectReadPath is { } redirect) path = redirect(path);
@@ -598,7 +598,7 @@ public sealed class VfpSession : IDisposable
         string? path = ResolveFreePath(name);
         if (path is null)
             throw new FoxDbfSqlException(
-                $"Table '{name}' was not found in the open database or data directory.");
+                $"Table '{name}' was not found in the open database or data directory.") { VfpErrorNumber = 1 }; // VFP err 1 "does not exist".
         return path;
     }
 

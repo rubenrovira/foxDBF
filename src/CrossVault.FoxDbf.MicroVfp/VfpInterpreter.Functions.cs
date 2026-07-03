@@ -642,7 +642,7 @@ public sealed partial class VfpInterpreter
     {
         int cx = SortClass(x), cy = SortClass(y);
         if (cx != cy)
-            throw new MicroVfpRuntimeException("ASORT(): array elements are not the same data type.");
+            throw new MicroVfpRuntimeException("ASORT(): array elements are not the same data type.", 9); // VFP err 9 "Data type mismatch." (oracle-pinned).
         return cx switch
         {
             0 => ci

@@ -164,7 +164,7 @@ public sealed partial class VfpInterpreter
         {
             RestoreSnapshot(candSnap!);
             throw new MicroVfpRuntimeException(
-                $"REPLACE: CANDIDATE tag {badReplaceTag} uniqueness violated — a duplicate key value exists.");
+                $"REPLACE: CANDIDATE tag {badReplaceTag} uniqueness violated — a duplicate key value exists.", 1884); // VFP err 1884 (oracle-pinned).
         }
         // P3b: a key-changing REPLACE on a parent fires its bound update trigger, cascading the new key
         // to children (the trigger reads OLDVAL() — captured above — for the OLD key). A .F./error return

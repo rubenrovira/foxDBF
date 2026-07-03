@@ -68,7 +68,13 @@ internal sealed class DmlExecutor
             for (int i = 0; i < cols.Count; i++)
             {
                 if (IndexOfColumn(columns, cols[i]) < 0)
-                    throw new FoxDbfSqlException($"Column '{cols[i]}' does not exist in table '{st.Table}'.");
+                    // VFP treats an unknown name in the INSERT column-list as an undefined VARIABLE, not an
+                    // SQL column: err 12 "Variable '...' is not found." (oracle-pinned against the VFP9
+                    // runtime, project-review 5.3). Typed so the interpreter's ErrorNumberOf carries the
+                    // exact number WITHOUT the last-resort "does not exist" text heuristic (which would
+                    // mis-map it to err 1 "File does not exist").
+                    throw new FoxDbfSqlException($"Column '{cols[i]}' does not exist in table '{st.Table}'.")
+                        { VfpErrorNumber = 12 };
                 map[cols[i]] = values[i];
             }
             writer.AppendRecord(map);
@@ -101,8 +107,13 @@ internal sealed class DmlExecutor
         {
             int idx = IndexOfColumn(columns, st.Assignments[i].Column);
             if (idx < 0)
+                // An unknown SET column is the SQL-column class: err 1806 "SQL: Column '...' is not found."
+                // (oracle-pinned against the VFP9 runtime, project-review 5.3 — same number SELECT reports
+                // for an unknown projected column). Typed so ErrorNumberOf carries the exact number WITHOUT
+                // the last-resort "does not exist" text heuristic (which would mis-map it to err 1).
                 throw new FoxDbfSqlException(
-                    $"Column '{st.Assignments[i].Column}' does not exist in table '{st.Table}'.");
+                    $"Column '{st.Assignments[i].Column}' does not exist in table '{st.Table}'.")
+                    { VfpErrorNumber = 1806 };
             assigns[i] = (idx, st.Assignments[i].Value);
             setColumns.Add(idx);
         }

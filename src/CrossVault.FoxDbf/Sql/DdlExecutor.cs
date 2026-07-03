@@ -163,7 +163,7 @@ internal sealed class DdlExecutor
         if (!File.Exists(path))
         {
             if (st.IfExists) return SqlResult.Dml(0);
-            throw new FoxDbfSqlException($"Table '{st.Table}' was not found in the data directory.");
+            throw new FoxDbfSqlException($"Table '{st.Table}' was not found in the data directory.") { VfpErrorNumber = 1 }; // VFP err 1 "does not exist".
         }
 
         // Inside a transaction: snapshot the live .dbf + sidecars BEFORE deleting them so a Rollback
@@ -225,7 +225,7 @@ internal sealed class DdlExecutor
     {
         string path = TargetPath(name);
         if (!File.Exists(path))
-            throw new FoxDbfSqlException($"Table '{name}' was not found in the data directory.");
+            throw new FoxDbfSqlException($"Table '{name}' was not found in the data directory.") { VfpErrorNumber = 1 }; // VFP err 1 "does not exist".
         return path;
     }
 

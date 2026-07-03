@@ -264,7 +264,7 @@ public sealed partial class VfpInterpreter
         {
             if (snap is not null) RestoreSnapshot(snap);
             throw new MicroVfpRuntimeException(
-                $"APPEND: CANDIDATE tag {badAppendTag} uniqueness violated — a duplicate key value exists.");
+                $"APPEND: CANDIDATE tag {badAppendTag} uniqueness violated — a duplicate key value exists.", 1884); // VFP err 1884 (oracle-pinned).
         }
 
         // Deferred insert trigger / RI: positioned ON the new (last physical) record; .F. ⇒ RESTRICT abort.

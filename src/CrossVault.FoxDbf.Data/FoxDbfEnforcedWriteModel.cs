@@ -234,11 +234,11 @@ internal sealed class FoxDbfEnforcedWriteModel
                 if (string.IsNullOrEmpty(f.RuleExpression) || !candidates.ContainsKey(f.FieldName)) continue;
                 if (changedFields is not null && !changedFields.Contains(f.FieldName)) continue;
                 if (RuleFails(f.RuleExpression!))
-                    throw new FoxDbfException(RuleError(f.RuleText, f.FieldName));
+                    throw new FoxDbfException(RuleError(f.RuleText, f.FieldName), 1582); // VFP err 1582 field-rule (oracle-pinned).
             }
 
             if (!string.IsNullOrEmpty(rules.RuleExpression) && RuleFails(rules.RuleExpression!))
-                throw new FoxDbfException(RuleError(rules.RuleText, null));
+                throw new FoxDbfException(RuleError(rules.RuleText, null), 1583); // VFP err 1583 record/table-rule (oracle-pinned).
         }
         finally
         {
@@ -263,7 +263,7 @@ internal sealed class FoxDbfEnforcedWriteModel
     {
         if (!_interp.LastDmlTriggerAborted) return;
         _interp.LastDmlTriggerAborted = false;
-        throw new FoxDbfException($"Trigger failed in {table}. (Visual FoxPro error 1539)");
+        throw new FoxDbfException($"Trigger failed in {table}. (Visual FoxPro error 1539)", 1539); // VFP err 1539 trigger-.F. (oracle-pinned).
     }
 
     private static string RuleError(string? ruleText, string? field)

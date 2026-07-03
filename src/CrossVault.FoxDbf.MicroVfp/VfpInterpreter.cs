@@ -57,6 +57,14 @@ public sealed partial class VfpInterpreter
     /// ponytail: 64 is a fixed ceiling; raise it if a legitimate corpus case ever nests deeper AND the
     /// native stack can take it (else run the interpreter on a large-stack thread).</summary>
     private const int MaxCallDepth = 64;
+
+    /// <summary>The stable VFP-style error number microVFP raises when <see cref="MaxCallDepth"/> is hit
+    /// (project-review 5.3). VFP itself faults UNCATCHABLY on unbounded recursion (verified against the
+    /// runtime: it crashes before any trappable error fires), so there is NO oracle-authoritative number
+    /// to pin here — this is a microVFP-internal stable code, positive/non-zero for the AERROR/ON ERROR
+    /// contract. Its only contract is stability; change it only with the matching TypedError test.</summary>
+    internal const int MaxCallDepthErrorNumber = 1809;
+
     private readonly Row _row;
     private readonly EvaluationContext _ctx;
 
@@ -235,7 +243,7 @@ public sealed partial class VfpInterpreter
         if (_callStack.Count >= MaxCallDepth)
             throw new MicroVfpRuntimeException(
                 $"Maximum call nesting depth ({MaxCallDepth}) exceeded calling '{proc.Name}' — " +
-                "probable unbounded recursion.");
+                "probable unbounded recursion.", MaxCallDepthErrorNumber);
         System.Runtime.CompilerServices.RuntimeHelpers.EnsureSufficientExecutionStack();
 
         var cc = new CallContext(proc.Name, args, passedCount);
@@ -338,20 +346,47 @@ public sealed partial class VfpInterpreter
         Runtime.LastErrorField = 0;
     }
 
-    private static int ErrorNumberOf(Exception ex)
+    // Map a trapped exception onto the VFP9 error number the RI/AERROR/ON ERROR contract branches on
+    // (project-review 5.3). Order — MOST authoritative first, message-text sniffing LAST:
+    //   (1) TYPED  — the throw site pinned the number on the exception via IVfpErrorCode. The inner chain
+    //       is walked too, so a BCL wrapper that re-threw one of ours (e.g. Array.Sort wrapping ASORT's
+    //       typed error in an InvalidOperationException) still surfaces the pinned number. No text read.
+    //   (2) KNOWN OWN TYPE — a Core exception whose WHOLE class maps 1:1 to a VFP number.
+    //   (3) LAST RESORT — an English message-text heuristic, for FOREIGN (BCL / third-party) exceptions
+    //       that cannot carry a typed number, plus a few PERIPHERAL own throws whose VFP number is
+    //       syntax-dependent (SET ORDER / SET INDEX "not found" — VFP reports 12/1683 depending on form,
+    //       so they intentionally stay on the shared "not found" → 1 mapping). Best-effort and English-only;
+    //       every RI-critical / oracle-pinned OWN class is typed above, so text never decides THOSE. The
+    //       final fallback stays a positive, non-zero number — the RI framework branches require non-zero.
+    internal static int ErrorNumberOf(Exception ex)
     {
+        // (1) typed number — authoritative. Walk the inner chain: a BCL wrapper may sit on top of ours.
+        for (Exception? e = ex; e is not null; e = e.InnerException)
+            if (e is IVfpErrorCode { VfpErrorNumber: int typed }) return typed;
+
+        // (2) known OWN exception types with a well-defined 1:1 VFP class.
+        if (ex is DbfFileNotFoundException) return 1;   // "File/table does not exist" (VFP err 1).
+
+        // (3) LAST RESORT — foreign exceptions + a few peripheral own throws (see the header note). English-
+        // only, best-effort. Most specific patterns first so a generic "rule" message can't shadow the trigger.
         string m = ex.Message ?? string.Empty;
         bool Has(string s) => m.Contains(s, StringComparison.OrdinalIgnoreCase);
-
-        // Map the trapped exception onto the real VFP9 error numbers the RI/AERROR contract branches on.
-        // The most specific patterns first so a generic "rule" message doesn't shadow the trigger case.
-        if (Has("locate command must be issued")) return 42;     // CONTINUE with no prior LOCATE (VFP err 42).
+        if (Has("locate command must be issued")) return 42;     // CONTINUE with no prior LOCATE.
         if (Has("1539") || Has("trigger failed")) return 1539;   // RI trigger returned .F. (RESTRICT abort).
         if (Has("field") && Has("rule")) return 1582;            // field validation rule violated.
         if (Has("record") && Has("rule")) return 1583;           // record (table) validation rule violated.
         if (Has("rule violated") || Has("violates the rule")) return 1582; // bare rule-text → field-rule class.
         if (Has("session number is invalid")) return 1540;       // SET DATASESSION TO <non-existent session>.
-        if (Has("locked") || Has("not locked") || Has("lock")) return 130; // record/file is in use / locked.
+        // Lock-related text (a FOREIGN IOException from the Core writer — the interpreter models locks as
+        // always-held, single-process, so a genuine multi-user conflict is not reachable/oracle-pinnable
+        // headless). These are TWO DISTINCT VFP classes and the branch must not collapse them:
+        //   • "not locked" is genuinely err 130 "Record is not locked" — the ABSENCE of a held lock.
+        //   • a lock CONFLICT (another user holds it) is a different class: err 109 (record) / 108 (whole
+        //     file). The legacy code returned 130 for the conflict case too; corrected here per project-
+        //     review 5.3 (a headless oracle pin of a real multi-user conflict is infeasible — see above).
+        if (Has("not locked")) return 130;                       // absence of a held lock (err 130).
+        if (Has("file") && Has("lock")) return 108;              // whole-file lock conflict.
+        if (Has("locked") || Has("lock")) return 109;            // record lock conflict.
         if (Has("not found") || Has("does not exist")) return 1; // "File does not exist".
         if (Has("data type") || Has("type mismatch") || Has("not the same data type")) return 9; // type mismatch.
         return 1;   // unknown cause → a positive, non-zero VFP-style error number (all RI fallbacks need).
@@ -729,7 +764,7 @@ public sealed partial class VfpInterpreter
         var v = EvalText(s);
         int n = IsNumeric(v) ? (int)v.AsNumber : int.TryParse(v.AsString, out var p) ? p : -1;
         if (n == 1) return;   // the only session microVFP has → no-op.
-        throw new MicroVfpRuntimeException("Session number is invalid.");   // VFP error 1540.
+        throw new MicroVfpRuntimeException("Session number is invalid.", 1540);   // VFP error 1540.
     }
 
     // SET DATABASE TO [name]. With NO name → clear the current-database designation (DBC()/SET("DATABASE")
@@ -828,7 +863,11 @@ public sealed partial class VfpInterpreter
         // referential macro (&pcmd where pcmd='&pcmd') re-parses to another MacroSubstStmt and re-enters
         // here forever → StackOverflowException (uncatchable). Bound the nesting and raise VFP-style.
         if (_macroDepth >= 16)
-            throw new MicroVfpRuntimeException("Nesting level too deep.");
+            // 1206 is a microVFP-INTERNAL stable code, NOT oracle-pinned: real VFP9 faults UNCATCHABLY on
+            // recursive macro expansion (no trappable ERROR() to read a number from), so there is no
+            // authoritative runtime value — same honest labeling as MaxCallDepthErrorNumber. Its only
+            // contract is stability; change it only with the matching TypedError test.
+            throw new MicroVfpRuntimeException("Nesting level too deep.", 1206);
         var stmt = ParseSingle(expanded);
         if (stmt is null) return;
         _macroDepth++;

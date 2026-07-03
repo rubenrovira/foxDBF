@@ -90,7 +90,7 @@ public sealed partial class VfpInterpreter
         int area = Session.CurrentArea;
         var m = Meta(area);
         if (!m.LocateActive)
-            throw new MicroVfpRuntimeException("The LOCATE command must be issued before the CONTINUE command.");
+            throw new MicroVfpRuntimeException("The LOCATE command must be issued before the CONTINUE command.", 42);
 
         MaybeAutoCommitRow(area);
         var wa = Session.AreaAt(area);                // MUST re-fetch: a commit may reopen the file areas.
