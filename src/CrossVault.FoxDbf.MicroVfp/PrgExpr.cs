@@ -10,7 +10,7 @@ namespace CrossVault.FoxDbf.MicroVfp;
 /// every fragment is handed verbatim to <see cref="VfpExpression.Parse"/> (the existing,
 /// battle-tested xBase expression engine). <see cref="Parsed"/> holds the resulting AST.
 /// </summary>
-public sealed class PrgExpr
+internal sealed class PrgExpr
 {
     /// <summary>The exact source text of the fragment (trimmed).</summary>
     public string Text { get; }
