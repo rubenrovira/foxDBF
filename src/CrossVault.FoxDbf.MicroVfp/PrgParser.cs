@@ -889,10 +889,64 @@ public static class PrgParser
             return new ReindexStmt(inArea);
         }
 
+        // LOCATE [Scope] [FOR lExpr] [WHILE lExpr] [NOOPTIMIZE]. Unlike SCAN, VFP also tolerates the Scope
+        // AFTER the FOR clause (e.g. `LOCATE FOR x NEXT 5`) and a trailing NOOPTIMIZE optimizer hint — both
+        // VFP9-verified as legal. Carve on FOR/WHILE (leading scope becomes the head, as for SCAN), then peel
+        // any scope/NOOPTIMIZE that trails a FOR/WHILE expression so it is not fed to the expression parser
+        // (which would otherwise fail and yield a silent never-matching Null predicate — project-review 5.2).
         private static LocateStmt BuildLocate(string text)
         {
-            var (scope, forE, whileE) = ScopeForWhile(PrgScan.AfterFirstWord(text));
+            var (head, segs) = Carve(PrgScan.AfterFirstWord(text), "FOR", "WHILE");
+            string? scope = head.Length == 0 ? null : head;
+            PrgExpr? forE = null, whileE = null;
+            foreach (var (k, b) in segs)
+            {
+                // Only peel when the body does NOT parse as a whole: a clean parse means there is no trailing
+                // clause, which leaves a valid predicate that happens to end in a field named e.g. "record"
+                // untouched (PrgExpr.Parse is error-tolerant — IsParsed is false only on genuine junk).
+                var expr = PrgExpr.Parse(b);
+                if (!expr.IsParsed)
+                {
+                    string body = b;
+                    string? trailScope = PeelTrailingScope(ref body);
+                    if (body.Length != b.Length)            // something was peeled ⇒ re-parse the expression.
+                    {
+                        scope ??= trailScope;               // leading (head) scope, if any, always wins.
+                        expr = PrgExpr.Parse(body);
+                    }
+                }
+                if (k == "FOR") forE = expr; else whileE = expr;
+            }
             return new LocateStmt(scope, forE, whileE);
+        }
+
+        /// <summary>Peels a trailing NOOPTIMIZE hint and/or a trailing scope clause (REST / ALL / NEXT n /
+        /// RECORD n) off the END of a LOCATE FOR/WHILE body and returns the scope text (null if none);
+        /// <paramref name="body"/> is trimmed back to just the expression. Called only when the body already
+        /// failed to parse, so a scope keyword appearing here is genuine trailing junk, not a field name in a
+        /// valid predicate.</summary>
+        private static string? PeelTrailingScope(ref string body)
+        {
+            // (1) trailing NOOPTIMIZE — a bare optimizer hint microVFP does not model (single-process; no
+            // Rushmore toggle). Drop it so it is not parsed as part of the expression.
+            var words = PrgScan.TopWords(body);
+            if (words.Count > 0 && words[^1].Upper == "NOOPTIMIZE")
+            {
+                body = body.Substring(0, words[^1].Start).TrimEnd();
+                words = PrgScan.TopWords(body);
+            }
+            // (2) trailing scope clause. REST/ALL are bare words; NEXT/RECORD take a trailing count expression,
+            // so the keyword is the LAST top-level word when its count is numeric/parenthesised (both are
+            // non-words) and the second-to-last when the count is a bare identifier (NEXT lnN).
+            if (words.Count == 0) return null;
+            int kwIdx = -1;
+            if (words[^1].Upper is "REST" or "ALL" or "NEXT" or "RECORD") kwIdx = words.Count - 1;
+            else if (words.Count >= 2 && words[^2].Upper is "NEXT" or "RECORD") kwIdx = words.Count - 2;
+            if (kwIdx < 0) return null;
+            int start = words[kwIdx].Start;
+            string scope = body.Substring(start).Trim();
+            body = body.Substring(0, start).TrimEnd();
+            return scope;
         }
 
         private static GoStmt BuildGo(string text)

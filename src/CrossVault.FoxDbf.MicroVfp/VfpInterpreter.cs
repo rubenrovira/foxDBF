@@ -467,6 +467,7 @@ public sealed class VfpInterpreter
 
         // Map the trapped exception onto the real VFP9 error numbers the RI/AERROR contract branches on.
         // The most specific patterns first so a generic "rule" message doesn't shadow the trigger case.
+        if (Has("locate command must be issued")) return 42;     // CONTINUE with no prior LOCATE (VFP err 42).
         if (Has("1539") || Has("trigger failed")) return 1539;   // RI trigger returned .F. (RESTRICT abort).
         if (Has("field") && Has("rule")) return 1582;            // field validation rule violated.
         if (Has("record") && Has("rule")) return 1583;           // record (table) validation rule violated.
@@ -538,7 +539,9 @@ public sealed class VfpInterpreter
             case FlushStmt: break;                           // write-through model — persisted already; no-op.
             case ClearStmt cl: ExecClear(cl); break;
             case MacroSubstStmt ms: ExecMacroSubst(ms); break;
-            case LocateStmt or ContinueStmt or UnknownCommand or ProcDef: break;
+            case LocateStmt loc: ExecLocate(loc); break;
+            case ContinueStmt: ExecContinue(); break;
+            case UnknownCommand or ProcDef: break;
             default: break;
         }
     }
@@ -682,6 +685,211 @@ public sealed class VfpInterpreter
             Session.SelectArea(area);
             Skip(area, 1);
         }
+    }
+
+    // ─────────────────────────── LOCATE / CONTINUE (project-review 5.2) ───────────────────────────
+    //
+    // LOCATE positions on the FIRST record — in the area's CURRENT order (the master index if one is set,
+    // else physical) — that satisfies FOR within the scope/WHILE window, honouring SET DELETED / SET FILTER /
+    // SET KEY visibility through the SAME Visible() gate GO/SKIP use. Found ⇒ pointer on the record,
+    // FOUND()=.T.; the search runs off the end ⇒ EOF(), FOUND()=.F. LOCATE with no FOR positions on the
+    // first visible record. CONTINUE resumes the LAST LOCATE of the CURRENT work area from the record AFTER
+    // the current one, reusing its remembered FOR/WHILE + scope window (per AreaMeta); CONTINUE with no
+    // prior LOCATE raises VFP error 42. Both are ONE pointer move and fire the GO/SKIP side effects:
+    // MaybeAutoCommitRow before leaving the row, RepositionChildren after landing.
+
+    private enum LocScope { All, Rest, Next, Record }
+
+    private void ExecLocate(LocateStmt loc)
+    {
+        int area = Session.CurrentArea;
+        if (Session.AreaAt(area) is null) return;     // no table open ⇒ nothing to search.
+        var m = Meta(area);
+
+        var (kind, count) = ResolveLocScope(loc.Scope);
+        // A WHILE with NO explicit scope keyword defaults to REST — the search starts at the CURRENT record,
+        // not the top of the table (the canonical `SEEK key` / `LOCATE … WHILE key=…` key-group idiom relies
+        // on this; a top restart would discard the SEEK). Mirrors ExecScan's `fromCurrent` rule. Guard on the
+        // RAW parsed scope (loc.Scope) so an explicit ALL is never overridden. VFP9-verified.
+        if (loc.Scope is null && loc.While is not null) kind = LocScope.Rest;
+
+        MaybeAutoCommitRow(area);                     // leaving the current row commits its pending edit (mode 2/3).
+        var wa = Session.AreaAt(area);                // MUST re-fetch: a commit may reopen the file areas.
+        if (wa is null) return;
+
+        // Remember this LOCATE so a following CONTINUE can resume it (per work area).
+        m.LocateActive = true;
+        m.LocateFor = loc.For;
+        m.LocateWhile = loc.While;
+
+        if (kind == LocScope.Record)
+        {
+            m.LocateWindow = new HashSet<int> { count };
+            m.LocateWindowFull = true;                // single-record window is "full" (exhaust ⇒ park on it).
+            LocateOnRecord(area, wa, m, count, loc.For, loc.While);
+            RepositionChildren(area);
+            return;
+        }
+
+        var order = TraversalOrder(area, wa);         // recnos in the CURRENT order (index order or physical).
+        int startIdx = kind == LocScope.All ? 0 : CurrentIndex(order, m);   // REST/NEXT start at the current record.
+        if (startIdx < 0) startIdx = order.Count;     // current at EOF/BOF ⇒ REST/NEXT window is empty.
+
+        List<int> candidates;
+        bool unbounded;
+        if (kind == LocScope.Next)
+        {
+            var (window, full) = BuildNextWindow(order, wa, startIdx, count);
+            m.LocateWindow = new HashSet<int>(window);
+            m.LocateWindowFull = full;
+            candidates = window;
+            unbounded = false;
+        }
+        else                                          // ALL / REST — unbounded to the end of the order.
+        {
+            m.LocateWindow = null;
+            m.LocateWindowFull = false;
+            candidates = SubListFrom(order, startIdx);
+            unbounded = true;
+        }
+
+        RunLocateScan(area, wa, m, candidates, loc.For, loc.While, unbounded, m.LocateWindowFull);
+        RepositionChildren(area);
+    }
+
+    private void ExecContinue()
+    {
+        int area = Session.CurrentArea;
+        var m = Meta(area);
+        if (!m.LocateActive)
+            throw new MicroVfpRuntimeException("The LOCATE command must be issued before the CONTINUE command.");
+
+        MaybeAutoCommitRow(area);
+        var wa = Session.AreaAt(area);                // MUST re-fetch: a commit may reopen the file areas.
+        if (wa is null) return;
+
+        var order = TraversalOrder(area, wa);
+        int curIdx = CurrentIndex(order, m);
+        int from = (m.Eof || curIdx < 0) ? order.Count : curIdx + 1;   // resume AFTER the current record.
+
+        List<int> candidates = SubListFrom(order, from);
+        bool unbounded = m.LocateWindow is null;
+        if (!unbounded) candidates = candidates.Where(m.LocateWindow!.Contains).ToList();   // stay inside the NEXT/RECORD window.
+
+        RunLocateScan(area, wa, m, candidates, m.LocateFor, m.LocateWhile, unbounded, m.LocateWindowFull);
+        RepositionChildren(area);
+    }
+
+    /// <summary>Parse the LOCATE scope head (null/"ALL"/"REST"/"NEXT n"/"RECORD n"); the count expression is
+    /// evaluated in the current context (VFP allows an expression, e.g. <c>NEXT lnCount</c>).</summary>
+    private (LocScope Kind, int Count) ResolveLocScope(string? scope)
+    {
+        if (string.IsNullOrWhiteSpace(scope)) return (LocScope.All, 0);
+        string s = scope.Trim();
+        int sp = s.IndexOf(' ');
+        string head = (sp < 0 ? s : s.Substring(0, sp)).ToUpperInvariant();
+        string rest = sp < 0 ? string.Empty : s.Substring(sp + 1).Trim();
+        return head switch
+        {
+            "ALL" => (LocScope.All, 0),
+            "REST" => (LocScope.Rest, 0),
+            "NEXT" => (LocScope.Next, ScopeCount(rest)),
+            "RECORD" => (LocScope.Record, ScopeCount(rest)),
+            _ => (LocScope.All, 0),                    // unrecognised head ⇒ ALL (VFP's default scope).
+        };
+
+        int ScopeCount(string expr)
+        {
+            try { return (int)Eval(PrgExpr.Parse(expr)).AsNumber; } catch { return 0; }
+        }
+    }
+
+    /// <summary>The recnos of <paramref name="area"/> in its CURRENT traversal order — the active index
+    /// sequence (<see cref="ActiveOrder"/>) or, with no controlling order, physical 1..count.</summary>
+    private List<int> TraversalOrder(int area, VfpSession.WorkArea wa)
+    {
+        var ord = ActiveOrder(area);
+        if (ord is not null) return ord;
+        int rc = EffCount(area, wa);
+        var list = new List<int>(rc);
+        for (int i = 1; i <= rc; i++) list.Add(i);
+        return list;
+    }
+
+    /// <summary>The index of the CURRENT record within <paramref name="order"/>, or -1 when the pointer is
+    /// at EOF/BOF (or on a record absent from the active index).</summary>
+    private static int CurrentIndex(List<int> order, AreaMeta m) => order.IndexOf(m.RecNo);
+
+    private static List<int> SubListFrom(List<int> order, int from)
+        => from >= order.Count ? new List<int>() : order.GetRange(from, order.Count - from);
+
+    /// <summary>The first <paramref name="count"/> VISIBLE recnos of the NEXT window, walking <paramref
+    /// name="order"/> from <paramref name="startIdx"/>, plus whether the window reached its full count (a
+    /// full window that finds nothing parks on its last record; a window truncated by EOF goes to EOF).</summary>
+    private (List<int> Window, bool Full) BuildNextWindow(List<int> order, VfpSession.WorkArea wa, int startIdx, int count)
+    {
+        var w = new List<int>();
+        for (int idx = Math.Max(0, startIdx); idx < order.Count && w.Count < count; idx++)
+            if (Visible(wa, order[idx])) w.Add(order[idx]);
+        return (w, count > 0 && w.Count == count);
+    }
+
+    /// <summary>Walk <paramref name="candidates"/> (already in order, already the right scope subset) for the
+    /// first record satisfying FOR, honouring WHILE (stops on the first .F., parking there) and visibility.
+    /// No match: an <paramref name="unbounded"/> (ALL/REST) walk parks at EOF; a full bounded (NEXT/RECORD)
+    /// window leaves the pointer where it is — on the FIRST LOCATE that is its last examined record, on a
+    /// CONTINUE whose remaining slice is already empty it stays put (only FOUND() clears) (VFP9-verified).</summary>
+    private void RunLocateScan(int area, VfpSession.WorkArea wa, AreaMeta m, List<int> candidates,
+        PrgExpr? forExpr, PrgExpr? whileExpr, bool unbounded, bool windowFull)
+    {
+        var ord = ActiveOrder(area);
+        foreach (int rec in candidates)
+        {
+            if (!Visible(wa, rec)) continue;
+            PositionPointer(m, ord, rec);
+            if (whileExpr is not null && !Truth(Eval(whileExpr))) { m.Found = false; return; }  // WHILE .F. ⇒ stop here.
+            if (forExpr is null || Truth(Eval(forExpr))) { m.Found = true; return; }             // match ⇒ done.
+        }
+        // No match after the walk.
+        if (!unbounded && windowFull)
+        {
+            // A fully-counted bounded window (NEXT n / RECORD n) that finds nothing does NOT move to EOF: the
+            // pointer stays where it is (VFP9-verified). On the FIRST LOCATE a full window always examined a
+            // record, so the pointer is parked on that last record; on a CONTINUE whose remaining window slice
+            // is already empty (lastExamined == -1) the pointer is simply left untouched — RecNo/Bof/Eof below
+            // are skipped and only FOUND() clears.
+            m.Found = false;
+            return;
+        }
+        m.RecNo = wa.Table.RecordCount + 1; m.Eof = true; m.Bof = false; m.Found = false;
+        m.Cached = null; m.OldVals = null;
+        if (ord is not null) m.OrderPos = ord.Count;
+    }
+
+    /// <summary>LOCATE RECORD n — GO n (explicit; no visibility skip), then evaluate WHILE/FOR on it; the
+    /// pointer stays on record n whether or not it matches (VFP9-verified). Out-of-range n ⇒ EOF/not found.</summary>
+    private void LocateOnRecord(int area, VfpSession.WorkArea wa, AreaMeta m, int rec, PrgExpr? forExpr, PrgExpr? whileExpr)
+    {
+        var ord = ActiveOrder(area);
+        if (rec < 1 || rec > wa.Table.RecordCount)
+        {
+            m.RecNo = wa.Table.RecordCount + 1; m.Eof = true; m.Bof = false; m.Found = false;
+            m.Cached = null; m.OldVals = null;
+            if (ord is not null) m.OrderPos = ord.Count;
+            return;
+        }
+        PositionPointer(m, ord, rec);
+        if (whileExpr is not null && !Truth(Eval(whileExpr))) { m.Found = false; return; }
+        m.Found = forExpr is null || Truth(Eval(forExpr));
+    }
+
+    /// <summary>Position the pointer on <paramref name="rec"/> for FOR/WHILE evaluation (re-basing the record
+    /// cache + OLDVAL buffer + index position), the SAME state a GO would set — but WITHOUT the GO/SKIP side
+    /// effects, which LOCATE fires ONCE for its whole scan.</summary>
+    private static void PositionPointer(AreaMeta m, List<int>? ord, int rec)
+    {
+        m.RecNo = rec; m.Eof = false; m.Bof = false; m.Cached = null; m.OldVals = null;
+        if (ord is not null) m.OrderPos = ord.IndexOf(rec);
     }
 
     private void ExecDoCall(DoCall d)
@@ -2998,6 +3206,15 @@ public sealed class VfpInterpreter
 
         // ── SET RELATION (this area as PARENT; microVFP P1 gap #2) ──
         public List<Relation>? Relations; // child relations set on THIS area (null ⇒ none).
+
+        // ── LOCATE / CONTINUE (project-review 5.2) — the last LOCATE issued in THIS area, remembered so a
+        // following CONTINUE resumes the SAME search (same FOR/WHILE + scope window) from the current
+        // position instead of restarting. Per work area. ──
+        public bool LocateActive;          // a LOCATE has run in this area ⇒ CONTINUE is legal (else VFP err 42).
+        public PrgExpr? LocateFor;         // the remembered FOR predicate (null ⇒ match the first visible record).
+        public PrgExpr? LocateWhile;       // the remembered WHILE predicate (stops the walk at the first .F.).
+        public HashSet<int>? LocateWindow; // bounded scope (NEXT/RECORD) candidate recnos; null ⇒ ALL/REST (to end).
+        public bool LocateWindowFull;      // a NEXT window that reached its full count (exhaust ⇒ park, not EOF).
 
         // ── multi-index model (microVFP INDEX/ORDER MODEL) ──
         // Non-structural index files opened via SET INDEX TO / USE … INDEX, in OPEN order (full paths).
