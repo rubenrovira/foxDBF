@@ -39,9 +39,18 @@ internal sealed class RuntimeState
     /// The RI-critical branch (MICROVFP_SEMANTICS.md §Locking / risk #5): <c>SET REPROCESS TO 0</c>
     /// makes the lock FUNCTIONS (RLOCK/FLOCK/…) fail FAST (return <c>.F.</c> immediately) WHEN an
     /// <c>ON ERROR</c> handler is installed; with no handler the same setting means "retry forever".
-    /// True ⇒ a failed lock returns <c>.F.</c> at once instead of spinning.
+    /// True ⇒ a failed lock returns <c>.F.</c> at once instead of spinning. Consumed by the interpreter's
+    /// real lock-acquire retry loop (finding 5.13 — RLOCK/FLOCK take REAL byte-range locks now).
     /// </summary>
     public bool LockFailFast => Reprocess == 0 && OnErrorInstalled;
+
+    /// <summary>
+    /// SET MULTILOCKS (default OFF). OFF ⇒ only ONE record lock per work area — a new <c>RLOCK</c> releases
+    /// the previously-held record lock; the <c>cRecordList</c> form is not available. ON ⇒ record locks
+    /// ACCUMULATE (and a list of records can be locked at once). Read back by <c>SET("MULTILOCKS")</c>.
+    /// Required ON for the row/table BUFFERING modes 4/5 (hackfox s4g204).
+    /// </summary>
+    public bool Multilocks { get; internal set; }
 
     // ── retained LAST-ERROR state (backs AERROR; see MICROVFP_SEMANTICS.md Nachtrag) ──
     // VFP clears the LIVE ERROR()/MESSAGE() when the ON ERROR handler returns, but the RI handler

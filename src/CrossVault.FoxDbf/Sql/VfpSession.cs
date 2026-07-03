@@ -67,6 +67,18 @@ public sealed class VfpSession : IDisposable
     internal event Action? Disposing;
 
     /// <summary>
+    /// Raised at the START of <see cref="CloseAllHandles"/> — the QUIESCE point an ADO.NET transaction
+    /// Commit/Rollback runs BEFORE it swaps each private copy over the live file (or restores a DDL
+    /// snapshot). A consumer holding LIVE-file handles keyed to a coordination lock (the microVFP
+    /// interpreter's 5.13 RLOCK/FLOCK byte-range locks, which ride a cached writer on the LIVE file even
+    /// inside a copy-on-write transaction) subscribes here to release them, so the imminent
+    /// <see cref="File.Replace(string, string, string?)"/> / <see cref="File.Copy(string, string, bool)"/>
+    /// writeback is not blocked by an open handle or a held byte range. Best-effort: a throwing subscriber
+    /// never aborts the quiesce.
+    /// </summary>
+    internal event Action? HandlesClosing;
+
+    /// <summary>
     /// The optional query ACCELERATOR (e.g. the Highlike engine) that SELECT / DML candidate-set
     /// discovery routes through instead of the plain <see cref="QueryOptimizer"/>. When <see langword="null"/>
     /// (the default) the Core optimizer runs. An accelerator must return the SAME record set the Core
@@ -148,6 +160,11 @@ public sealed class VfpSession : IDisposable
     /// </summary>
     internal void CloseAllHandles()
     {
+        // Let subscribers (the microVFP interpreter's 5.5 cached writers + 5.13 held byte-range locks)
+        // release their LIVE-file handles first — a transaction Commit/Rollback quiesces via this BEFORE it
+        // swaps/restores the live files, and a lingering interpreter lock handle on a live file would block
+        // that writeback. Best-effort — a throwing subscriber never aborts the quiesce.
+        try { HandlesClosing?.Invoke(); } catch { /* best-effort */ }
         foreach (var w in _areas.Values) w.Dispose();
         _areas.Clear();
     }

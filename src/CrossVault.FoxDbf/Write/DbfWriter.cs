@@ -365,6 +365,29 @@ public sealed partial class DbfWriter : IDisposable
     }
 
     /// <summary>
+    /// Acquire the VFP HEADER lock — <c>RLOCK</c> of "record 0", which VFP models as a lock on the table
+    /// header / append anchor (<see cref="VfpLock.AppendLockPosition"/>) used to serialise appends. No-op
+    /// in <see cref="LockMode.Exclusive"/>.
+    /// </summary>
+    /// <exception cref="IOException">Another writer already holds an overlapping lock.</exception>
+    public void LockHeader()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_lockMode == LockMode.Exclusive)
+            return;
+        AcquireTracked(VfpLock.AppendLockPosition(_usesStructuralScheme), 1);
+    }
+
+    /// <summary>Release the VFP header lock (<c>RLOCK</c> record 0).</summary>
+    public void UnlockHeader()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_lockMode == LockMode.Exclusive)
+            return;
+        ReleaseTracked(VfpLock.AppendLockPosition(_usesStructuralScheme), 1);
+    }
+
+    /// <summary>
     /// Acquire the record lock for the 1-based <paramref name="recNo"/> and return a token
     /// whose <see cref="IDisposable.Dispose"/> releases it (scope-based locking).
     /// </summary>
@@ -383,6 +406,16 @@ public sealed partial class DbfWriter : IDisposable
         LockFile();
         return new LockToken(this, UnlockFile);
     }
+
+    /// <summary>
+    /// True when this writer holds one or more EXPLICIT (caller-acquired) byte-range locks taken through
+    /// the public surface (<see cref="Lock"/> / <see cref="LockFile"/> / <see cref="LockHeader"/>). The
+    /// short-lived internal per-mutation locks are always released in <c>WithLock</c>'s finally and are
+    /// never tracked here, so this reflects only locks the caller is deliberately holding. The microVFP
+    /// interpreter reads it to PIN a cached writer that is coordinating an <c>RLOCK</c>/<c>FLOCK</c> — its
+    /// cached-writer prune/invalidate must never silently drop a held byte-range lock (finding 5.13).
+    /// </summary>
+    public bool HasHeldLocks => _heldLocks.Count > 0;
 
     // ---- lock plumbing ---------------------------------------------------------
 

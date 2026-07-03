@@ -127,6 +127,23 @@ public sealed partial class VfpInterpreter
         // 5.5: release the per-area cached write handles when the session is disposed (callers dispose the
         // session, not the interpreter), so no .dbf stays locked past the session's life.
         Session.Disposing += DisposeAllCachedWriters;
+        // 5.13: an ADO.NET copy-on-write transaction Commit/Rollback QUIESCES the session (CloseAllHandles)
+        // right before it swaps each private copy over the live file. A byte-range lock (RLOCK/FLOCK) an SP
+        // took inside the transaction rides a cached writer on the LIVE file (coordination happens there);
+        // that open handle + its lock would break the File.Replace/Copy writeback. Release every held lock
+        // and dispose the cached writers at the quiesce point — the DEFINED lock disposition for an ADO.NET
+        // transaction boundary. Autocommit never calls CloseAllHandles, so this is inert outside a tx.
+        Session.HandlesClosing += ReleaseLocksAndWritersOnQuiesce;
+    }
+
+    // 5.13 quiesce hook (see ctor): drop the interpreter's held locks + cached writers so a transaction
+    // Commit/Rollback can write back the live files. ReleaseAllLocks clears the _areaLocks bookkeeping (so a
+    // later ISRLOCKED reports .F.) and releases the OS ranges off the cached writers; DisposeAllCachedWriters
+    // then closes the handles themselves.
+    private void ReleaseLocksAndWritersOnQuiesce()
+    {
+        ReleaseAllLocks();
+        DisposeAllCachedWriters();
     }
 
     /// <summary>The data session the interpreter runs over (work areas, USE/SELECT, resolution, DML).</summary>
@@ -436,7 +453,7 @@ public sealed partial class VfpInterpreter
             case DeleteStmt del: ExecDelete(del); break;
             case RecallStmt rc: ExecRecall(rc); break;
             case SumStmt sum: ExecSum(sum); break;
-            case UnlockStmt: break;                          // locks are modelled as always-held.
+            case UnlockStmt ul: ExecUnlock(ul); break;       // release our REAL byte-range locks (finding 5.13).
             case BeginTxnStmt: BeginTransaction(); break;
             case EndTxnStmt: EndTransaction(); break;
             case RollbackStmt: RollbackTransaction(); break;
@@ -632,7 +649,9 @@ public sealed partial class VfpInterpreter
         if (u.IsClose)
         {
             int area = u.In is not null ? ResolveAreaRef(u.In) : Session.CurrentArea;
-            if (area > 0) { Session.CloseArea(area); _meta.Remove(area); }
+            // 5.13: closing a table releases the locks the session held on it (VFP semantics) — release our
+            // byte-range locks FIRST so the writer carries no held lock and the prune below can dispose it.
+            if (area > 0) { ReleaseAreaLocks(area); Session.CloseArea(area); _meta.Remove(area); }
             PruneCachedWriters();   // 5.5: releasing the last area on a file must release its cached writer.
             return;
         }
@@ -655,6 +674,7 @@ public sealed partial class VfpInterpreter
 
         Session.Use(table, inArea, alias, again: u.Again,
             exclusive: u.Mode == UseMode.Exclusive, noUpdate: u.NoUpdate);
+        ReleaseStaleLocks();    // 5.13: a USE that repurposed/closed an area drops the locks it held (before prune).
         PruneCachedWriters();   // 5.5: repurposing an area off its old table may release that file's cached writer.
 
         string aliasName = alias ?? Path.GetFileNameWithoutExtension(table);
@@ -744,6 +764,7 @@ public sealed partial class VfpInterpreter
             case "ANSI": _ctx.Ansi = OnOff(arg); break;
             case "COLLATE": SetCollate(arg); break;             // baked into the next INDEX tag; SET("COLLATE").
             case "UNIQUE": Runtime.Unique = OnOff(arg); break;  // session default for a clause-less INDEX; SET("UNIQUE").
+            case "MULTILOCKS": Runtime.Multilocks = OnOff(arg); break; // OFF ⇒ a new RLOCK releases the prior record lock; SET("MULTILOCKS").
             case "KEY": SetKey(arg); break;                     // master-index visible key range; feeds Visible().
             case "NEAR": _setNear = OnOff(arg); break;          // failed-SEEK pointer parking; SET("NEAR").
             case "NULL": _ctx.NullSetting = OnOff(arg); break;  // CREATE/ALTER TABLE default nullability; SET("NULL").
@@ -925,6 +946,7 @@ public sealed partial class VfpInterpreter
                 break;
             case ClearKind.All:
                 Memory.ClearAll();
+                ReleaseAllLocks();            // 5.13: CLEAR ALL = UNLOCK ALL + close everything (release byte-range locks).
                 DisposeAllCachedWriters();    // 5.5: CLEAR ALL closes every file — release cached writers too.
                 Session.CloseAllHandles();   // close every open work area (keeps the data-source binding).
                 _meta.Clear();               // drop the per-area record pointers/relations too.

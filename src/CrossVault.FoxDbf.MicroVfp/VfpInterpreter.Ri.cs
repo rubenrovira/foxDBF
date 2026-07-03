@@ -207,7 +207,11 @@ public sealed partial class VfpInterpreter
     {
         // 5.5: a cached writer holding this .dbf/.fpt open would block the File.WriteAllBytes rewrite below
         // (and its stale handle/count must not survive a rollback). Drop it first — the next write re-opens.
-        InvalidateCachedWriter(snap.Path);
+        // 5.13: FORCE-close it even when an explicit RLOCK/FLOCK pins it — InvalidateCachedWriter would
+        // SKIP a pinned writer, leaving the handle open so File.WriteAllBytes below hits a sharing violation
+        // that the surrounding catch{} silently swallows (⇒ the rollback no-ops, leaving the duplicate/invalid
+        // rows on disk under the raised error). ReacquireHeldLocks at the end re-takes the tracked lock.
+        ForceCloseCachedWriter(snap.Path);
         // Capture the work areas currently riding this file so they can be re-opened after the restore.
         // TablePath (the actual .dbf source) is captured alongside the alias: a riopen SCRATCH area has an
         // alias like "__ri6" which is NOT a DBC member / on-disk file, so re-opening BY ALIAS would throw —
@@ -250,6 +254,9 @@ public sealed partial class VfpInterpreter
             GoTop(r.Area);
         }
         Session.SelectArea(savedCur);
+        // 5.13: re-take on the fresh cached writer the explicit RLOCK/FLOCK we force-closed above, so a lock
+        // an SP holds while a transaction / RI / CANDIDATE abort rolls the file back stays held afterwards.
+        ReacquireHeldLocks(snap.Path);
     }
 
     // ── 5.5 RECORD-LEVEL pre-image (pathology 3): the per-statement RI atomicity snapshots for a REPLACE do

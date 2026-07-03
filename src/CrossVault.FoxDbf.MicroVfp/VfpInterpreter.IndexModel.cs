@@ -475,7 +475,9 @@ public sealed partial class VfpInterpreter
         string full = Path.GetFullPath(path);
         // 5.5: drop any cached writer first — this opens an EXCLUSIVE writer (FileShare.None), which a
         // lingering Shared cached-writer handle would deny, and the index rewrite invalidates its state.
-        InvalidateCachedWriter(full);
+        // 5.13: force-close even a lock-pinned writer (else the EXCLUSIVE open throws) and re-take the lock
+        // after the rebuild, so an explicit RLOCK/FLOCK survives a REINDEX/INDEX.
+        ForceCloseCachedWriter(full);
         var reopen = Session.CloseAreasForPath(full);
         try
         {
@@ -487,6 +489,7 @@ public sealed partial class VfpInterpreter
             Session.ReopenAreas(reopen);
         }
         ResetMetaCachesForPath(path);
+        ReacquireHeldLocks(full);
     }
 
     /// <summary>Drop the cached record / index-order / key-range state of every open area riding
@@ -575,7 +578,9 @@ public sealed partial class VfpInterpreter
     /// pre-image had NO <c>.cdx</c> the freshly written one is DELETED (not left orphaned on disk).</summary>
     private void RollbackFiles(FileSnapshot pre, string path)
     {
-        InvalidateCachedWriter(path);   // 5.5: release the cached handle before File.WriteAllBytes rewrites the files.
+        // 5.5/5.13: release the cached handle before File.WriteAllBytes rewrites the files — force-closing
+        // even a lock-pinned writer so the rewrite is not silently blocked, then re-take the lock after.
+        ForceCloseCachedWriter(path);
         var reopen = Session.CloseAreasForPath(Path.GetFullPath(path));
         try
         {
@@ -589,6 +594,7 @@ public sealed partial class VfpInterpreter
             Session.ReopenAreas(reopen);
         }
         ResetMetaCachesForPath(path);
+        ReacquireHeldLocks(path);
     }
 
     // ─────────────────────────── SET COLLATE / SET KEY (microVFP P1 gap #1) ───────────────────────────

@@ -40,9 +40,11 @@ the rest of this project (byte-compatible reads/writes, the same Rushmore-optimi
 
 See **[the full function reference and VFP deviations](https://github.com/crossvault/foxDBF/blob/main/docs/04-microvfp-runtime.md)**
 in `docs/04-microvfp-runtime.md`. Honest limits worth knowing up front: `LOCATE`/`CONTINUE` parse but
-don't move the record pointer (use `SCAN`/`ENDSCAN`); `SET DATASESSION` is a single-session stub; and
-the interpreter-level `RLOCK()`/`FLOCK()` always succeed (a single in-process writer never contends —
-the underlying `CrossVault.FoxDbf` table API has the real byte-range locks).
+don't move the record pointer (use `SCAN`/`ENDSCAN`); `SET DATASESSION` is a single-session stub.
+`RLOCK()`/`LOCK()`/`FLOCK()`/`UNLOCK`/`ISRLOCKED()`/`ISFLOCKED()` take **real** VFP-byte-compatible
+byte-range locks on the live `.dbf` (honouring `SET REPROCESS` and `SET MULTILOCKS`), so a stored proc
+that coordinates via `RLOCK` is mutually exclusive with a concurrent VFP client — only the `SET REPROCESS
+TO … SECONDS` wait timing is approximated (a headless library cannot block a UI thread indefinitely).
 
 The rest of the VFP9 command surface (low-level file I/O, `LOCATE`/`CONTINUE` movement, multi-session
 `SET DATASESSION`) is being built out incrementally — this targets running real-world VFP9

@@ -90,9 +90,69 @@ public sealed partial class VfpInterpreter
     {
         if (path is null) return;
         string key = Path.GetFullPath(path);
-        if (_cachedWriters.Remove(key, out var w))
+        if (!_cachedWriters.TryGetValue(key, out var w)) return;
+        // 5.13: an explicit RLOCK/FLOCK lives on this handle. Disposing it here would SILENTLY drop the
+        // byte-range lock a stored proc is coordinating with — pin it instead. The lock is released only by
+        // UNLOCK / area close / CLEAR ALL / session dispose (which route through ReleaseAreaLocks/-AllLocks
+        // BEFORE disposal). A destructive rewrite that needed this invalidation cannot proceed while records
+        // are locked anyway — exactly as VFP refuses PACK/REINDEX on a shared table with held locks.
+        if (w.HasHeldLocks) return;
+        if (_cachedWriters.Remove(key, out w))
         {
             try { w.Dispose(); } catch { /* best-effort release */ }
+        }
+    }
+
+    /// <summary>
+    /// Force-dispose the cached writer for <paramref name="path"/> EVEN WHEN it holds an explicit
+    /// RLOCK/FLOCK byte-range lock — for an OUT-OF-BAND whole-file rewrite (a rollback
+    /// <see cref="RestoreSnapshot"/> / CANDIDATE-index <c>RollbackFiles</c> / an EXCLUSIVE index rebuild)
+    /// that DEPENDS on the OS handle actually closing: a pinned handle would make
+    /// <see cref="File.WriteAllBytes(string, byte[])"/> (FileShare.Read) or an <see cref="LockMode.Exclusive"/>
+    /// reopen (FileShare.None) throw a sharing violation — which the rewrite's <c>catch{}</c> would then
+    /// SWALLOW, silently no-op'ing the revert (finding 5.13). Unlike <see cref="InvalidateCachedWriter"/>
+    /// (whose <see cref="DbfWriter.HasHeldLocks"/> pin is correct ONLY for cached-writer churn), this closes
+    /// the handle so the rewrite can proceed; <see cref="DbfWriter.Dispose"/> releases the OS locks. The
+    /// interpreter still TRACKS the lock in <c>_areaLocks</c>, so the caller pairs this with
+    /// <see cref="ReacquireHeldLocks"/> AFTER the rewrite + area reopen to re-take the lock on a fresh handle —
+    /// the explicit lock stays logically held across the rewrite (never silently dropped).
+    /// </summary>
+    private void ForceCloseCachedWriter(string? path)
+    {
+        if (path is null) return;
+        string key = Path.GetFullPath(path);
+        if (_cachedWriters.Remove(key, out var w))
+        {
+            try { w.Dispose(); } catch { /* best-effort — Dispose releases held OS byte-range locks */ }
+        }
+    }
+
+    /// <summary>Re-take, on a FRESH cached writer, the explicit byte-range locks the interpreter still tracks
+    /// in <c>_areaLocks</c> for <paramref name="path"/> — the second half of the
+    /// <see cref="ForceCloseCachedWriter"/> out-of-band-rewrite protocol, run AFTER the rewrite + area reopen.
+    /// Best-effort per lock: should a foreign process have grabbed the byte in the tiny release→reacquire
+    /// window the re-take throws and is swallowed (the record is then genuinely not ours — the same net state
+    /// VFP reaches when it loses a byte). A whole-file (FLOCK) set re-takes only the file lock (it superseded
+    /// its records when acquired); a record set re-takes its record/header bytes.</summary>
+    private void ReacquireHeldLocks(string? path)
+    {
+        if (path is null || _areaLocks.Count == 0) return;
+        string key = Path.GetFullPath(path);
+        DbfWriter? w = null;
+        foreach (var set in _areaLocks.Values)
+        {
+            if (!set.Any || !SamePath(set.Path, key)) continue;
+            w ??= GetOrOpenCachedWriter(set.Path);
+            if (set.File)
+            {
+                try { w.LockFile(); } catch { /* lost the byte to a foreign holder — best-effort */ }
+            }
+            else
+            {
+                foreach (var rec in set.Records)
+                    try { if (rec == 0) w.LockHeader(); else w.Lock(rec); }
+                    catch { /* lost the byte to a foreign holder — best-effort */ }
+            }
         }
     }
 
@@ -106,8 +166,11 @@ public sealed partial class VfpInterpreter
         foreach (var wa in Session.OpenAreas)
             if (wa.Table.SourcePath is { } sp) live.Add(Path.GetFullPath(sp));
         List<string>? drop = null;
-        foreach (var key in _cachedWriters.Keys)
-            if (!live.Contains(key)) (drop ??= new()).Add(key);
+        foreach (var (key, w) in _cachedWriters)
+            // 5.13: never prune a writer that still holds an explicit RLOCK/FLOCK — the byte-range lock must
+            // outlive cached-writer churn (it is released by UNLOCK / close via ReleaseAreaLocks first, which
+            // drops the lock before the area leaves OpenAreas, so a genuinely closed file still prunes).
+            if (!live.Contains(key) && !w.HasHeldLocks) (drop ??= new()).Add(key);
         if (drop is null) return;
         foreach (var key in drop)
             if (_cachedWriters.Remove(key, out var w))

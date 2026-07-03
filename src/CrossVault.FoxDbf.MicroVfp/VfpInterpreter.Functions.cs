@@ -83,11 +83,14 @@ public sealed partial class VfpInterpreter
             case "ATAGINFO": r = VfpValue.Integer(FnATagInfo(a)); return true;
             case "LOOKUP": r = FnLookup(a); return true;
             case "SECONDS": r = VfpValue.Number(DateTime.Now.TimeOfDay.TotalSeconds); return true;
-            // Single-user model: there is no lock contention, so a lock is always granted (.T.). The
-            // SET REPROCESS TO 0 + ON-ERROR fail-fast branch (Runtime.LockFailFast) governs RETRY
-            // behaviour under contention, which this in-process interpreter never sees.
-            case "RLOCK": case "LOCK": case "FLOCK": r = VfpValue.Logical(true); return true;
-            case "ISRLOCKED": case "ISFLOCKED": r = VfpValue.Logical(false); return true;
+            // Finding 5.13: RLOCK/LOCK/FLOCK take a REAL VFP-byte-compatible byte-range lock on the area's
+            // live .dbf (via the Core DbfWriter surface) so a stored proc that coordinates via RLOCK is
+            // mutually exclusive with a concurrent VFP client — honouring SET REPROCESS + SET MULTILOCKS.
+            // ISRLOCKED/ISFLOCKED report OUR OWN held locks without taking one. See VfpInterpreter.Locking.
+            case "RLOCK": case "LOCK": r = FnRlock(a); return true;
+            case "FLOCK": r = FnFlock(a); return true;
+            case "ISRLOCKED": r = FnIsRlocked(a); return true;
+            case "ISFLOCKED": r = FnIsFlocked(a); return true;
             case "ALLT": r = VfpValue.Character((a.Length > 0 ? a[0].AsString : string.Empty).Trim(' ')); return true;
             case "OCCURS": r = VfpValue.Integer(FnOccurs(a)); return true;
             case "ATC": r = VfpValue.Integer(FnAtc(a)); return true;
@@ -231,6 +234,7 @@ public sealed partial class VfpInterpreter
             "ANSI" => VfpValue.Character(_ctx.Ansi ? "ON" : "OFF"),
             "COLLATE" => VfpValue.Character(_ctx.Collation?.Name ?? "MACHINE"),
             "UNIQUE" => VfpValue.Character(Runtime.Unique ? "ON" : "OFF"),
+            "MULTILOCKS" => VfpValue.Character(Runtime.Multilocks ? "ON" : "OFF"),
             "NEAR" => VfpValue.Character(_setNear ? "ON" : "OFF"),
             "NULL" => VfpValue.Character(_ctx.NullSetting ? "ON" : "OFF"),
             "AUTOSAVE" => VfpValue.Character(_setAutosave ? "ON" : "OFF"),
