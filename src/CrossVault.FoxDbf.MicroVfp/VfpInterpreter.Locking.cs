@@ -41,7 +41,9 @@ public sealed partial class VfpInterpreter
     // per-path cached DbfWriter (see class remarks); this tracks WHICH records / whole-file we hold so
     // ISRLOCKED/ISFLOCKED can report our own locks, MULTILOCKS OFF can release the previous record lock, and
     // the lifecycle hooks can release exactly what we own.
-    private readonly Dictionary<int, AreaLockSet> _areaLocks = new();
+    // Per-DATA-SESSION (5.14): byte-range lock bookkeeping belongs to the session's areas; non-readonly so a
+    // SET DATASESSION switch re-points it at the target session's locks (releasing a session frees its locks).
+    private Dictionary<int, AreaLockSet> _areaLocks = new();
 
     private sealed class AreaLockSet
     {

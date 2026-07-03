@@ -224,7 +224,7 @@ not a context-free default), and take precedence over any same-named generic fun
 
 ## Deviations from VFP
 
-microVFP runs real VFP9 `.prg` source, but it is a **headless, single-session interpreter for
+microVFP runs real VFP9 `.prg` source, but it is a **headless interpreter for
 business-logic stored procedures** — not a drop-in replacement for the full VFP9 IDE/runtime. The
 differences below are deliberate, verified simplifications, not bugs to be worked around:
 
@@ -256,8 +256,8 @@ differences below are deliberate, verified simplifications, not bugs to be worke
   rather than their real per-code VFP9 behavior. (`DBC()`, `CURSORGETPROP()`/`GETFLDSTATE()` used to
   be on this list — they now return real values; see [What's implemented](#whats-implemented).)
 
-The remaining VFP9 command surface (low-level file I/O, `LOCATE`/`CONTINUE` movement, multi-session
-`SET DATASESSION`, contested locking) is being built out incrementally, prioritized by what real
+The remaining VFP9 command surface (low-level file I/O, `LOCATE`/`CONTINUE` movement, contested
+locking) is being built out incrementally, prioritized by what real
 `.prg` business-logic corpora actually use — the goal is correctly running real-world stored
 procedures, not 100% language coverage on day one.
 

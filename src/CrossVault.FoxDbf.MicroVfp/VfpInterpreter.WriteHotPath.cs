@@ -41,7 +41,10 @@ public sealed partial class VfpInterpreter
     // Full-path → the persistent Shared writer open on that .dbf (autocommit / PRG-txn). Keyed by path (not
     // area) so USE..AGAIN siblings share ONE writer and its live _recordCount, and so a write through any
     // area on the file goes through the same handle. OrdinalIgnoreCase to match the session's path compares.
-    private readonly Dictionary<string, DbfWriter> _cachedWriters = new(StringComparer.OrdinalIgnoreCase);
+    // Per-DATA-SESSION (5.14): the cached writers carry the session's held byte-range locks, so they are
+    // swapped with the data session; non-readonly so a SET DATASESSION switch re-points it (and releasing a
+    // session disposes ITS writers, freeing the locks for another session to take).
+    private Dictionary<string, DbfWriter> _cachedWriters = new(StringComparer.OrdinalIgnoreCase);
 
     // Bounded parse/expression caches (short-lived session; a full Clear on overflow keeps them bounded
     // without LRU bookkeeping — a repeated source/expression stays hot, a stream of distinct ones just

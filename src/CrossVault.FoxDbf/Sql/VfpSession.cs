@@ -34,16 +34,42 @@ namespace CrossVault.FoxDbf.Sql;
 /// </summary>
 public sealed class VfpSession : IDisposable
 {
-    private readonly Dictionary<int, WorkArea> _areas = new();
-    /// <summary>Cursor alias → its backing temp-table <c>.dbf</c> path (each in its own temp directory).
-    /// A cursor created by <c>SELECT … INTO CURSOR</c> is a real temp table registered as a work area; its
-    /// files are deleted when the cursor is dropped (name reused) or the session is disposed.</summary>
-    private readonly Dictionary<string, string> _cursorPaths = new(StringComparer.OrdinalIgnoreCase);
-    private int _currentArea = 1; // VFP selects work area 1 by default.
+    // ── DATA SESSIONS (finding 5.14) ──────────────────────────────────────────────────────
+    // A DATA SESSION is an isolated set of work areas PLUS its own session-scoped SET/evaluation state.
+    // Session 1 (the default public session) is created in the ctor; a form-equivalent PRIVATE session is
+    // added by CreateDataSession, and SET DATASESSION TO n switches _active. Every existing work-area code
+    // path operates on _active unchanged (the maps/current-area are surfaced below under the old field names).
+    private sealed class DataSessionState
+    {
+        public readonly Dictionary<int, WorkArea> Areas = new();
+        /// <summary>Cursor alias → its backing temp-table <c>.dbf</c> path (each in its own temp directory).
+        /// A cursor created by <c>SELECT … INTO CURSOR</c> is a real temp table registered as a work area; its
+        /// files are deleted when the cursor is dropped (name reused) or the session is disposed.</summary>
+        public readonly Dictionary<string, string> CursorPaths = new(StringComparer.OrdinalIgnoreCase);
+        public int CurrentArea = 1; // VFP selects work area 1 by default.
+        public EvaluationContext Context; // this session's SET DELETED/EXACT/ANSI/COLLATE… state.
+        public DataSessionState(EvaluationContext context) => Context = context;
+    }
+
+    private readonly Dictionary<int, DataSessionState> _sessions = new();
+    private DataSessionState _active;
+    private int _currentSessionId = 1;
+    private int _nextSessionId = 2;
+
+    // The DATA SOURCE binding (open .dbc / directory) is SHARED across data sessions — a deliberate microVFP
+    // simplification (VFP scopes open databases per session; microVFP binds ONE data source per VfpSession and
+    // isolates at the work-area level, which is exactly what the per-session isolation model requires).
     private DbfDatabase? _db;
     private string? _dataDir;
     private string? _dbcPath;
     private bool _disposed;
+
+    // The ACTIVE session's swappable maps/current-area, surfaced under the ORIGINAL field names so every
+    // existing work-area code path (USE/SELECT/DML/SQL/buffering/locks) keeps operating on the active session
+    // untouched — SET DATASESSION just re-points _active.
+    private Dictionary<int, WorkArea> _areas => _active.Areas;
+    private Dictionary<string, string> _cursorPaths => _active.CursorPaths;
+    private int _currentArea { get => _active.CurrentArea; set => _active.CurrentArea = value; }
 
     /// <summary>Creates a session with VFP-default evaluation settings.</summary>
     public VfpSession() : this(null) { }
@@ -51,11 +77,13 @@ public sealed class VfpSession : IDisposable
     /// <summary>Creates a session carrying <paramref name="context"/> (or fresh VFP defaults).</summary>
     public VfpSession(EvaluationContext? context)
     {
-        Context = context ?? new EvaluationContext();
+        _active = new DataSessionState(context ?? new EvaluationContext());
+        _sessions[1] = _active;
     }
 
-    /// <summary>The ambient evaluation context (collation, SET DELETED, SET ANSI) the executor uses.</summary>
-    public EvaluationContext Context { get; }
+    /// <summary>The ambient evaluation context (collation, SET DELETED, SET ANSI) of the ACTIVE data session
+    /// — the executor and the interpreter read the current session's SET state through this.</summary>
+    public EvaluationContext Context => _active.Context;
 
     /// <summary>
     /// Raised at the START of <see cref="Dispose"/>, before any work-area handle is closed. A consumer that
@@ -165,6 +193,28 @@ public sealed class VfpSession : IDisposable
         // swaps/restores the live files, and a lingering interpreter lock handle on a live file would block
         // that writeback. Best-effort — a throwing subscriber never aborts the quiesce.
         try { HandlesClosing?.Invoke(); } catch { /* best-effort */ }
+        // 5.14: tear down EVERY data session's work-area handles, not just the ACTIVE one. An ADO.NET COW
+        // transaction Commit/Rollback quiesces the WHOLE VfpSession here before it swaps each private copy over
+        // its live file; a NON-active PRIVATE session (CreateDataSession) holding an open handle on that .dbf
+        // would otherwise block the File.Replace writeback (or leave that session reading torn content). This
+        // mirrors Dispose()'s per-session teardown, minus the data-source binding + cursor temp tables, which a
+        // quiesce keeps — tables re-open lazily on the next access, in whichever session accesses them.
+        foreach (var s in _sessions.Values)
+        {
+            foreach (var w in s.Areas.Values) w.Dispose();
+            s.Areas.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Close (dispose) only the CURRENT data session's work-area handles — the microVFP <c>CLEAR ALL</c> /
+    /// <c>CLOSE ALL</c> teardown, which in VFP is scoped to the CURRENT data session (a form's PRIVATE session
+    /// keeps its tables open when the default session issues CLEAR ALL). Unlike <see cref="CloseAllHandles"/>
+    /// (the whole-VfpSession transaction-quiesce boundary) this touches neither other data sessions nor the
+    /// <see cref="HandlesClosing"/> subscribers; the data-source binding is kept.
+    /// </summary>
+    internal void CloseActiveAreas()
+    {
         foreach (var w in _areas.Values) w.Dispose();
         _areas.Clear();
     }
@@ -190,6 +240,72 @@ public sealed class VfpSession : IDisposable
     /// <summary>The full path of the open VFP database container (<c>.dbc</c>), or <see langword="null"/>
     /// in free-table (directory) mode. Backs the microVFP <c>ADATABASES()</c> array-filler.</summary>
     internal string? DatabasePath => _dbcPath;
+
+    // ---- data sessions (finding 5.14) -----------------------------------------------------
+
+    /// <summary>The id of the CURRENT (active) data session — the numeric <c>SET("DATASESSION")</c>.
+    /// 1 is the default public session.</summary>
+    public int CurrentDataSessionId => _currentSessionId;
+
+    /// <summary>Every existing data-session id, ascending (the <c>ASESSIONS()</c> list). Always includes 1.</summary>
+    public IReadOnlyList<int> DataSessionIds
+    {
+        get { var ids = new List<int>(_sessions.Keys); ids.Sort(); return ids; }
+    }
+
+    /// <summary>True when data session <paramref name="id"/> exists (<c>SET DATASESSION TO n</c> is valid iff so).</summary>
+    public bool HasDataSession(int id) => _sessions.ContainsKey(id);
+
+    /// <summary>
+    /// Create a new (form-equivalent PRIVATE) data session with its OWN empty work-area set and the supplied
+    /// fresh SET/evaluation <paramref name="context"/>; returns the new id. Does NOT switch to it — the caller
+    /// (the microVFP host API / <c>SET DATASESSION TO</c>) switches separately. VFP itself only ever creates a
+    /// private session from a form with <c>DataSession=2</c>; this is microVFP's headless equivalent.
+    /// </summary>
+    public int CreateDataSession(EvaluationContext context)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(context);
+        int id = _nextSessionId++;
+        _sessions[id] = new DataSessionState(context);
+        return id;
+    }
+
+    /// <summary>Switch the ACTIVE data session to <paramref name="id"/> (<c>SET DATASESSION TO n</c>). Throws
+    /// when the id does not exist — the caller maps that to VFP error 1540 "Session number is invalid."</summary>
+    public void SwitchDataSession(int id)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_sessions.TryGetValue(id, out var s))
+            throw new FoxDbfSqlException($"Data session {id} does not exist.") { VfpErrorNumber = 1540 };
+        _active = s;
+        _currentSessionId = id;
+    }
+
+    /// <summary>
+    /// Release data session <paramref name="id"/>: close (dispose) its work-area handles — releasing the
+    /// byte-range locks those areas took (5.13 lifetime rules extend naturally) — and delete its cursor temp
+    /// tables, then drop it. Session 1 is permanent; the caller must switch away from a session before
+    /// releasing it. A no-op when the id does not exist.
+    /// </summary>
+    public void ReleaseDataSession(int id)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (id == 1)
+            throw new InvalidOperationException("The default data session (1) cannot be released.");
+        if (id == _currentSessionId)
+            throw new InvalidOperationException($"Cannot release the CURRENT data session {id}; switch away first.");
+        if (!_sessions.Remove(id, out var s)) return;
+        foreach (var w in s.Areas.Values) w.Dispose();
+        s.Areas.Clear();
+        foreach (var p in s.CursorPaths.Values) TryDeleteCursorFiles(p);
+        s.CursorPaths.Clear();
+    }
+
+    /// <summary>Every open work area of data session <paramref name="id"/> (backs <c>AUSED(arr, n)</c>);
+    /// empty when the session does not exist.</summary>
+    internal IReadOnlyCollection<WorkArea> OpenAreasOf(int id)
+        => _sessions.TryGetValue(id, out var s) ? s.Areas.Values : Array.Empty<WorkArea>();
 
     // ---- data sources ---------------------------------------------------------------------
 
@@ -802,11 +918,16 @@ public sealed class VfpSession : IDisposable
         // Let subscribers (the microVFP interpreter's cached write handles) release their own handles first,
         // while the session is otherwise intact. Best-effort — never let a subscriber abort teardown.
         try { Disposing?.Invoke(); } catch { /* best-effort */ }
-        foreach (var w in _areas.Values) w.Dispose();
-        _areas.Clear();
-        // Drop every cursor's backing temp table (close handle above, then delete the temp dirs).
-        foreach (var p in _cursorPaths.Values) TryDeleteCursorFiles(p);
-        _cursorPaths.Clear();
+        // Tear down EVERY data session (5.14): the active one plus any private sessions still open.
+        foreach (var s in _sessions.Values)
+        {
+            foreach (var w in s.Areas.Values) w.Dispose();
+            s.Areas.Clear();
+            // Drop every cursor's backing temp table (close handle above, then delete the temp dirs).
+            foreach (var p in s.CursorPaths.Values) TryDeleteCursorFiles(p);
+            s.CursorPaths.Clear();
+        }
+        _sessions.Clear();
         _db?.Dispose();
     }
 

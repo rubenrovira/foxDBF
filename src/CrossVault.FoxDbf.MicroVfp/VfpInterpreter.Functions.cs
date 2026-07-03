@@ -240,7 +240,7 @@ public sealed partial class VfpInterpreter
             "AUTOSAVE" => VfpValue.Character(_setAutosave ? "ON" : "OFF"),
             "RELATION" => VfpValue.Character(RelationSetString(Session.CurrentArea)),  // reproduces the SET RELATION args.
             "SKIP" => VfpValue.Character(SkipSetString(Session.CurrentArea)),          // comma-list of 1:n aliases.
-            "DATASESSION" => VfpValue.Number(1m),   // NUMERIC (verified vs vfp9.exe) — single public session.
+            "DATASESSION" => VfpValue.Number((decimal)Session.CurrentDataSessionId),   // NUMERIC (verified vs vfp9.exe) — the current data-session id (5.14).
             // SET("DATABASE") — the current DBC's NAME only (no drive/path/extension), "" when none current.
             "DATABASE" => VfpValue.Character(CurrentDbPath() is { Length: > 0 } p ? Path.GetFileNameWithoutExtension(p) : string.Empty),
             "TALK" => VfpValue.Character("OFF"),
@@ -683,12 +683,13 @@ public sealed partial class VfpInterpreter
     }
 
     /// <summary>AUSED(ArrayName [, nDataSessionId]) — fill (nAreas × 2) [alias, work-area number] for every
-    /// open work area (ordered by area number), or return 0 when none is open. Single data session, so the
-    /// optional session id is ignored (backlog C.7).</summary>
+    /// open work area (ordered by area number) of the given data session (5.14; default = the current
+    /// session), or return 0 when that session has none open / does not exist.</summary>
     private int FnAUsed(VfpValue[] a)
     {
         if (a.Length == 0) return 0;
-        var areas = new List<VfpSession.WorkArea>(Session.OpenAreas);
+        int sid = a.Length >= 2 && IsNumeric(a[1]) ? (int)a[1].AsNumber : Session.CurrentDataSessionId;
+        var areas = new List<VfpSession.WorkArea>(Session.OpenAreasOf(sid));
         if (areas.Count == 0) return 0;
         areas.Sort((x, y) => x.Area.CompareTo(y.Area));
         var arr = Memory.RedimOrCreateArray(a[0].AsString, areas.Count, 2);
@@ -700,14 +701,15 @@ public sealed partial class VfpInterpreter
         return areas.Count;
     }
 
-    /// <summary>ASESSIONS(ArrayName) — fill a 1-D array with the open data-session ids. microVFP is a SINGLE
-    /// data session (see the SET DATASESSION stub), so this is always [1] with a return of 1 (backlog C.1).</summary>
+    /// <summary>ASESSIONS(ArrayName) — fill a 1-D array with the existing data-session ids, ascending (5.14).
+    /// Always at least [1] (the default public session); grows as CreateDataSession adds private sessions.</summary>
     private int FnASessions(VfpValue[] a)
     {
         if (a.Length == 0) return 0;
-        var arr = Memory.RedimOrCreateArray(a[0].AsString, 1, 0);
-        arr.SetLinear(1, VfpValue.Integer(1));
-        return 1;
+        var ids = Session.DataSessionIds;   // ascending; always includes 1.
+        var arr = Memory.RedimOrCreateArray(a[0].AsString, ids.Count, 0);
+        for (int i = 0; i < ids.Count; i++) arr.SetLinear(i + 1, VfpValue.Integer(ids[i]));
+        return ids.Count;
     }
 
     private VfpValue FnCoCreateGuid()

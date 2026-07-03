@@ -35,7 +35,9 @@ public sealed partial class VfpInterpreter
 {
     private readonly Dictionary<string, ProcDef> _procs = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, VfpValue> _defines = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<int, AreaMeta> _meta = new();
+    // Per-DATA-SESSION (5.14): the record-pointer/relation/order/buffering/LOCATE state, swapped by
+    // SET DATASESSION. Non-readonly so a session switch can re-point it at the target session's map.
+    private Dictionary<int, AreaMeta> _meta = new();
     private readonly List<CallContext> _callStack = new();
 
     // CANDIDATE tags are byte-identical to plain tags on disk for a FREE table (no DBC index catalog), so
@@ -66,12 +68,16 @@ public sealed partial class VfpInterpreter
     internal const int MaxCallDepthErrorNumber = 1809;
 
     private readonly Row _row;
-    private readonly EvaluationContext _ctx;
+    // Per-DATA-SESSION (5.14): the ACTIVE session's SET DELETED/EXACT/ANSI/COLLATE… context. Aliases
+    // Session.Context; re-pointed on SET DATASESSION. Non-readonly so a switch can mirror the new session.
+    private EvaluationContext _ctx;
 
     // ── transactions (snapshot-and-restore over the live DBC tables; see §Transaktionen) ──
     private sealed class TxnFrame { public readonly Dictionary<string, FileSnapshot> Snaps = new(StringComparer.OrdinalIgnoreCase); }
     private sealed class FileSnapshot { public string Path = ""; public byte[]? Dbf; public byte[]? Cdx; public byte[]? Fpt; }
-    private readonly List<TxnFrame> _txn = new();
+    // Per-DATA-SESSION (5.14): a PRG transaction stack is scoped to its data session, so a BEGIN TRANSACTION
+    // in one session never snapshots/rolls back another session's writes. Non-readonly so a switch re-points it.
+    private List<TxnFrame> _txn = new();
 
     // ── SET NEAR (per data-session; microVFP INDEX/ORDER MODEL) ──
     // When ON, a failed SEEK leaves the pointer on the record just past where the key would sort
@@ -124,9 +130,17 @@ public sealed partial class VfpInterpreter
         _ctx.Deleted = true;
         _ctx.Encoding ??= Encoding.Latin1; // CHR()/ASC() byte-consistency for createId/newguid.
         _callStack.Add(new CallContext("(main)", Array.Empty<VfpValue>(), 0));
+        // 5.14: register the DEFAULT data session (id 1) — its interpreter-side state (record pointers, locks,
+        // cached writers, PRG transactions, per-session SETs) IS the live fields above; SET DATASESSION swaps
+        // these in lockstep with the VfpSession work-area bundle. See VfpInterpreter.DataSession.
+        _interpSessions[1] = new InterpSessionState
+        {
+            Meta = _meta, AreaLocks = _areaLocks, CachedWriters = _cachedWriters, Txn = _txn,
+        };
         // 5.5: release the per-area cached write handles when the session is disposed (callers dispose the
-        // session, not the interpreter), so no .dbf stays locked past the session's life.
-        Session.Disposing += DisposeAllCachedWriters;
+        // session, not the interpreter), so no .dbf stays locked past the session's life. 5.14: this now
+        // covers EVERY data session's writers, not just the active one.
+        Session.Disposing += DisposeCachedWritersAllSessions;
         // 5.13: an ADO.NET copy-on-write transaction Commit/Rollback QUIESCES the session (CloseAllHandles)
         // right before it swaps each private copy over the live file. A byte-range lock (RLOCK/FLOCK) an SP
         // took inside the transaction rides a cached writer on the LIVE file (coordination happens there);
@@ -136,14 +150,35 @@ public sealed partial class VfpInterpreter
         Session.HandlesClosing += ReleaseLocksAndWritersOnQuiesce;
     }
 
-    // 5.13 quiesce hook (see ctor): drop the interpreter's held locks + cached writers so a transaction
-    // Commit/Rollback can write back the live files. ReleaseAllLocks clears the _areaLocks bookkeeping (so a
-    // later ISRLOCKED reports .F.) and releases the OS ranges off the cached writers; DisposeAllCachedWriters
-    // then closes the handles themselves.
+    // 5.13/5.14 quiesce hook (see ctor): drop the interpreter's held locks + cached writers so a transaction
+    // Commit/Rollback can write back the live files. 5.14 — do it for EVERY data session, not just the ACTIVE
+    // one: a NON-active PRIVATE session (CreateDataSession) that took a byte-range lock / cached writer on a
+    // .dbf the imminent File.Replace targets would otherwise block the writeback (and keep ISRLOCKED .T.). For
+    // each session we release the byte ranges off its cached writers, clear its AreaLocks bookkeeping (so
+    // ISRLOCKED reports .F. in that session after the quiesce), then dispose the cached writers themselves
+    // (closing the OS handle). The ACTIVE session's InterpSessionState aliases the live _areaLocks/_cachedWriters,
+    // so it is covered by the same loop — single-session behaviour is byte-identical to the old two-call form.
     private void ReleaseLocksAndWritersOnQuiesce()
     {
-        ReleaseAllLocks();
-        DisposeAllCachedWriters();
+        foreach (var st in _interpSessions.Values)
+        {
+            foreach (var set in st.AreaLocks.Values)
+            {
+                if (st.CachedWriters.TryGetValue(set.Path, out var w))
+                {
+                    foreach (var rec in set.Records) UnlockOne(w, rec);
+                    if (set.File) { try { w.UnlockFile(); } catch { /* best-effort byte-range release */ } }
+                }
+                set.Records.Clear();
+                set.File = false;
+            }
+            st.AreaLocks.Clear();
+            foreach (var w in st.CachedWriters.Values)
+            {
+                try { w.Dispose(); } catch { /* best-effort — Dispose releases any OS lock still on the handle */ }
+            }
+            st.CachedWriters.Clear();
+        }
     }
 
     /// <summary>The data session the interpreter runs over (work areas, USE/SELECT, resolution, DML).</summary>
@@ -769,7 +804,7 @@ public sealed partial class VfpInterpreter
             case "NEAR": _setNear = OnOff(arg); break;          // failed-SEEK pointer parking; SET("NEAR").
             case "NULL": _ctx.NullSetting = OnOff(arg); break;  // CREATE/ALTER TABLE default nullability; SET("NULL").
             case "AUTOSAVE": _setAutosave = OnOff(arg); break;  // header-buffer flush policy; SET("AUTOSAVE").
-            case "DATASESSION": SetDataSession(arg); break;     // single-session stub; TO 1 no-op, else err 1540.
+            case "DATASESSION": SetDataSession(arg); break;     // 5.14: SWITCH the active data session; TO current no-op, TO 0/non-existent → err 1540.
             case "DATABASE": SetDatabase(arg); break;           // current-DBC designation; feeds DBC()/SET("DATABASE").
             default: break; // TALK / COMPATIBLE / DATA / PROCEDURE / … — irrelevant to results.
         }
@@ -777,20 +812,23 @@ public sealed partial class VfpInterpreter
 
     private static bool OnOff(string s) => s.Trim().StartsWith("ON", StringComparison.OrdinalIgnoreCase);
 
-    // SET DATASESSION TO n — in real VFP this switches among data sessions, but private data sessions
-    // only ever come from forms (DataSession=2); a bare PRG/SP interpreter has just the default public
-    // session #1. So this is a faithful single-session stub: TO 1 is a no-op; ANY other id (0, 5, …) is
-    // an invalid session → VFP error 1540 "Session number is invalid." (verified against vfp9.exe:
-    // SET("DATASESSION") is NUMERIC 1; TO 1 ok; TO 0 and TO 5 both raise 1540). SET("DATASESSION")=1 is
-    // returned by FnSet. Full multi-session work-area registry is the deferred P3 architecture item.
+    // SET DATASESSION TO n — SWITCH the active data session (5.14). VFP only ever CREATES a private session
+    // from a form (DataSession=2); microVFP's headless equivalent is the host API CreateDataSession(). This
+    // handler only SWITCHES among sessions that already exist: TO the current id is a no-op (so TO 1 while on
+    // session 1 stays a no-op — the oracle-pinned fact); TO an existing id switches; TO 0 / a non-existent id
+    // raises VFP error 1540 "Session number is invalid." (also oracle-pinned). SET("DATASESSION") returns the
+    // numeric current id via FnSet. Isolation is real: work areas, record pointers, orders, relations,
+    // buffering, LOCATE state, byte-range locks and the session-scoped SETs all swap with the session.
     private void SetDataSession(string arg)
     {
         string s = arg.Trim();
         if (s.StartsWith("TO", StringComparison.OrdinalIgnoreCase)) s = s.Substring(2).Trim();
         var v = EvalText(s);
         int n = IsNumeric(v) ? (int)v.AsNumber : int.TryParse(v.AsString, out var p) ? p : -1;
-        if (n == 1) return;   // the only session microVFP has → no-op.
-        throw new MicroVfpRuntimeException("Session number is invalid.", 1540);   // VFP error 1540.
+        if (n == Session.CurrentDataSessionId) return;   // TO the current session → no-op.
+        if (n < 1 || !Session.HasDataSession(n))
+            throw new MicroVfpRuntimeException("Session number is invalid.", 1540);   // VFP error 1540.
+        SwitchDataSession(n);
     }
 
     // SET DATABASE TO [name]. With NO name → clear the current-database designation (DBC()/SET("DATABASE")
@@ -948,7 +986,8 @@ public sealed partial class VfpInterpreter
                 Memory.ClearAll();
                 ReleaseAllLocks();            // 5.13: CLEAR ALL = UNLOCK ALL + close everything (release byte-range locks).
                 DisposeAllCachedWriters();    // 5.5: CLEAR ALL closes every file — release cached writers too.
-                Session.CloseAllHandles();   // close every open work area (keeps the data-source binding).
+                Session.CloseActiveAreas();  // 5.14: CLEAR ALL is scoped to the CURRENT data session (NOT the
+                                             // all-sessions transaction-quiesce CloseAllHandles); keeps the binding.
                 _meta.Clear();               // drop the per-area record pointers/relations too.
                 _currentDbCleared = true;    // CLEAR ALL closes all files incl. databases ⇒ DBC()/SET("DATABASE")="".
                 break;
