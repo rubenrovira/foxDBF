@@ -94,6 +94,27 @@ public sealed class VfpSession : IDisposable
     internal Func<string, string>? TxBeginWritePath { get; set; }
 
     /// <summary>
+    /// COPY-ON-WRITE canonicalization hook installed by an active ADO.NET transaction: given a resolved
+    /// <c>.dbf</c> path that may be one of the transaction's PRIVATE working copies, return the LIVE path it
+    /// copies (else the path unchanged). Lets <see cref="ReopenAreaTable"/> recover a redirected work area's
+    /// live identity so it can re-resolve the DBC member (long field names) and re-apply the read redirect
+    /// when refreshing the handle. <see langword="null"/> in autocommit.
+    /// </summary>
+    internal Func<string, string>? TxLivePath { get; set; }
+
+    /// <summary>
+    /// WRITE redirect for a DIRECT writer (the microVFP interpreter opens its own <c>DbfWriter</c> on a
+    /// table's <c>SourcePath</c> rather than going through <see cref="OpenWritableTarget"/>). Inside a
+    /// transaction this engages the SAME <see cref="TxBeginWritePath"/> seam the raw DML path uses — lazily
+    /// taking the table's private working copy on first write and returning the COPY path so the write lands
+    /// there (ISOLATION / rollback-able). Idempotent when handed a path that is already a private copy.
+    /// Returns the path unchanged in autocommit, so EnforceRules=off / non-transactional writes are
+    /// byte-identical.
+    /// </summary>
+    internal string RedirectWritePath(string dbfPath)
+        => TxBeginWritePath is { } beginWrite ? beginWrite(dbfPath) : dbfPath;
+
+    /// <summary>
     /// DDL snapshot-on-live hook installed by an active ADO.NET transaction. CREATE / ALTER / DROP
     /// operate on the LIVE files (so the transacting connection sees the table created / dropped / altered
     /// within the transaction); this captures the live files first so a Rollback restores them (or, for
@@ -404,11 +425,17 @@ public sealed class VfpSession : IDisposable
         string? path = w.Table.SourcePath;
         if (path is null) return;
 
+        // COPY-ON-WRITE: inside a transaction the area may already be riding a private working copy. Recover
+        // the LIVE path first so the DBC-member match (below) and the free-table resolution work off the real
+        // identity, then re-apply the READ redirect so the refreshed handle opens the COPY (read-your-writes).
+        // Both hooks are null in autocommit, leaving the reopen byte-identical.
+        string livePath = TxLivePath is { } toLive ? toLive(path) : path;
+
         DbfTable dbf;
         string? objectName = null;
         if (_db is not null)
         {
-            string full = Path.GetFullPath(path);
+            string full = Path.GetFullPath(livePath);
             foreach (var t in _db.TableNames)
             {
                 var p = _db.GetTablePath(t);
@@ -416,12 +443,13 @@ public sealed class VfpSession : IDisposable
                 { objectName = t; break; }
             }
         }
+        string readPath = TxRedirectReadPath is { } redirect ? redirect(livePath) : livePath;
         dbf = objectName is not null
-            ? _db!.OpenTable(objectName)
-            : DbfTable.Open(path, new DbfOptions { LockMode = w.Exclusive ? Write.LockMode.Exclusive : Write.LockMode.Shared });
+            ? _db!.OpenTableAt(objectName, readPath)
+            : DbfTable.Open(readPath, new DbfOptions { LockMode = w.Exclusive ? Write.LockMode.Exclusive : Write.LockMode.Shared });
 
         CdxFile? cdx = null;
-        string cdxPath = Path.ChangeExtension(path, ".cdx");
+        string cdxPath = Path.ChangeExtension(readPath, ".cdx");
         if (File.Exists(cdxPath))
         {
             try { cdx = CdxFile.Open(cdxPath, dbf); }

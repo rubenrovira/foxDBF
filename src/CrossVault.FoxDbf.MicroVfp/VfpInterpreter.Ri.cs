@@ -231,7 +231,11 @@ public sealed partial class VfpInterpreter
         int savedCur = Session.CurrentArea;
         foreach (var r in reopen)
         {
-            Session.Use(r.TablePath ?? r.Alias, r.Area, r.Alias, again: false, exclusive: r.Excl, noUpdate: r.NoUpd);
+            // Inside an ADO.NET transaction the captured TablePath is the private COPY; canonicalize it back to
+            // the LIVE path so Use re-resolves the DBC member (long field names) and re-applies the read
+            // redirect onto the copy. In autocommit TxLivePath is null → the path is used unchanged.
+            string? reopenTarget = r.TablePath is { } tp && Session.TxLivePath is { } toLive ? toLive(tp) : r.TablePath;
+            Session.Use(reopenTarget ?? r.Alias, r.Area, r.Alias, again: false, exclusive: r.Excl, noUpdate: r.NoUpd);
             _meta[r.Area] = new AreaMeta
             {
                 Order = r.Order, Buffering = r.Buffering, Buf = r.Buf,
@@ -260,6 +264,34 @@ public sealed partial class VfpInterpreter
             Session.ReopenAreaTable(a);
             if (_meta.TryGetValue(a, out var mm)) { mm.Cached = null; mm.Ordered = null; }
         }
+    }
+
+    /// <summary>
+    /// Engage the ADO.NET COPY-ON-WRITE transaction seam for a table the interpreter is about to write to
+    /// DIRECTLY (via its own short-lived <see cref="DbfWriter"/>), returning the path the writer must open.
+    /// <para>
+    /// Inside a <c>FoxDbfTransaction</c> this lazily takes the table's private working copy on FIRST write —
+    /// the SAME <c>TxBeginWritePath</c> seam the raw DML path uses via <c>OpenWritableTarget</c> — and repoints
+    /// every open work area on the live file at the copy (read-your-writes), then returns the COPY path. From
+    /// then on the caller's <c>path</c> is the copy, so EVERY downstream file touch in the same op — the
+    /// pre-image snapshots (<see cref="CaptureSnapshot"/> for a trigger-abort revert, <see cref="SnapshotForTxn"/>
+    /// for a PRG <c>BEGIN TRANSACTION</c> frame), the <see cref="DbfWriter"/>, the read-your-writes
+    /// <see cref="ReopenFileAreas"/>, and any <see cref="RestoreSnapshot"/> — all operate on the copy. The two
+    /// snapshot layers therefore compose rather than fight: the interpreter's own transaction/trigger-abort
+    /// reverts happen WITHIN the copy, and the outer COW transaction commits or discards the copy as a whole.
+    /// </para>
+    /// <para>
+    /// In autocommit (no active transaction — including EnforceRules=off and every direct-interpreter test)
+    /// the live path is returned unchanged and no area is reopened, so the write path is byte-identical.
+    /// </para>
+    /// </summary>
+    private string BeginTxWrite(string path)
+    {
+        if (Session.TxBeginWritePath is null) return path;   // autocommit — unchanged.
+        string writePath = Session.RedirectWritePath(path);  // live → private copy (idempotent for a copy path).
+        if (!SamePath(writePath, path))
+            ReopenFileAreas(path);                            // repoint the live-riding area(s) at the copy.
+        return writePath;
     }
 
 }

@@ -79,6 +79,20 @@ public sealed class FoxDbfTransaction : DbTransaction
         return _copies.TryGetValue(full, out var wc) ? wc.CopyDbfPath : liveDbfPath;
     }
 
+    /// <summary>CANONICALIZE a resolved <c>.dbf</c> path back to the table's LIVE path: given one of this
+    /// transaction's PRIVATE working-copy paths return the live file it copies; given anything else (a live
+    /// path, or an untracked table) return it unchanged. Lets a caller holding a work area that is already
+    /// riding a private copy (its <see cref="System.IO.Path"/>-form <c>SourcePath</c> is the copy) recover the
+    /// live identity so it can re-resolve the DBC member (long field names) and re-apply the read redirect.</summary>
+    internal string LivePathOf(string dbfPath)
+    {
+        string full = Path.GetFullPath(dbfPath);
+        foreach (var wc in _copies.Values)
+            if (string.Equals(Path.GetFullPath(wc.CopyDbfPath), full, StringComparison.OrdinalIgnoreCase))
+                return wc.LiveDbfPath;
+        return dbfPath;
+    }
+
     /// <summary>WRITE redirect: ensure the table backing <paramref name="liveDbfPath"/> has a private
     /// working copy (created lazily, once per table, with the live change-token recorded) and return the
     /// COPY's <c>.dbf</c> path the writer should open — so the live file is never touched. A table the
@@ -94,6 +108,15 @@ public sealed class FoxDbfTransaction : DbTransaction
 
         // Already copied — reuse the same private copy (idempotent per table).
         if (_copies.TryGetValue(full, out var existing)) return existing.CopyDbfPath;
+
+        // IDEMPOTENT when handed a path that IS ALREADY one of our private copies: the microVFP interpreter
+        // resolves a direct write's path from its (possibly already-redirected) open work area, so on the
+        // SECOND+ write to a table it passes the copy path back in — return it unchanged rather than taking
+        // a copy-of-a-copy. (The raw DML path never hits this: it re-resolves the LIVE path from the table
+        // NAME on every write, so it always passes a live path.)
+        foreach (var owned in _copies.Values)
+            if (string.Equals(Path.GetFullPath(owned.CopyDbfPath), full, StringComparison.OrdinalIgnoreCase))
+                return owned.CopyDbfPath;
 
         // A table being created/altered/dropped via DDL is operated on the LIVE files; write in place.
         if (_ddlSnapshots.ContainsKey(full)) return liveDbfPath;

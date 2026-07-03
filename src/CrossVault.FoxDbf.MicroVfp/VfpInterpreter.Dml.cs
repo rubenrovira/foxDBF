@@ -75,7 +75,11 @@ public sealed partial class VfpInterpreter
         }
 
         int area = wa.Area;
-        string? path = wa.Table.SourcePath;
+        // COPY-ON-WRITE seam (ADO.NET transaction): take the table's private copy BEFORE snapshotting so the
+        // pre-image, the row append (Session.Execute re-enters the SAME seam via the table name), the trigger's
+        // read-your-writes and a trigger-abort RestoreSnapshot all operate on the copy — isolated + rollback-
+        // able. No-op in autocommit (the live path is returned unchanged).
+        string? path = wa.Table.SourcePath is { } sp ? BeginTxWrite(sp) : null;
         FileSnapshot? snap = path is not null ? CaptureSnapshot(path) : null;   // pre-image for the rollback.
 
         try { Session.Execute(ins.Sql); }
@@ -114,6 +118,13 @@ public sealed partial class VfpInterpreter
 
         var path = wa.Table.SourcePath;
         if (path is null) return;
+
+        // COPY-ON-WRITE seam (ADO.NET transaction): redirect this direct write onto the table's private
+        // working copy — the SAME seam the raw DML path uses — so an EnforceRules=on UPDATE / RI-cascade
+        // child REPLACE is isolated and rolled back, instead of escaping to the live file. From here `path`
+        // is the copy, so the snapshots / writer / reopen below all operate on it. No-op in autocommit.
+        path = BeginTxWrite(path);
+        wa = Session.AreaAt(area) ?? wa;   // BeginTxWrite may have reopened the area on the copy.
 
         // ATOMICITY (P3b): when a bound UPDATE trigger will auto-fire, the parent key change must be
         // REVERTIBLE — the parent write lands first (so the trigger reads the NEW key via the current
@@ -203,6 +214,9 @@ public sealed partial class VfpInterpreter
         if (recIndex < 0 || recIndex >= wa.Table.RecordCount) return;
         var path = wa.Table.SourcePath;
         if (path is null) return;
+        // COPY-ON-WRITE seam (ADO.NET transaction): a DELETE/RECALL mark (incl. an RI-delete-cascade child
+        // DELETE) lands on the table's private copy so it is isolated + rollback-able. No-op in autocommit.
+        path = BeginTxWrite(path);
         SnapshotForTxn(path);
         using (var writer = DbfWriter.Open(path, new DbfOptions { LockMode = LockMode.Shared }))
         {
@@ -363,6 +377,10 @@ public sealed partial class VfpInterpreter
         }
 
         if (rows.Count == 0) return;
+        // COPY-ON-WRITE seam (ADO.NET transaction): redirect the bulk append onto the target table's private
+        // working copy so a stored-proc APPEND FROM inside a FoxDbfTransaction is isolated + rolled back
+        // instead of landing rows on the live .dbf. No-op in autocommit / EnforceRules=off (path unchanged).
+        targetPath = BeginTxWrite(targetPath);
         SnapshotForTxn(targetPath);
         using (var writer = DbfWriter.Open(targetPath, new DbfOptions { LockMode = LockMode.Shared }))
         {
@@ -557,6 +575,11 @@ public sealed partial class VfpInterpreter
         var wa = Session.AreaAt(area);
         string? path = wa?.Table.SourcePath;
         if (wa is null || path is null) return;
+        // COPY-ON-WRITE seam (ADO.NET transaction): PACK physically truncates/compacts the .dbf/.fpt/.cdx —
+        // an irreversible destructive op. Redirect it onto the table's private working copy so a stored-proc
+        // PACK inside a FoxDbfTransaction hits the copy (Rollback discards it, restoring the deleted rows)
+        // instead of the live file. No-op in autocommit / EnforceRules=off (path returned unchanged).
+        path = BeginTxWrite(path);
         string full = Path.GetFullPath(path);
 
         SnapshotForTxn(path);

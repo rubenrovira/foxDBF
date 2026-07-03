@@ -158,7 +158,14 @@ public sealed partial class VfpInterpreter
             throw new MicroVfpRuntimeException("TABLEUPDATE(): the current work area is not buffered.");
         if (m.Buf is null) return true;                        // buffering enabled, nothing pending → .T.
         var wa = Session.AreaAt(area);
-        if (wa?.Table.SourcePath is not string path) return true;
+        if (wa?.Table.SourcePath is not string livePath) return true;
+        // COPY-ON-WRITE seam (ADO.NET transaction): redirect the buffered commit onto the table's private
+        // working copy on FIRST write — the SAME seam ExecReplace/WriteFlag use — so a stored-proc
+        // CURSORSETPROP('Buffering',n>1)+REPLACE/DELETE/INSERT+TABLEUPDATE() inside a FoxDbfTransaction is
+        // isolated + rolled back instead of escaping to the live .dbf/.fpt/.cdx. No-op in autocommit, so
+        // EnforceRules=off / non-transactional buffering stays byte-identical.
+        string path = BeginTxWrite(livePath);
+        wa = Session.AreaAt(area) ?? wa;                        // BeginTxWrite may have reopened the area on the copy.
         var buf = m.Buf;
         bool ok = true;
         _inBufferCommit = true;
@@ -239,8 +246,13 @@ public sealed partial class VfpInterpreter
                      ?? (SafeParseSql(ae.Stmt.Sql) as InsertStatement)?.Table;
         if (table is null) return false;
         var wa = Session.FindAreaByAlias(table);
-        if (wa?.Table.SourcePath is not string path) return false;
+        if (wa?.Table.SourcePath is not string livePath) return false;
         int area = wa.Area;
+        // COPY-ON-WRITE seam: a buffered INSERT committed here (TABLEUPDATE / row-buffer auto-commit) must
+        // land on the table's private working copy inside a FoxDbfTransaction — mirror ExecInsert's redirect.
+        // No-op in autocommit, so the non-transactional buffered append stays byte-identical.
+        string path = BeginTxWrite(livePath);
+        wa = Session.AreaAt(area) ?? wa;                        // BeginTxWrite may have reopened the area on the copy.
 
         // Row built from the pre-evaluated field values; an omitted column gets the type's real blank.
         var vals = new object?[wa.Table.Columns.Count];
@@ -353,7 +365,12 @@ public sealed partial class VfpInterpreter
         if (_inBufferCommit) return;   // internal moves DURING a commit must not re-trigger the auto-commit.
         if (!_meta.TryGetValue(area, out var m) || (m.Buffering != 2 && m.Buffering != 3) || m.Buf is null) return;
         var wa = Session.AreaAt(area);
-        if (wa?.Table.SourcePath is not string path) return;
+        if (wa?.Table.SourcePath is not string livePath) return;
+        // COPY-ON-WRITE seam: a row-buffer pointer-move auto-commit is a real write — redirect it onto the
+        // table's private working copy inside a FoxDbfTransaction (mirrors CommitBuffer/ExecReplace). No-op
+        // in autocommit, so the non-transactional row-buffer auto-commit stays byte-identical.
+        string path = BeginTxWrite(livePath);
+        wa = Session.AreaAt(area) ?? wa;                        // BeginTxWrite may have reopened the area on the copy.
         int rec = m.RecNo, rcTable = wa.Table.RecordCount;
         _inBufferCommit = true;
         try

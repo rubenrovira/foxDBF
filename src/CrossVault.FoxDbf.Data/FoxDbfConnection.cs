@@ -692,6 +692,7 @@ public sealed class FoxDbfConnection : DbConnection
         // DDL still snapshots the live files so a rollback restores them.
         _session!.TxRedirectReadPath = tx.RedirectReadPath;
         _session!.TxBeginWritePath = tx.BeginWritePath;
+        _session!.TxLivePath = tx.LivePathOf;
         _session!.TxDdlSnapshot = tx.DdlSnapshot;
         return tx;
     }
@@ -714,6 +715,7 @@ public sealed class FoxDbfConnection : DbConnection
             {
                 _session.TxRedirectReadPath = null;
                 _session.TxBeginWritePath = null;
+                _session.TxLivePath = null;
                 _session.TxDdlSnapshot = null;
             }
         }
