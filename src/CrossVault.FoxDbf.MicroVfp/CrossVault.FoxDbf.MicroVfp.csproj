@@ -9,9 +9,6 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <!-- PackageId intentionally differs from AssemblyName/RootNamespace (CrossVault.FoxDbf.MicroVfp) -
-         "CrossVault.microVFP" is the public-facing package name. -->
-    <PackageId>CrossVault.microVFP</PackageId>
     <Version>0.7.0</Version>
     <Authors>CrossVault</Authors>
     <Company>CrossVault</Company>
@@ -40,7 +37,9 @@
     <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Internal" />
     <!-- The ADO.NET provider reads interpreter state (Memory) for SP results/EnforceRules; the
          interpreter internals are deliberately NOT public API (finding 5.11) - same sibling-IVT
-         pattern Core already uses for Data. Decoupling via a public seam is tracked as 5.12. -->
+         pattern Core already uses for Data. DECIDED (review finding 5.12, 2026-07-03): the hard
+         Data->MicroVfp dependency is DELIBERATE (the interpreter is core product value, SP calls +
+         EnforceRules work out of the box); no separate adapter package. -->
     <InternalsVisibleTo Include="CrossVault.FoxDbf.Data" />
   </ItemGroup>
 

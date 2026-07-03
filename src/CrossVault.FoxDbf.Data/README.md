@@ -3,7 +3,7 @@
 An **ADO.NET data provider** for Visual FoxPro / dBase tables and database containers. Query
 FoxPro/dBase data from Dapper, raw ADO.NET, reporting tools and LINQPad — using SQL. Depends on
 [CrossVault.FoxDbf](https://www.nuget.org/packages/CrossVault.FoxDbf) (core + SQL engine) and
-[CrossVault.microVFP](https://www.nuget.org/packages/CrossVault.microVFP) (stored-procedure/UDF
+[CrossVault.FoxDbf.MicroVfp](https://www.nuget.org/packages/CrossVault.FoxDbf.MicroVfp) (stored-procedure/UDF
 execution via `EnforceRules`) — both are pulled in automatically as NuGet dependencies.
 
 ## Quick start
@@ -55,7 +55,7 @@ metadata collections.
 ## Stored procedures, UDFs, and opt-in rule enforcement
 
 With a `.dbc` open, the provider runs the container's stored procedures / UDFs on the embedded
-[microVFP](https://www.nuget.org/packages/CrossVault.microVFP) interpreter (sharing the connection's
+[microVFP](https://www.nuget.org/packages/CrossVault.FoxDbf.MicroVfp) interpreter (sharing the connection's
 work-area session):
 
 ```csharp

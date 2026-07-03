@@ -1,6 +1,6 @@
 # CrossVault.FoxDbf.MicroVfp
 
-Published as **[CrossVault.microVFP](https://www.nuget.org/packages/CrossVault.microVFP)** — a
+Published as **[CrossVault.FoxDbf.MicroVfp](https://www.nuget.org/packages/CrossVault.FoxDbf.MicroVfp)** — a
 minimal, embeddable **Visual FoxPro 9 stored-procedure interpreter**. It runs real VFP9 `.prg`
 source (the kind you'd extract from a database container's stored procedures, or write by hand)
 directly in .NET, with no Visual FoxPro runtime installed.

@@ -3,7 +3,7 @@
 **What you'll do:** parse and run real VFP9 `.prg` source — a self-contained snippet, a file of
 `PROCEDURE`/`FUNCTION` definitions, or the stored procedures embedded in a `.dbc`.
 
-`CrossVault.microVFP` is a **tree-walking interpreter**: it parses `.prg` text into an AST once,
+`CrossVault.FoxDbf.MicroVfp` is a **tree-walking interpreter**: it parses `.prg` text into an AST once,
 then executes it against a live [`VfpSession`](03-sql-and-ado-net.md) — so table access inside your
 `.prg` code (`USE`, `SEEK`, `SCAN`, `REPLACE`, …) runs on the exact same engine as everything else
 in this project.

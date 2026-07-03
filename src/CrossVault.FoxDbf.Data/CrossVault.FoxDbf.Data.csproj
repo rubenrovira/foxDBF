@@ -38,7 +38,7 @@
     <ProjectReference Include="..\CrossVault.FoxDbf\CrossVault.FoxDbf.csproj" />
     <!-- microVFP interpreter: the provider runs stored procedures / UDFs and (opt-in EnforceRules)
          enforces the DBC's DEFAULT/RULE/TRIGGER on writes through it. Normal reference -> nuspec
-         dependency on the published CrossVault.microVFP package. -->
+         dependency on the published CrossVault.FoxDbf.MicroVfp package. -->
     <ProjectReference Include="..\CrossVault.FoxDbf.MicroVfp\CrossVault.FoxDbf.MicroVfp.csproj" />
     <!-- Data uses Expressions types directly (IVfpCollation/EvaluationContext in the conn-string
          mapping). Expressions is bundled in the Core package (no standalone package), so reference it

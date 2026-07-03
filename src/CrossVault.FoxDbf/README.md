@@ -10,7 +10,7 @@ and the real VFP9 runtime).
 Need SQL from Dapper/ADO.NET/reporting tools instead of the raw API below? Use
 **[CrossVault.FoxDbf.Data](https://www.nuget.org/packages/CrossVault.FoxDbf.Data)** (the ADO.NET
 provider built on this package). Need to run VFP9 stored-procedure `.prg` business logic? Use
-**[CrossVault.microVFP](https://www.nuget.org/packages/CrossVault.microVFP)**.
+**[CrossVault.FoxDbf.MicroVfp](https://www.nuget.org/packages/CrossVault.FoxDbf.MicroVfp)**.
 
 ## Features
 

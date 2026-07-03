@@ -14,7 +14,7 @@ No native dependencies, no COM/OLE DB interop, no Visual FoxPro IDE required —
 |---|---|
 | **[CrossVault.FoxDbf](src/CrossVault.FoxDbf/README.md)** | The core: read/write `.dbf`/`.fpt`/`.cdx`/`.dbc`, the VFP expression engine, a Rushmore-style query optimizer, a SQL parser + executor, and the opt-in Highlike performance accelerator. Everything below builds on this. |
 | **[CrossVault.FoxDbf.Data](src/CrossVault.FoxDbf.Data/README.md)** | An ADO.NET data provider (`DbConnection`/`DbCommand`/`DbDataReader`, plus `DbDataSource` and `DbBatch`) — use FoxPro/dBase data from Dapper, raw ADO.NET, reporting tools, LINQPad. Runs a `.dbc`'s stored procedures/UDFs, and can opt in (`EnforceRules`) to the full VFP write model (DEFAULTs/RULEs/RI triggers) on writes. |
-| **[CrossVault.microVFP](src/CrossVault.FoxDbf.MicroVfp/README.md)** | A minimal, embeddable interpreter for real VFP9 `.prg` stored-procedure/business-logic code — for when you just need to *run* FoxPro logic, not a full data provider. |
+| **[CrossVault.FoxDbf.MicroVfp](src/CrossVault.FoxDbf.MicroVfp/README.md)** | A minimal, embeddable interpreter for real VFP9 `.prg` stored-procedure/business-logic code — for when you just need to *run* FoxPro logic, not a full data provider. |
 
 `CrossVault.FoxDbf.Expressions` (the shared expression engine) has [its own README](src/CrossVault.FoxDbf.Expressions/README.md)
 but isn't published separately — it ships bundled inside `CrossVault.FoxDbf`.
@@ -39,7 +39,7 @@ byte-compatibly with what a real VFP9 install would produce, without requiring V
                 ┌────────────────────┼────────────────────┐
                 │                                          │
    ┌────────────▼─────────────┐               ┌────────────▼─────────────┐
-   │  CrossVault.FoxDbf.Data   │               │     CrossVault.microVFP   │
+   │  CrossVault.FoxDbf.Data   │               │     CrossVault.FoxDbf.MicroVfp   │
    │   (ADO.NET provider)      │──────────────▶│  (VFP9 .prg interpreter)  │
    └───────────────────────────┘   uses for     └───────────────────────────┘
                                   stored procs

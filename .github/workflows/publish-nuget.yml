@@ -1,6 +1,6 @@
 name: Publish NuGet packages
 
-# Publishes the 3 public packages (CrossVault.FoxDbf, CrossVault.FoxDbf.Data, CrossVault.microVFP)
+# Publishes the 3 public packages (CrossVault.FoxDbf, CrossVault.FoxDbf.Data, CrossVault.FoxDbf.MicroVfp)
 # to nuget.org using Trusted Publishing (OIDC) — no long-lived API key stored as a GitHub secret.
 # See https://learn.microsoft.com/nuget/nuget-org/trusted-publishing.
 #
