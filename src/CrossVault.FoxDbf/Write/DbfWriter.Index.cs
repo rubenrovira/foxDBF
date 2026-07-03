@@ -23,10 +23,24 @@ public sealed partial class DbfWriter
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(definition);
 
+        // FAST PATH (project-review 5.6): append the NEW tag as its OWN pages at the cdx file end and wire it
+        // in with a single tag-directory INSERT — the SIBLING tags are neither re-read nor rewritten. Only the
+        // new tag needs a table scan (unavoidable). REPLACING an existing name unlinks the old tag first.
+        string cdx = ExistingCdxPath();
+        if (File.Exists(cdx) && TryFastAppendTag(cdx, definition, evalContext, includeDeleted))
+        {
+            EnsureStructuralCdxAdvertised();
+            InvalidateTagComputerCache();
+            return;
+        }
+
+        // FALLBACK / FIRST tag: whole-file build (also the byte-exact single-tag golden path). Preserves the
+        // corrupt-sidecar guard in ReadExistingTagDefinitions (never rebuild-from-nothing and wipe real tags).
         var tags = ReadExistingTagDefinitions();
         tags.RemoveAll(t => string.Equals(t.Name, definition.Name, StringComparison.OrdinalIgnoreCase));
         tags.Add(definition);
         RebuildStructuralCdx(tags, evalContext, includeDeleted);
+        InvalidateTagComputerCache();
     }
 
     /// <summary>
@@ -73,6 +87,16 @@ public sealed partial class DbfWriter
         ArgumentNullException.ThrowIfNull(cdxPath);
         ArgumentNullException.ThrowIfNull(definition);
 
+        // FAST PATH (project-review 5.6): append the new tag's pages + splice its directory entry, leaving
+        // sibling tags untouched. Falls back to the whole-file rebuild for a legacy / unreadable sidecar.
+        if (File.Exists(cdxPath) && TryFastAppendTag(cdxPath, definition, evalContext, includeDeleted))
+        {
+            if (structural)
+                EnsureStructuralCdxAdvertised();
+            InvalidateTagComputerCache();
+            return;
+        }
+
         var tags = ReadTagDefinitionsFrom(cdxPath);
         tags.RemoveAll(t => string.Equals(t.Name, definition.Name, StringComparison.OrdinalIgnoreCase));
         tags.Add(definition);
@@ -80,12 +104,9 @@ public sealed partial class DbfWriter
         Flush();
         var rows = MaterializeRows();
         CdxIndexBuilder.Build(cdxPath, _schema, rows, tags, evalContext, includeDeleted);
-        if (structural && !_hasStructuralCdx)
-        {
-            SetStructuralCdxFlag();
-            _hasStructuralCdx = true;
-            _usesStructuralScheme = VfpLock.UsesStructuralScheme(_version.Code, true);
-        }
+        if (structural)
+            EnsureStructuralCdxAdvertised();
+        InvalidateTagComputerCache();
     }
 
     /// <summary>
@@ -101,30 +122,59 @@ public sealed partial class DbfWriter
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(cdxPath);
 
-        var tags = ReadTagDefinitionsFrom(cdxPath);
-        if (tags.Count == 0)
+        var existing = ReadTagDefinitionsFrom(cdxPath);
+        if (existing.Count == 0)
             return 0;
 
-        if (names is null)
-            tags.Clear();                                   // DELETE TAG ALL
-        else
-            tags.RemoveAll(t => names.Any(n => string.Equals(n, t.Name, StringComparison.OrdinalIgnoreCase)));
-
-        if (tags.Count == 0)
+        // Partition the current tags into survivors vs the ones the caller named (creation order preserved).
+        List<CdxTagDefinition> survivors;
+        List<string> toRemove;
+        bool everyRequestedExists;
+        if (names is null)                                  // DELETE TAG ALL
         {
+            survivors = new List<CdxTagDefinition>();
+            toRemove = existing.Select(t => t.Name).ToList();
+            everyRequestedExists = true;
+        }
+        else
+        {
+            bool Named(CdxTagDefinition t) => names.Any(n => string.Equals(n, t.Name, StringComparison.OrdinalIgnoreCase));
+            survivors = existing.Where(t => !Named(t)).ToList();
+            toRemove = existing.Where(Named).Select(t => t.Name).ToList();
+            everyRequestedExists = names.All(n => existing.Any(t => string.Equals(n, t.Name, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        if (survivors.Count == 0)
+        {
+            // Removing the LAST tag deletes the file (VFP behaviour); a structural sidecar also clears the DBF
+            // header structural bit. (Unchanged from the whole-rebuild path.)
             try { if (File.Exists(cdxPath)) File.Delete(cdxPath); } catch { /* best-effort */ }
             if (structural && _hasStructuralCdx)
             {
                 ClearStructuralCdxFlag();
                 _hasStructuralCdx = false;
             }
+            InvalidateTagComputerCache();
             return 0;
         }
 
+        // FAST PATH (project-review 5.6): unlink each named tag's directory entry and abandon its pages — the
+        // surviving tags are neither re-read nor rewritten, and NO table row is materialized. Taken only when
+        // every requested name actually exists (else fall back, which also matches today's silent-ignore of a
+        // non-existent tag) and the sidecar is a fast-editable standard compound index.
+        if (everyRequestedExists && toRemove.Count > 0 && TryFastUnlinkTags(cdxPath, toRemove))
+        {
+            InvalidateTagComputerCache();
+            return survivors.Count;
+        }
+
+        // FALLBACK (whole-file rebuild of the survivors from live rows) — today's behaviour, kept for a legacy /
+        // unreadable sidecar and for a delete that names a non-existent tag.
         Flush();
         var rows = MaterializeRows();
-        CdxIndexBuilder.Build(cdxPath, _schema, rows, tags, evalContext, includeDeleted);
-        return tags.Count;
+        CdxIndexBuilder.Build(cdxPath, _schema, rows, survivors, evalContext, includeDeleted);
+        InvalidateTagComputerCache();
+        return survivors.Count;
     }
 
     /// <summary>Read the tag definitions currently in the compound <c>.cdx</c> at
@@ -261,12 +311,196 @@ public sealed partial class DbfWriter
         // DBF header (byte 28 bit 0) so a real VFP runtime auto-opens it on USE, and flip the writer's
         // own _hasStructuralCdx/_usesStructuralScheme so a subsequent Pack/Zap correctly invalidates
         // (deletes + ReindexNeeded) the now-owned sidecar instead of early-returning and leaving it stale.
-        if (!_hasStructuralCdx)
+        EnsureStructuralCdxAdvertised();
+    }
+
+    // ---- incremental tag-DDL fast paths (project-review 5.6) --------------------
+
+    /// <summary>The tag-directory key length (10-byte tag names) and its space pad — the standard compound-index
+    /// directory scheme the fast paths edit in place.</summary>
+    private const int DirKeyLen = 10;
+    private const byte DirPad = 0x20;
+
+    /// <summary>Test seam (project-review 5.6 structural guard): when set, <see cref="MaterializeRows"/> throws.
+    /// The DELETE-TAG fast path must complete WITHOUT ever reading table rows, so a test can arm this and prove
+    /// the fast path never materializes (while a whole-file rebuild — REINDEX / the fallback — would throw).</summary>
+    internal bool FailMaterializeRowsForTests { get; set; }
+
+    /// <summary>Advertise the structural <c>.cdx</c> in the DBF header (byte 28 bit 0) and flip the writer's own
+    /// tracking so a later Pack/Zap correctly invalidates it — the shared tail of every structural tag-build
+    /// path. No-op when the sidecar is already advertised.</summary>
+    private void EnsureStructuralCdxAdvertised()
+    {
+        if (_hasStructuralCdx)
+            return;
+        SetStructuralCdxFlag();
+        _hasStructuralCdx = true;
+        _usesStructuralScheme = VfpLock.UsesStructuralScheme(_version.Code, true);
+    }
+
+    /// <summary>Drop the cached per-tag key computers after any tag DDL — a tag's DEFINITION may have changed
+    /// (REPLACE), been added or removed, so incremental write-path maintenance must re-derive them from the
+    /// fresh on-disk headers rather than trust a stale name-keyed cache.</summary>
+    private void InvalidateTagComputerCache() => _tagComputers = null;
+
+    /// <summary>
+    /// Try to add (or REPLACE) tag <paramref name="def"/> in the compound <c>.cdx</c> at <paramref name="cdxPath"/>
+    /// WITHOUT rewriting the sibling tags (project-review 5.6): probe the tag directory, scan the table ONCE for
+    /// only the new tag's keys, build just that tag's pages, append them at the file end and splice its directory
+    /// entry in via <see cref="CdxTreeEditor"/>. When the name already exists it is UNLINKED first (its pages are
+    /// abandoned — dead pages are acceptable; REINDEX compacts). Returns <see langword="true"/> on success;
+    /// <see langword="false"/> (caller falls back to a whole-file rebuild, which OVERWRITES the file and heals any
+    /// partial edit) when the sidecar is not a fast-editable standard compound index. A genuine truncated-table
+    /// throw from <see cref="MaterializeRows"/> propagates (as it does today) rather than silently falling back.
+    /// </summary>
+    private bool TryFastAppendTag(string cdxPath, CdxTagDefinition def, EvaluationContext? evalContext, bool includeDeleted)
+    {
+        // Probe the directory read-only FIRST so a legacy / unreadable sidecar falls back before the table scan.
+        List<(string Name, long HeaderOffset)>? dir;
+        try
         {
-            SetStructuralCdxFlag();
-            _hasStructuralCdx = true;
-            _usesStructuralScheme = VfpLock.UsesStructuralScheme(_version.Code, true);
+            using var probe = new FileStream(cdxPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            dir = ReadDirectoryEntries(probe);
         }
+        catch { return false; }
+        if (dir is null)
+            return false;
+
+        // ONE table scan for THIS tag's keys (the win is NOT rewriting the siblings). A truncated-table throw
+        // here surfaces to the caller exactly as the whole-file path would (both refuse to index a partial table).
+        Flush();
+        var rows = MaterializeRows();
+
+        try
+        {
+            using var rw = new FileStream(cdxPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+            long baseOffset = rw.Length;
+            if (baseOffset <= 0 || baseOffset % IndexFile.PageSize != 0)
+                return false;   // not a page-aligned compound index → fall back
+
+            var block = CdxIndexBuilder.BuildTagBlock(_schema, rows, def, baseOffset, evalContext, includeDeleted);
+            rw.Seek(baseOffset, SeekOrigin.Begin);
+            rw.Write(block.Pages, 0, block.Pages.Length);
+            rw.Flush();
+
+            // Recno geometry for the DIRECTORY leaf is sized from the DATA (the largest existing tag-header byte
+            // offset — the directory's "recnos" ARE header offsets), NOT from rw.Length: the just-appended block
+            // (and unrelated 5.1 row-append maintenance) can push the file past an 8-bit band without the
+            // directory needing a wider record field, and an rw.Length basis would then re-pack the directory
+            // leaf one byte-per-entry WIDER (project-review 5.6 MUST-FIX — silent sibling loss on the REPLACE
+            // unlink). The new entry's own (larger) offset is folded in by LeafGeometry on the Insert, which
+            // SPLITS safely if it must; the Delete only ever narrows, so it can never overflow.
+            long basis = DirectoryRecnoBasis(dir);
+            byte[] nameKey = CdxIndexBuilder.DirectoryKey(def.Name);
+            using (var editor = new CdxTreeEditor(rw))
+            {
+                var old = dir.FirstOrDefault(e => string.Equals(e.Name, def.Name, StringComparison.OrdinalIgnoreCase));
+                if (old.Name is not null)
+                    editor.Delete(0, nameKey, (uint)old.HeaderOffset, DirKeyLen, DirPad, basis);  // REPLACE: unlink old
+                editor.Insert(0, nameKey, (uint)block.HeaderOffset, DirKeyLen, DirPad, basis);
+                editor.Flush();
+            }
+            return true;
+        }
+        catch
+        {
+            // A mid-splice failure leaves at most dead appended pages + a possibly half-edited directory; the
+            // caller's full rebuild OVERWRITES the whole file and heals it. Signal fallback.
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Try to UNLINK every tag in <paramref name="removeNames"/> from the compound <c>.cdx</c> at
+    /// <paramref name="cdxPath"/> by deleting its tag-directory entry (via <see cref="CdxTreeEditor"/>) and
+    /// abandoning its pages — WITHOUT reading any table row or touching the surviving tags (project-review 5.6).
+    /// Returns <see langword="true"/> on success; <see langword="false"/> (caller falls back to a whole-file
+    /// rebuild) when the sidecar is not a fast-editable standard compound index or a requested tag is not present
+    /// in the directory. Never materializes table rows on the success path.
+    /// </summary>
+    private static bool TryFastUnlinkTags(string cdxPath, IReadOnlyList<string> removeNames)
+    {
+        FileStream? rw = null;
+        try
+        {
+            rw = new FileStream(cdxPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+            var dir = ReadDirectoryEntries(rw);
+            if (dir is null)
+                return false;
+
+            var targets = new List<(byte[] Key, uint Recno)>(removeNames.Count);
+            foreach (var nm in removeNames)
+            {
+                var hit = dir.FirstOrDefault(e => string.Equals(e.Name, nm, StringComparison.OrdinalIgnoreCase));
+                if (hit.Name is null)
+                    return false;   // a requested tag is not in the directory → fall back (matches today)
+                targets.Add((CdxIndexBuilder.DirectoryKey(nm), (uint)hit.HeaderOffset));
+            }
+
+            // Size the directory leaf's recno field from the DATA (max tag-header offset), NOT rw.Length — the
+            // file may have grown past an 8-bit band via unrelated 5.1 row-append maintenance with the directory
+            // untouched, and an rw.Length basis would re-pack the leaf one byte-per-entry WIDER, overflowing a
+            // near-full directory leaf and silently losing surviving tags (project-review 5.6 MUST-FIX). Header
+            // offsets never move, so this basis can only leave the delete re-pack equal-or-narrower.
+            long basis = DirectoryRecnoBasis(dir);
+            using (var editor = new CdxTreeEditor(rw))
+            {
+                foreach (var (key, recno) in targets)
+                    editor.Delete(0, key, recno, DirKeyLen, DirPad, basis);
+                editor.Flush();
+            }
+            return true;
+        }
+        catch { return false; }
+        finally { rw?.Dispose(); }
+    }
+
+    /// <summary>
+    /// The recno-geometry basis for a DIRECTORY-leaf edit: the LARGEST tag-header byte offset the directory must
+    /// represent (a directory entry's "recno" IS that tag's header offset). Deriving the compact-leaf record
+    /// field width from the DATA — not from the FILE LENGTH — is what keeps a tag-directory unlink/insert safe:
+    /// the cdx grows past 8-bit record-field bands (256B / 64KiB / 16MiB / 4GiB of length) via UNRELATED 5.1
+    /// row-append maintenance that never edits the directory, so an <c>rw.Length</c> basis would re-pack the
+    /// directory leaf one byte-per-entry WIDER and overflow a near-full leaf on a delete — silently dropping
+    /// surviving tags (project-review 5.6 MUST-FIX). Tag-header offsets never move once written, so this basis
+    /// never exceeds the geometry the leaf was last packed with: a delete re-pack stays equal-or-narrower (never
+    /// overflows), and an insert folds the new (possibly larger) offset in via <see cref="CdxTreeEditor"/>'s own
+    /// split-safe path. Floored at 1 so an empty directory still yields a valid single-byte field.
+    /// </summary>
+    private static long DirectoryRecnoBasis(IEnumerable<(string Name, long HeaderOffset)> dir)
+    {
+        long basis = 1;
+        foreach (var (_, headerOffset) in dir)
+            if (headerOffset > basis)
+                basis = headerOffset;
+        return basis;
+    }
+
+    /// <summary>Read the compound-index tag directory over <paramref name="stream"/> as (tag name → header byte
+    /// offset) pairs, or <see langword="null"/> when the file is not a fast-editable STANDARD compound index
+    /// (directory key length ≠ 10, unreadable, or no tags) — the signal for the tag-DDL fast paths to fall back
+    /// to a whole-file rebuild. Reads only index pages; never touches the table.</summary>
+    private static List<(string Name, long HeaderOffset)>? ReadDirectoryEntries(FileStream stream)
+    {
+        try
+        {
+            using var index = IndexFile.Open(stream, leaveOpen: true);
+            var fileHeader = index.ReadCdxHeader(0);
+            if (fileHeader.KeyLength != DirKeyLen)
+                return null;   // not the 10-byte tag-name directory scheme → not fast-editable here
+            var result = new List<(string, long)>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (headerOffset, nameBytes) in
+                     IndexTraversal.EnumerateCompact(index, fileHeader.Root, fileHeader.KeyLength, isCharacter: true))
+            {
+                string name = TrimName(nameBytes);
+                if (name.Length == 0 || !seen.Add(name))
+                    continue;
+                result.Add((name, headerOffset));
+            }
+            return result.Count == 0 ? null : result;
+        }
+        catch { return null; }
     }
 
     /// <summary>
@@ -297,6 +531,10 @@ public sealed partial class DbfWriter
     /// </summary>
     private List<CdxIndexBuilder.BuildRow> MaterializeRows()
     {
+        if (FailMaterializeRowsForTests)
+            throw new InvalidOperationException(
+                "Injected MaterializeRows fault (test seam): a fast tag-DDL path must not read table rows.");
+
         int count = _recordCount;
         var rows = new List<CdxIndexBuilder.BuildRow>(count);
         var buffer = new byte[_recordLength];

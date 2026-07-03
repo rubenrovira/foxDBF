@@ -122,6 +122,51 @@ internal static class CdxIndexBuilder
         File.WriteAllBytes(cdxPath, sink.ToArray());
     }
 
+    // ---- single-tag append (project-review 5.6: page-level CREATE-TAG fast path) ------------------
+
+    /// <summary>One tag's on-disk pages (header + expression pool + compact B-tree) as a CONTIGUOUS block ready
+    /// to APPEND at <see cref="HeaderOffset"/> (the block's first byte), plus that header byte offset — the unit
+    /// the incremental CREATE-TAG fast path splices onto a live compound <c>.cdx</c> without rewriting siblings.</summary>
+    internal readonly record struct TagBlock(byte[] Pages, long HeaderOffset);
+
+    /// <summary>
+    /// Build ONLY the pages for the single tag <paramref name="def"/> over <paramref name="rows"/>, laid out to
+    /// sit at file offset <paramref name="baseByteOffset"/> (which MUST be page-aligned — the end of a valid
+    /// <c>.cdx</c> always is): a header page, its expression-pool page, then the tag's compact B-tree. Returns
+    /// the contiguous block plus the tag's header byte offset. Reuses the EXACT same per-tag plan, tree
+    /// bulk-loader and header/pool writers as the whole-file <see cref="Build"/>, so an appended tag reads back
+    /// byte-identical to one a fresh build would place at the same page position — the win is that the SIBLING
+    /// tags are never touched. The caller appends the block, then inserts the tag's directory entry
+    /// (name → header offset) via <see cref="CdxTreeEditor"/>.
+    /// </summary>
+    internal static TagBlock BuildTagBlock(DbfTable schema, IReadOnlyList<BuildRow> rows, CdxTagDefinition def,
+        long baseByteOffset, EvaluationContext? evalContext, bool includeDeleted)
+    {
+        if (baseByteOffset < 0 || baseByteOffset % Page != 0)
+            throw new ArgumentException($"CDX append base offset {baseByteOffset} is not page-aligned.", nameof(baseByteOffset));
+
+        var plan = PlanTag(schema, rows, def, evalContext, includeDeleted);
+        var sink = new PageSink((int)(baseByteOffset / Page));
+
+        int headerIndex = sink.Reserve();   // tag header page (absolute page index == basePage)
+        sink.Reserve();                      // its expression-pool page
+        long headerOffset = (long)headerIndex * Page;
+
+        uint treeRoot = BuildTree(sink, () => sink.Reserve(), plan.Entries, plan.KeyLen, plan.Pad, isDataTag: true, plan.Geom);
+
+        WriteHeaderCommon(sink.At(headerIndex), root: treeRoot, keyLen: plan.KeyLen, options: plan.Options,
+            signature: plan.Signature, sortOrder: plan.SortOrder, descending: plan.Descending,
+            keyExpr: plan.KeyExpr, forExpr: plan.ForExpr);
+        WriteExpressionPool(sink, headerOffset, plan.KeyExpr, plan.ForExpr);
+
+        return new TagBlock(sink.ToArray(), headerOffset);
+    }
+
+    /// <summary>The 10-byte, space-padded tag-directory key for <paramref name="name"/> — the exact bytes the
+    /// compound-index directory tree sorts and stores. Shared with the incremental tag-DDL fast paths so an
+    /// unlink/insert targets the same key bytes the bulk builder wrote.</summary>
+    internal static byte[] DirectoryKey(string name) => MakeNameKey(name);
+
     // ---- per-tag build ---------------------------------------------------------
 
     /// <summary>The fully resolved plan for one tag: its sorted entries, leaf geometry, page
@@ -797,8 +842,17 @@ internal static class CdxIndexBuilder
     private sealed class PageSink
     {
         private readonly List<byte[]> _pages = new();
-        public int Reserve() { _pages.Add(new byte[Page]); return _pages.Count - 1; }
-        public byte[] At(int index) => _pages[index];
+        private readonly int _basePage;
+
+        /// <summary>A sink whose first reserved page is ABSOLUTE page index <paramref name="basePage"/> — 0 for
+        /// a whole-file <see cref="Build"/>, or the append base for a single-tag block (<see cref="BuildTagBlock"/>).
+        /// <see cref="Reserve"/> hands out absolute page indices and <see cref="At"/> maps them back, so the B-tree
+        /// bulk-loader emits correct ABSOLUTE byte offsets whether it lays down page 0 of a fresh file or a block
+        /// appended at the end of an existing one.</summary>
+        public PageSink(int basePage = 0) { _basePage = basePage; }
+
+        public int Reserve() { _pages.Add(new byte[Page]); return _basePage + _pages.Count - 1; }
+        public byte[] At(int index) => _pages[index - _basePage];
         public byte[] ToArray()
         {
             var buf = new byte[_pages.Count * Page];

@@ -289,8 +289,22 @@ internal sealed class CdxTreeEditor : IDisposable
                 return new DeleteResult { Emptied = true };
             }
 
-            // Removal never overflows → exactly one leaf image.
-            var img = CdxIndexBuilder.PackLeafImages(entries, keyLen, pad, recnoBasis)[0];
+            // A removal FREES space, so with a correctly-sized recnoBasis the leaf re-packs into exactly ONE
+            // image. But an OVERSIZED recnoBasis (a record count — or, historically, a file length — that crossed
+            // an 8-bit band since this leaf was last packed) widens BytesPerEntry and can push a near-full leaf
+            // over a page: PackLeafImages then returns MULTIPLE images. Taking image[0] and dropping the rest
+            // would SILENTLY LOSE entries — e.g. sibling tags in the compound-index directory tree
+            // (project-review 5.6 MUST-FIX). The pack precedes every page write, so THROW here, before any
+            // WritePage, leaving the on-disk tree untouched by this node: the tag-DDL fast paths catch it and
+            // fall back to a consistent whole-file rebuild; the 5.1 row-maintenance path catches it and durably
+            // invalidates + REINDEXes. Callers pass a DATA-derived (non-oversized) basis, so this is a
+            // belt-and-braces guard rather than a normal code path.
+            var imgs = CdxIndexBuilder.PackLeafImages(entries, keyLen, pad, recnoBasis);
+            if (imgs.Count > 1)
+                throw new InvalidOperationException(
+                    $"CDX leaf delete re-packed into {imgs.Count} pages (recno geometry widened past the packed " +
+                    "leaf); refusing to drop entries — the caller must fall back to a full rebuild.");
+            var img = imgs[0];
             PatchSiblings(img.Page, left ?? NoPtr, right ?? NoPtr);
             PatchRoot(img.Page, isRoot);
             WritePage(nodeOff, img.Page);
