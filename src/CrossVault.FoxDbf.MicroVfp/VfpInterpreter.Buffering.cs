@@ -119,12 +119,29 @@ public sealed partial class VfpInterpreter
             if (!FireDmlTrigger(RiEvent.Delete, area)) return false;
         }
 
+        // The buffered field NAMES this commit writes — for the record-level RI pre-image (whether a touched
+        // field is FPT-backed) and the TAG-SCOPED in-place refresh (5.5). Empty for a pure delete/recall flip.
+        var replacedFields = new List<string>(edit.Fields.Count);
+        if (hasFields)
+            foreach (var kv in edit.Fields)
+                if (kv.Key >= 0 && kv.Key < wa.Table.Columns.Count) replacedFields.Add(wa.Table.Columns[kv.Key].Name);
+
+        // 5.5 hot path (must-fix): the RI-abort pre-image is RECORD-LEVEL — only the one committed record can
+        // change between the write and a trigger abort — not the whole .dbf/.cdx/.fpt (O(recordsize), not
+        // O(filesize) per buffered row). Whole-file CaptureSnapshot is used only for a row it cannot represent
+        // record-level (falls back exactly like ExecReplace).
         bool autoFireUpdate = EnforceReferentialIntegrity && hasFields && ResolveTriggerProc(RiEvent.Update, wa) is not null;
-        FileSnapshot? parentSnap = autoFireUpdate ? CaptureSnapshot(path) : null;
+        RecordImage? parentImg = null; FileSnapshot? parentSnap = null;
+        if (autoFireUpdate)
+        {
+            if (TryCaptureRecordImage(path, recIndex, wa, replacedFields, out var pImg)) parentImg = pImg;
+            else parentSnap = CaptureSnapshot(path);
+        }
 
         SnapshotForTxn(path);
-        using (var writer = DbfWriter.Open(path, new DbfOptions { LockMode = LockMode.Shared }))
+        using (var lease = LeaseWriter(path))
         {
+            var writer = lease.Writer;
             if (hasFields)
             {
                 var values = new object?[writer.Schema.Columns.Count];
@@ -135,13 +152,22 @@ public sealed partial class VfpInterpreter
             if (edit.DeletedOverride is bool del) { if (del) writer.Delete(recIndex); else writer.Recall(recIndex); }
             writer.Flush();
         }
-        ReopenFileAreas(path);
+        // 5.5 hot path (must-fix): the commit is IN-PLACE (record count unchanged) — drop the read buffers in
+        // place and PRESERVE the ordered cache unless a replaced field feeds a structural tag key (then the
+        // cdx moved ⇒ RefreshAfterInPlaceWrite reopens). Replaces the unconditional full ReopenFileAreas that
+        // re-opened every area (the ~8 ms Defender-scanned open) + dropped the whole Ordered cache per row.
+        RefreshAfterInPlaceWrite(path, wa, replacedFields);
 
         if (autoFireUpdate)
         {
             GoRecordCore(area, recno);
             m.OldVals = new Dictionary<string, object?>(edit.Old, StringComparer.OrdinalIgnoreCase);
-            if (!FireDmlTrigger(RiEvent.Update, area) && parentSnap is not null) { RestoreSnapshot(parentSnap); return false; }
+            if (!FireDmlTrigger(RiEvent.Update, area))
+            {
+                if (parentImg is { } pRev) RestoreRecordImage(pRev);
+                else if (parentSnap is not null) RestoreSnapshot(parentSnap);
+                return false;
+            }
         }
         return true;
     }
@@ -259,20 +285,28 @@ public sealed partial class VfpInterpreter
         for (int i = 0; i < vals.Length; i++)
             vals[i] = ae.Fields.TryGetValue(i, out var v) ? v : BlankFor(wa.Table.Columns[i]);
 
-        FileSnapshot? snap = CaptureSnapshot(path);            // pre-image for a RESTRICT / candidate rollback.
+        // 5.5 hot path (must-fix): reverting a committed APPEND removes the last physical record — it is NOT
+        // a record-level UpdateRecord, so it keeps the whole-file pre-image. But capture it ONLY when the
+        // append can actually be aborted — a CANDIDATE tag to re-check, or a bound insert trigger (RESTRICT).
+        // A plain buffered append (the bulk Buffering=5 + TABLEUPDATE case) has no abort path, so it pays NO
+        // per-row whole-file read (the pathology (3) cost this must-fix removes). The PRG/ADO transaction
+        // frame's own once-per-table pre-image (SnapshotForTxn) still covers a batch rollback.
+        bool candidateHere = CandidateTagsFor(path) is not null;
+        bool autoFireInsert = EnforceReferentialIntegrity && ResolveTriggerProc(RiEvent.Insert, wa) is not null;
+        FileSnapshot? snap = (candidateHere || autoFireInsert) ? CaptureSnapshot(path) : null;
         SnapshotForTxn(path);
-        using (var writer = DbfWriter.Open(path, new DbfOptions { LockMode = LockMode.Shared }))
+        using (var lease = LeaseWriter(path))
         {
-            writer.AppendRecord(vals);
-            writer.Flush();
+            lease.Writer.AppendRecord(vals);
+            lease.Writer.Flush();
         }
-        ReopenFileAreas(path);
+        ReopenFileAreas(path);   // an append changed the record count/geometry ⇒ full re-open (RefreshView cannot).
 
         // CANDIDATE: a buffered APPEND committed here (TABLEUPDATE) that duplicates a candidate key must
         // RAISE — the same enforcement the write-through INSERT path applies. The maintained cdx now holds
         // the duplicate; restore the pre-image and raise on a violation. (CommitBuffer's allRows transaction
         // frame is rolled back by its catch so the raise leaves the buffer intact.)
-        if (CandidateTagsFor(path) is not null && FirstViolatedCandidate(path) is string badAppendTag)
+        if (candidateHere && FirstViolatedCandidate(path) is string badAppendTag)
         {
             if (snap is not null) RestoreSnapshot(snap);
             throw new MicroVfpRuntimeException(
@@ -280,7 +314,7 @@ public sealed partial class VfpInterpreter
         }
 
         // Deferred insert trigger / RI: positioned ON the new (last physical) record; .F. ⇒ RESTRICT abort.
-        if (EnforceReferentialIntegrity && ResolveTriggerProc(RiEvent.Insert, wa) is not null)
+        if (autoFireInsert)
         {
             int savedArea = Session.CurrentArea;
             Session.SelectArea(area);
@@ -294,9 +328,11 @@ public sealed partial class VfpInterpreter
         // A buffered DELETE on the appended row commits as a deleted physical record.
         if (ae.Deleted && Session.AreaAt(area) is { } after && after.Table.RecordCount > 0)
         {
-            using var w2 = DbfWriter.Open(path, new DbfOptions { LockMode = LockMode.Shared });
-            w2.Delete(after.Table.RecordCount - 1);
-            w2.Flush();
+            using (var lease2 = LeaseWriter(path))
+            {
+                lease2.Writer.Delete(after.Table.RecordCount - 1);
+                lease2.Writer.Flush();
+            }
             ReopenFileAreas(path);
         }
         return true;

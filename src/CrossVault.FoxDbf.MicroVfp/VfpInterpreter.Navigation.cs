@@ -478,6 +478,7 @@ public sealed partial class VfpInterpreter
         public int CachedRec = -1;
         public List<int>? Ordered;  // recnos in the active index order (null ⇒ physical order).
         public string? OrderedFor;  // the tag name the Ordered cache was built for.
+        public string? OrderedKeyExpr; // the controlling order's KEY expression (5.5: tag-scoped cache refresh).
         public int OrderPos = -1;   // current position within Ordered (when index-ordered).
         public bool OrderReversed;  // SET ORDER … DESCENDING|ASCENDING override: traverse the tag reversed.
         public Dictionary<string, object?>? OldVals; // OLDVAL() per field (pre-change buffer values).
@@ -580,6 +581,9 @@ public sealed partial class VfpInterpreter
         if (m.OrderReversed) ordered.Reverse();
         m.Ordered = ordered;
         m.OrderedFor = m.Order;
+        // Remember the controlling key expression so a later REPLACE can decide (tag-scoped, 5.5) whether it
+        // touched the order key — a CDX tag exposes it; a standalone .idx does not (null ⇒ drop on any REPLACE).
+        m.OrderedKeyExpr = src.CdxTag?.KeyExpression?.Trim();
         m.OrderPos = -1;
         return m.Ordered;
     }

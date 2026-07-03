@@ -124,16 +124,19 @@ public sealed partial class VfpInterpreter
         _ctx.Deleted = true;
         _ctx.Encoding ??= Encoding.Latin1; // CHR()/ASC() byte-consistency for createId/newguid.
         _callStack.Add(new CallContext("(main)", Array.Empty<VfpValue>(), 0));
+        // 5.5: release the per-area cached write handles when the session is disposed (callers dispose the
+        // session, not the interpreter), so no .dbf stays locked past the session's life.
+        Session.Disposing += DisposeAllCachedWriters;
     }
 
     /// <summary>The data session the interpreter runs over (work areas, USE/SELECT, resolution, DML).</summary>
     public VfpSession Session { get; }
 
     /// <summary>The memory-variable store (VFP scoping: LOCAL/PRIVATE/PUBLIC + implicit-private).</summary>
-    public MemoryStore Memory { get; }
+    internal MemoryStore Memory { get; }
 
     /// <summary>The interpreter runtime state (ON ERROR, SET REPROCESS, the lock fail-fast branch).</summary>
-    public RuntimeState Runtime { get; }
+    internal RuntimeState Runtime { get; }
 
     /// <summary>The loaded program, or <see langword="null"/> before <see cref="Load(PrgProgram)"/>.</summary>
     public PrgProgram? Program { get; private set; }
@@ -173,7 +176,7 @@ public sealed partial class VfpInterpreter
     /// the global frame; state mutates the bound session/memory/runtime.</summary>
     public void Execute(string source)
     {
-        var prog = PrgParser.Parse(source);
+        var prog = ParseProgramCached(source);
         foreach (var p in prog.Procedures) { _procs[p.Name] = p; ScanDefines(p.Body); }
         ScanDefines(prog.Main);
         try { ExecBlock(prog.Main); }
@@ -197,7 +200,7 @@ public sealed partial class VfpInterpreter
     {
         try
         {
-            value = VfpExpression.Parse(MicroVfpExprRewrite.Normalize(expression ?? string.Empty)).Evaluate(_row, _ctx);
+            value = ParseExpressionCached(MicroVfpExprRewrite.Normalize(expression ?? string.Empty)).Evaluate(_row, _ctx);
             return true;
         }
         catch
@@ -630,6 +633,7 @@ public sealed partial class VfpInterpreter
         {
             int area = u.In is not null ? ResolveAreaRef(u.In) : Session.CurrentArea;
             if (area > 0) { Session.CloseArea(area); _meta.Remove(area); }
+            PruneCachedWriters();   // 5.5: releasing the last area on a file must release its cached writer.
             return;
         }
 
@@ -651,6 +655,7 @@ public sealed partial class VfpInterpreter
 
         Session.Use(table, inArea, alias, again: u.Again,
             exclusive: u.Mode == UseMode.Exclusive, noUpdate: u.NoUpdate);
+        PruneCachedWriters();   // 5.5: repurposing an area off its old table may release that file's cached writer.
 
         string aliasName = alias ?? Path.GetFileNameWithoutExtension(table);
         var wa = Session.FindAreaByAlias(aliasName);
@@ -920,6 +925,7 @@ public sealed partial class VfpInterpreter
                 break;
             case ClearKind.All:
                 Memory.ClearAll();
+                DisposeAllCachedWriters();    // 5.5: CLEAR ALL closes every file — release cached writers too.
                 Session.CloseAllHandles();   // close every open work area (keeps the data-source binding).
                 _meta.Clear();               // drop the per-area record pointers/relations too.
                 _currentDbCleared = true;    // CLEAR ALL closes all files incl. databases ⇒ DBC()/SET("DATABASE")="".
@@ -1154,7 +1160,7 @@ public sealed partial class VfpInterpreter
     {
         // Normalise VFP array syntax (bracket subscripts → parens; ALEN/AERROR array-name → quoted name)
         // so dynamically-evaluated strings (TYPE/EVAL/macro/DIMENSION dimension expressions) resolve arrays.
-        try { return VfpExpression.Parse(MicroVfpExprRewrite.Normalize(text)).Evaluate(_row, _ctx); }
+        try { return ParseExpressionCached(MicroVfpExprRewrite.Normalize(text)).Evaluate(_row, _ctx); }
         catch { return VfpValue.Null; }
     }
 

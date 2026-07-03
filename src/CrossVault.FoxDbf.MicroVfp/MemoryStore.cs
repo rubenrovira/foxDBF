@@ -27,7 +27,7 @@ namespace CrossVault.FoxDbf.MicroVfp;
 
 /// <summary>The lifetime/visibility class of a memory variable (see <see cref="DeclScope"/> for the
 /// declaration syntax; this is the resolved runtime kind, incl. the implicit-private default).</summary>
-public enum VarKind
+internal enum VarKind
 {
     /// <summary>Undeclared-but-assigned: implicitly PRIVATE, visible to callees, released on exit.</summary>
     ImplicitPrivate,
@@ -41,7 +41,7 @@ public enum VarKind
 /// addressed with a single linear (row-major) subscript, exactly as VFP allows. See MICROVFP_SEMANTICS.md
 /// §Fehlerbehandlung (AERROR) + task gap 1.
 /// </summary>
-public sealed class VfpArray
+internal sealed class VfpArray
 {
     private VfpValue[] _data;
 
@@ -174,7 +174,7 @@ public sealed class VfpArray
 /// The interpreter's memory-variable store with VFP dynamic scoping (a stack of call frames over a
 /// global PUBLIC frame).
 /// </summary>
-public sealed class MemoryStore
+internal sealed class MemoryStore
 {
     private sealed class Cell
     {

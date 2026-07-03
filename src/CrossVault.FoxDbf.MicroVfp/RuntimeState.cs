@@ -15,7 +15,7 @@ namespace CrossVault.FoxDbf.MicroVfp;
 
 /// <summary>Mutable per-session interpreter runtime state (the backing for the VFP state
 /// functions and the SET-setting interactions the RI framework relies on).</summary>
-public sealed class RuntimeState
+internal sealed class RuntimeState
 {
     /// <summary>The current <c>ON ERROR</c> command text, or <see langword="null"/> when no handler is
     /// installed (a bare <c>ON ERROR</c> clears it). <c>ON("ERROR")</c> reads this back.</summary>

@@ -39,6 +39,12 @@ public sealed partial class VfpInterpreter
         string? table = (ins.Parsed as InsertStatement)?.Table
                      ?? (SafeParseSql(ins.Sql) as InsertStatement)?.Table;
 
+        // A write-through INSERT appends through the SQL DML writer (OpenWritableTarget), NOT the cached
+        // interpreter writer — that foreign append bumps the on-disk record count under any writer this
+        // interpreter has cached on the same table, so drop it here (a stale cached _recordCount would
+        // otherwise reject a later REPLACE of the appended row). Cheap; INSERT is not the hot gate path.
+        if (table is not null) InvalidateCachedWriter(Session.FindAreaByAlias(table)?.Table.SourcePath);
+
         // CANDIDATE enforcement: if the target table has a tag created CANDIDATE, an INSERT that duplicates
         // one of its keys must RAISE (VFP). The row is written (funnelling the incremental maintenance),
         // then each candidate tag is re-checked; a violation rolls the write back + raises.
@@ -131,21 +137,47 @@ public sealed partial class VfpInterpreter
         // field) but a RESTRICT/error abort (trigger returns .F.) has to roll the parent key back too, or
         // the parent moves to the new key while its children keep the old one (orphans). Capture the
         // parent pre-image up front; restore it below if the trigger aborts.
+        // 5.5 RECORD-LEVEL pre-image (pathology 3): the abort revert needs only the ONE affected record, not
+        // the whole .dbf/.cdx/.fpt (O(recordsize), not O(filesize) per statement). A whole-file FileSnapshot
+        // is used only as the fallback for a record that cannot be captured record-level (a deleted current row).
+        // The fields this REPLACE writes (resolvable columns only), computed UP FRONT so the record-level
+        // pre-image below can tell whether a TOUCHED field is FPT-backed (a G/P field can't round-trip, so
+        // it forces the whole-file snapshot). Also drives the TAG-SCOPED ordered-cache refresh (5.5
+        // incremental maintenance): a REPLACE that touches no field of the controlling order's key leaves
+        // the cached recno sequence + OrderPos intact (no O(n) re-read; the ordered SCAN keeps advancing).
+        var replacedFields = new List<string>(rp.Clauses.Count);
+        foreach (var clause in rp.Clauses)
+        {
+            string f = StripQualifier(NameOf(clause.Field));
+            if (ColumnIndex(wa.Table, f) >= 0) replacedFields.Add(f);
+        }
+
         bool autoFireUpdate = EnforceReferentialIntegrity && ResolveTriggerProc(RiEvent.Update, wa) is not null;
-        FileSnapshot? parentSnap = autoFireUpdate ? CaptureSnapshot(path) : null;
+        RecordImage? parentImg = null; FileSnapshot? parentSnap = null;
+        if (autoFireUpdate)
+        {
+            if (TryCaptureRecordImage(path, recIndex, wa, replacedFields, out var pImg)) parentImg = pImg;
+            else parentSnap = CaptureSnapshot(path);
+        }
 
         // CANDIDATE: a REPLACE that changes an indexed key to a duplicate of a CANDIDATE tag must RAISE
         // (VFP error 1884), matching INDEX ON … CANDIDATE. The incremental cdx maintenance leaves the
         // duplicate visible in the tag (a free-table candidate tag is plain/non-UNIQUE on disk), so we
         // capture the pre-image up front and, after the maintained write, re-check every candidate tag —
-        // rolling the .dbf/.cdx back and raising on a violation (the same flow the INSERT path uses).
+        // rolling the record back and raising on a violation (the same flow the INSERT path uses).
         bool hasCandidate = CandidateTagsFor(path) is not null;
-        FileSnapshot? candSnap = hasCandidate ? CaptureSnapshot(path) : null;
+        RecordImage? candImg = null; FileSnapshot? candSnap = null;
+        if (hasCandidate)
+        {
+            if (TryCaptureRecordImage(path, recIndex, wa, replacedFields, out var cImg)) candImg = cImg;
+            else candSnap = CaptureSnapshot(path);
+        }
 
         SnapshotForTxn(path);
 
-        using (var writer = DbfWriter.Open(path, new DbfOptions { LockMode = LockMode.Shared }))
+        using (var lease = LeaseWriter(path))
         {
+            var writer = lease.Writer;
             var values = new object?[writer.Schema.Columns.Count];
             for (int i = 0; i < values.Length; i++) values[i] = DbfWriter.KeepValue;
 
@@ -167,13 +199,14 @@ public sealed partial class VfpInterpreter
             writer.UpdateRecord(recIndex, values);
             writer.Flush();
         }
-        // Refresh EVERY handle on this file (USE..AGAIN shares one buffer in VFP) so siblings see the write;
-        // this also re-bases the writing area's own read handle and drops its caches (incl. index order).
-        ReopenFileAreas(path);
+        // Refresh EVERY handle on this file (USE..AGAIN shares one buffer in VFP) so siblings see the write.
+        // 5.5 fast path: drop the read buffers in place (no per-statement file re-open) and preserve the
+        // ordered cache unless the write moved the structural cdx — see RefreshAfterInPlaceWrite.
+        RefreshAfterInPlaceWrite(path, wa, replacedFields);
 
         if (hasCandidate && FirstViolatedCandidate(path) is string badReplaceTag)
         {
-            RestoreSnapshot(candSnap!);
+            if (candImg is { } cRevert) RestoreRecordImage(cRevert); else RestoreSnapshot(candSnap!);
             throw new MicroVfpRuntimeException(
                 $"REPLACE: CANDIDATE tag {badReplaceTag} uniqueness violated — a duplicate key value exists.", 1884); // VFP err 1884 (oracle-pinned).
         }
@@ -181,8 +214,11 @@ public sealed partial class VfpInterpreter
         // to children (the trigger reads OLDVAL() — captured above — for the OLD key). A .F./error return
         // is a RESTRICT/update abort: the trigger already rolled back its child cascade (riend(.F.) →
         // ROLLBACK) — restore the parent pre-image too so the whole op is atomic (parent key reverts).
-        if (autoFireUpdate && !FireDmlTrigger(RiEvent.Update, area) && parentSnap is not null)
-            RestoreSnapshot(parentSnap);
+        if (autoFireUpdate && !FireDmlTrigger(RiEvent.Update, area))
+        {
+            if (parentImg is { } pRevert) RestoreRecordImage(pRevert);
+            else if (parentSnap is not null) RestoreSnapshot(parentSnap);
+        }
     }
 
     private void ExecDelete(DeleteStmt del)
@@ -218,12 +254,17 @@ public sealed partial class VfpInterpreter
         // DELETE) lands on the table's private copy so it is isolated + rollback-able. No-op in autocommit.
         path = BeginTxWrite(path);
         SnapshotForTxn(path);
-        using (var writer = DbfWriter.Open(path, new DbfOptions { LockMode = LockMode.Shared }))
+        using (var lease = LeaseWriter(path))
         {
+            var writer = lease.Writer;
             if (recall) writer.Recall(recIndex); else writer.Delete(recIndex);
             writer.Flush();
         }
-        ReopenFileAreas(path);   // refresh EVERY handle on this file (USE..AGAIN shares one buffer in VFP).
+        // A DELETE/RECALL flips only the deletion flag — no cdx entry moves (VFP keeps a deleted row's key
+        // until PACK) and the count is unchanged, so the 5.5 fast in-place refresh applies: drop the read
+        // buffers in place (no file re-open) and PRESERVE the ordered recno sequence (empty field set).
+        var wref = Session.AreaAt(area) ?? wa;
+        RefreshAfterInPlaceWrite(path, wref, System.Array.Empty<string>());
     }
 
     private void ExecSum(SumStmt sum)
@@ -382,12 +423,13 @@ public sealed partial class VfpInterpreter
         // instead of landing rows on the live .dbf. No-op in autocommit / EnforceRules=off (path unchanged).
         targetPath = BeginTxWrite(targetPath);
         SnapshotForTxn(targetPath);
-        using (var writer = DbfWriter.Open(targetPath, new DbfOptions { LockMode = LockMode.Shared }))
+        using (var lease = LeaseWriter(targetPath))
         {
+            var writer = lease.Writer;
             foreach (var map in rows) writer.AppendRecord(map);
             writer.Flush();
         }
-        ReopenFileAreas(targetPath);
+        ReopenFileAreas(targetPath);   // appended rows changed the count ⇒ rebuild the order cache.
     }
 
     private void ExecCopyStructure(CopyStructureStmt s)
@@ -583,6 +625,7 @@ public sealed partial class VfpInterpreter
         string full = Path.GetFullPath(path);
 
         SnapshotForTxn(path);
+        InvalidateCachedWriter(full);                   // 5.5: release the cached writer before PACK truncates the file.
         var reopen = Session.CloseAreasForPath(full);   // release read handles so Pack can truncate the file.
         try
         {
@@ -631,6 +674,9 @@ public sealed partial class VfpInterpreter
 
     private void ExecSqlPassthrough(SqlPassthroughStmt s)
     {
+        // 5.5: a passthrough may UPDATE/DELETE/INSERT/ALTER/DROP any table through the SQL DML/DDL writer —
+        // drop every cached interpreter writer so none straddles a foreign rewrite / count change. Cold path.
+        DisposeAllCachedWriters();
         var parsed = SafeParseSql(s.Sql);
         try { Session.Execute(s.Sql); }
         catch { return; }

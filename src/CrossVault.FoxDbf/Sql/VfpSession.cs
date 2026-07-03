@@ -58,6 +58,15 @@ public sealed class VfpSession : IDisposable
     public EvaluationContext Context { get; }
 
     /// <summary>
+    /// Raised at the START of <see cref="Dispose"/>, before any work-area handle is closed. A consumer that
+    /// holds its own file handles keyed to this session's lifetime (the microVFP interpreter's 5.5 cached
+    /// write handles) subscribes here so they are released when the session is disposed — even when the
+    /// caller disposes only the session and never the interpreter. Best-effort: a throwing subscriber does
+    /// not abort the rest of disposal.
+    /// </summary>
+    internal event Action? Disposing;
+
+    /// <summary>
     /// The optional query ACCELERATOR (e.g. the Highlike engine) that SELECT / DML candidate-set
     /// discovery routes through instead of the plain <see cref="QueryOptimizer"/>. When <see langword="null"/>
     /// (the default) the Core optimizer runs. An accelerator must return the SAME record set the Core
@@ -773,6 +782,9 @@ public sealed class VfpSession : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        // Let subscribers (the microVFP interpreter's cached write handles) release their own handles first,
+        // while the session is otherwise intact. Best-effort — never let a subscriber abort teardown.
+        try { Disposing?.Invoke(); } catch { /* best-effort */ }
         foreach (var w in _areas.Values) w.Dispose();
         _areas.Clear();
         // Drop every cursor's backing temp table (close handle above, then delete the temp dirs).

@@ -473,6 +473,9 @@ public sealed partial class VfpInterpreter
     private void BuildTagOnDisk(string path, Action<DbfWriter> action)
     {
         string full = Path.GetFullPath(path);
+        // 5.5: drop any cached writer first — this opens an EXCLUSIVE writer (FileShare.None), which a
+        // lingering Shared cached-writer handle would deny, and the index rewrite invalidates its state.
+        InvalidateCachedWriter(full);
         var reopen = Session.CloseAreasForPath(full);
         try
         {
@@ -572,6 +575,7 @@ public sealed partial class VfpInterpreter
     /// pre-image had NO <c>.cdx</c> the freshly written one is DELETED (not left orphaned on disk).</summary>
     private void RollbackFiles(FileSnapshot pre, string path)
     {
+        InvalidateCachedWriter(path);   // 5.5: release the cached handle before File.WriteAllBytes rewrites the files.
         var reopen = Session.CloseAreasForPath(Path.GetFullPath(path));
         try
         {

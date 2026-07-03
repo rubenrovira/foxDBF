@@ -766,6 +766,31 @@ public sealed partial class DbfTable : IDisposable
     }
 
     /// <summary>
+    /// Drop this read view's buffered bytes so the NEXT record/flag read fetches fresh from the OS —
+    /// the cheap coexistence-freshness counterpart to re-opening the file. A <see cref="System.IO.FileStream"/>
+    /// serves STALE buffered bytes after another handle (a sibling <see cref="Write.DbfWriter"/> on a
+    /// <see cref="System.IO.FileShare.ReadWrite"/> open) writes IN PLACE to the same file; <c>Flush()</c> resets
+    /// the managed read buffer so a following <see cref="GetRecord(int)"/> / <see cref="IsRecordDeleted(int)"/>
+    /// re-reads the just-written bytes. Only the record DATA region is affected — an in-place UPDATE/DELETE
+    /// leaves <see cref="RecordCount"/> (a header value fixed at open) unchanged, so this does NOT re-read it;
+    /// an APPEND/PACK/truncate (which does change the geometry) still requires a full re-open. No-op for a
+    /// memory-mapped view (its pages already reflect the shared file) or a non-seekable stream.
+    /// </summary>
+    /// <remarks>
+    /// Used by the microVFP interpreter's 5.5 write hot-path: it keeps ONE read handle per work area open
+    /// across statements (instead of re-opening it after every REPLACE/DELETE) and calls this to see the
+    /// cached writer's flushed in-place edits, so a SCAN+REPLACE loop pays no per-row file-open cost.
+    /// </remarks>
+    public void RefreshView()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_stream is FileStream fs)
+        {
+            try { fs.Flush(); } catch { /* best-effort read-buffer reset */ }
+        }
+    }
+
+    /// <summary>
     /// Produce a Rushmore EXPLAIN / ShowPlan (the VFP SYS(3054) equivalent) for
     /// <paramref name="filter"/>, auto-locating this table's sidecar structural <c>.cdx</c>
     /// (when opened from a path) to report which tags the optimizer would drive. Plan-ONLY —

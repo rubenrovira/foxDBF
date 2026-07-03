@@ -190,11 +190,14 @@ public sealed partial class VfpInterpreter
     private static FileSnapshot CaptureSnapshot(string path)
     {
         var snap = new FileSnapshot { Path = path };
-        try { if (File.Exists(path)) snap.Dbf = File.ReadAllBytes(path); } catch { }
+        // FileShare.ReadWrite reads (ReadAllBytesShared) so the pre-image can be taken WHILE the 5.5 cached
+        // writer holds the .dbf/.fpt open — a plain File.ReadAllBytes requests FileShare.Read, which a live
+        // read/write handle denies (it would silently swallow → a null pre-image → a broken rollback).
+        snap.Dbf = ReadAllBytesShared(path);
         string cdx = Path.ChangeExtension(path, ".cdx");
         string fpt = Path.ChangeExtension(path, ".fpt");
-        try { if (File.Exists(cdx)) snap.Cdx = File.ReadAllBytes(cdx); } catch { }
-        try { if (File.Exists(fpt)) snap.Fpt = File.ReadAllBytes(fpt); } catch { }
+        snap.Cdx = ReadAllBytesShared(cdx);
+        snap.Fpt = ReadAllBytesShared(fpt);
         return snap;
     }
 
@@ -202,6 +205,9 @@ public sealed partial class VfpInterpreter
     /// re-open the area(s) in place (same number / alias / order) so the reverted state is visible.</summary>
     private void RestoreSnapshot(FileSnapshot snap)
     {
+        // 5.5: a cached writer holding this .dbf/.fpt open would block the File.WriteAllBytes rewrite below
+        // (and its stale handle/count must not survive a rollback). Drop it first — the next write re-opens.
+        InvalidateCachedWriter(snap.Path);
         // Capture the work areas currently riding this file so they can be re-opened after the restore.
         // TablePath (the actual .dbf source) is captured alongside the alias: a riopen SCRATCH area has an
         // alias like "__ri6" which is NOT a DBC member / on-disk file, so re-opening BY ALIAS would throw —
@@ -246,6 +252,99 @@ public sealed partial class VfpInterpreter
         Session.SelectArea(savedCur);
     }
 
+    // ── 5.5 RECORD-LEVEL pre-image (pathology 3): the per-statement RI atomicity snapshots for a REPLACE do
+    // not need the WHOLE .dbf/.cdx/.fpt — only the ONE affected record can change between the parent write and
+    // a trigger/candidate abort (the trigger's child cascade lives in OTHER tables, reverted by the trigger's
+    // own transaction). So capture just that record's values + deleted flag (O(recordsize), not O(filesize))
+    // and revert it in place through the cached writer (which re-maintains the cdx). Falls back to a whole-file
+    // FileSnapshot only for the record it cannot represent (a deleted/unreadable current row). The PRG BEGIN
+    // TRANSACTION frame (SnapshotForTxn) intentionally stays whole-file. ──
+    private readonly struct RecordImage
+    {
+        public readonly string Path;
+        public readonly int RecIndex;
+        // Per public column. M/W hold the OLD decoded CONTENT (string / byte[]) so RestoreRecordImage can
+        // round-trip it into a fresh .fpt block; UNTOUCHED G/P hold DbfWriter.KeepValue (their on-disk block
+        // pointer is preserved verbatim). A TOUCHED G/P cannot be represented here — TryCaptureRecordImage
+        // bails to the whole-file snapshot in that case (see the method).
+        public readonly object?[] Values;
+        public readonly bool Deleted;
+        public RecordImage(string path, int recIndex, object?[] values, bool deleted)
+        { Path = path; RecIndex = recIndex; Values = values; Deleted = deleted; }
+    }
+
+    /// <summary>Capture a record-level pre-image of physical record <paramref name="recIndex"/> of
+    /// <paramref name="wa"/> for a revertible REPLACE. <paramref name="replacedFields"/> is the set of fields
+    /// the statement writes (empty for a DELETE/RECALL flag flip). Returns <see langword="false"/> (⇒ the
+    /// caller falls back to a whole-file <see cref="CaptureSnapshot"/>) when the row cannot be represented
+    /// record-level:
+    /// <list type="bullet">
+    ///   <item>a deleted/unreadable current record (<see cref="DbfTable.GetRecord"/> returns null); or</item>
+    ///   <item>the statement TOUCHES a General/Picture (<c>G</c>/<c>P</c>) field — those decode to a raw
+    ///     4-byte FPT block POINTER, not content, so feeding the read-back value back through
+    ///     <see cref="DbfWriter.UpdateRecord(int, object?[])"/> would write the pointer bytes AS block data
+    ///     and destroy the object. Only the whole-file snapshot can revert such a field.</item>
+    /// </list>
+    /// FPT-BACKED CONTENT (the 5.5 must-fix): memo/blob (<c>M</c>/<c>W</c>) fields decode to their actual
+    /// CONTENT (a text string for <c>M</c>, raw <c>byte[]</c> for <c>W</c>), which <c>UpdateRecord</c> writes
+    /// into a fresh <c>.fpt</c> block — so an aborted <c>REPLACE …, memofld WITH newtext</c> reverts the memo
+    /// (storing <see cref="DbfWriter.KeepValue"/> instead, as pre-fix, kept the NEW block ⇒ a partial write
+    /// survived the abort). An UNTOUCHED <c>M</c>/<c>W</c> is captured as content too (harmlessly re-written
+    /// on the cold abort path); an untouched <c>G</c>/<c>P</c> keeps its pointer via <c>KeepValue</c>.</summary>
+    private bool TryCaptureRecordImage(string path, int recIndex, VfpSession.WorkArea wa,
+                                       IReadOnlyList<string> replacedFields, out RecordImage image)
+    {
+        image = default;
+        if (recIndex < 0 || recIndex >= wa.Table.RecordCount) return false;
+        if (wa.Table.GetRecord(recIndex) is not { } rec) return false;   // deleted/unreadable ⇒ whole-file fallback.
+        var cols = wa.Table.Columns;
+        var vals = new object?[cols.Count];
+        for (int i = 0; i < cols.Count; i++)
+        {
+            char t = cols[i].Type;
+            if (t is 'M' or 'W')
+                vals[i] = rec[i];                        // decoded CONTENT — round-trips into a fresh .fpt block.
+            else if (t is 'G' or 'P')
+            {
+                // rec[i] is the block POINTER, not content — un-round-trippable. Safe to KEEP verbatim only
+                // when UNtouched; a touched one needs the whole-file snapshot.
+                if (FieldIn(replacedFields, cols[i].Name)) return false;
+                vals[i] = DbfWriter.KeepValue;
+            }
+            else
+                vals[i] = rec[i];
+        }
+        image = new RecordImage(path, recIndex, vals, wa.Table.IsRecordDeleted(recIndex));
+        return true;
+    }
+
+    /// <summary>Case-insensitive membership test of <paramref name="name"/> in <paramref name="fields"/>.</summary>
+    private static bool FieldIn(IReadOnlyList<string> fields, string name)
+    {
+        for (int i = 0; i < fields.Count; i++)
+            if (string.Equals(fields[i], name, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    /// <summary>Revert a REPLACE by rewriting the single affected record from its <see cref="RecordImage"/>
+    /// pre-image through the cached writer (which re-maintains the structural cdx, reverting any key change),
+    /// then refresh the read views. The record-level counterpart to <see cref="RestoreSnapshot"/> for the
+    /// per-statement RI/candidate abort — parent-record-scoped, exactly what those two snapshots covered.</summary>
+    private void RestoreRecordImage(RecordImage image)
+    {
+        using (var lease = LeaseWriter(image.Path))
+        {
+            var writer = lease.Writer;
+            if (image.RecIndex >= 0 && image.RecIndex < writer.RecordCount)
+            {
+                writer.UpdateRecord(image.RecIndex, image.Values);
+                if (image.Deleted) writer.Delete(image.RecIndex); else writer.Recall(image.RecIndex);
+                writer.Flush();
+            }
+        }
+        ReopenFileAreas(image.Path);   // a reverted key moved the cdx back ⇒ full reopen (cold abort path).
+    }
+
     private static bool SamePath(string? a, string? b)
         => a is not null && b is not null &&
            string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase);
@@ -254,7 +353,23 @@ public sealed partial class VfpInterpreter
     /// that file — not just the one that wrote — and drop its record/order caches. VFP9 shares one buffer
     /// across all <c>USE..AGAIN</c> handles of a file, so a sibling handle (e.g. a riopen scratch cursor)
     /// must see the write immediately; without this it would serve stale bytes until reopened on its own.</summary>
-    private void ReopenFileAreas(string path)
+    private void ReopenFileAreas(string path) => ReopenFileAreas(path, replacedFields: null);
+
+    /// <summary>Refresh EVERY open work area riding <paramref name="path"/> (see the single-arg overload),
+    /// with 5.5 TAG-SCOPED order-cache maintenance driven by <paramref name="replacedFields"/>:
+    /// <list type="bullet">
+    ///   <item><c>null</c> — a structural / count-changing write (APPEND, INSERT, PACK, index rebuild):
+    ///     drop the cached ordered recno sequence so it rebuilds (legacy behaviour).</item>
+    ///   <item>a field list — a REPLACE (or an empty list = a DELETE/RECALL flag flip): the on-disk cdx was
+    ///     kept current incrementally (§5.1), so the cached ordered sequence + OrderPos are PRESERVED unless
+    ///     a replaced field feeds the area's CONTROLLING order key (then that area's sequence is dropped).
+    ///     Preserving it is what turns an ordered SCAN+REPLACE from O(n·filesize)/non-terminating into O(n):
+    ///     the SCAN's next SKIP keeps walking the same sequence instead of re-reading the whole tag and
+    ///     re-topping.</item>
+    /// </list>
+    /// The record cache (<c>Cached</c>) is always dropped (the row bytes changed); the CdxFile handle is
+    /// always reopened, so a following SEEK / non-controlling-tag read still sees the maintained on-disk cdx.</summary>
+    private void ReopenFileAreas(string path, IReadOnlyList<string>? replacedFields)
     {
         var areas = new List<int>();
         foreach (var w in Session.OpenAreas)
@@ -262,8 +377,105 @@ public sealed partial class VfpInterpreter
         foreach (var a in areas)
         {
             Session.ReopenAreaTable(a);
-            if (_meta.TryGetValue(a, out var mm)) { mm.Cached = null; mm.Ordered = null; }
+            if (!_meta.TryGetValue(a, out var mm)) continue;
+            mm.Cached = null;
+            if (replacedFields is null || OrderKeyTouchedBy(a, mm, replacedFields))
+            {
+                mm.Ordered = null; mm.OrderedFor = null; mm.OrderPos = -1;
+            }
+            // else: preserve mm.Ordered / mm.OrderedFor / mm.OrderPos — the incremental cdx left the
+            // controlling order unchanged, so the cached sequence is still valid (no O(n) re-read).
         }
+    }
+
+    /// <summary>True when any field in <paramref name="replacedFields"/> feeds area <paramref name="a"/>'s
+    /// CONTROLLING order key expression (so its cached ordered sequence must be dropped). A conservative
+    /// substring/identifier scan of the tag's key expression: it may DROP a cache it could have kept
+    /// (correct, just a re-read), never KEEP one it should drop. No controlling order ⇒ never touched.</summary>
+    private bool OrderKeyTouchedBy(int a, AreaMeta mm, IReadOnlyList<string> replacedFields)
+    {
+        if (replacedFields.Count == 0) return false;               // a flag flip touches no key.
+        if (mm.Ordered is null || string.IsNullOrEmpty(mm.OrderedFor)) return false; // nothing cached to keep.
+        string? keyExpr = mm.OrderedKeyExpr;
+        if (keyExpr is null) return true;                          // unknown key ⇒ be safe, drop.
+        foreach (var f in replacedFields)
+            if (IdentifierAppears(keyExpr, f)) return true;
+        return false;
+    }
+
+    /// <summary>Whether identifier <paramref name="name"/> appears as a whole word (case-insensitive) in the
+    /// index key <paramref name="expr"/> — an over-eager but never-under-eager field-in-key test.</summary>
+    private static bool IdentifierAppears(string expr, string name)
+    {
+        if (name.Length == 0) return false;
+        int i = 0;
+        while ((i = expr.IndexOf(name, i, StringComparison.OrdinalIgnoreCase)) >= 0)
+        {
+            bool leftOk = i == 0 || !IsIdentChar(expr[i - 1]);
+            int end = i + name.Length;
+            bool rightOk = end >= expr.Length || !IsIdentChar(expr[end]);
+            if (leftOk && rightOk) return true;
+            i = end;
+        }
+        return false;
+    }
+
+    private static bool IsIdentChar(char c) => char.IsAsciiLetterOrDigit(c) || c == '_';
+
+    /// <summary>
+    /// 5.5 write hot-path: refresh read views after an IN-PLACE write (REPLACE / DELETE / RECALL — the
+    /// record COUNT is unchanged) that went through the cached writer.
+    /// <list type="bullet">
+    ///   <item>FAST PATH (autocommit + no structural cdx move): the cached writer already flushed the new
+    ///     bytes to the shared file, so every open area riding it only needs its read BUFFER dropped
+    ///     (<see cref="DbfTable.RefreshView"/>) + its current-record cache cleared — NO file re-open (the
+    ///     ~8&#160;ms Defender-scanned open that dominated the pre-5.5 per-statement cost). The cached ordered
+    ///     recno sequence + OrderPos are preserved: the on-disk structural cdx did not move (no tag key was
+    ///     touched) and non-structural indexes are not writer-maintained (so they did not move either), so
+    ///     the cached sequence still matches disk — this is what turns an ordered SCAN+REPLACE from
+    ///     O(n·filesize)/non-terminating into O(n).</item>
+    ///   <item>COLD PATH (a STRUCTURAL tag key was touched ⇒ the on-disk cdx moved, or an ADO.NET COW
+    ///     transaction is active): fall back to the full <c>ReopenFileAreas</c>
+    ///     so a following SEEK / ordered read sees fresh cdx pages. Cold because key-changing REPLACEs are
+    ///     rare next to the value-field REPLACE hot loop.</item>
+    /// </list>
+    /// </summary>
+    private void RefreshAfterInPlaceWrite(string path, VfpSession.WorkArea wa, IReadOnlyList<string> replacedFields)
+    {
+        if (Session.TxBeginWritePath is not null || AnyStructuralTagKeyTouchedBy(wa, replacedFields))
+        {
+            ReopenFileAreas(path, replacedFields);   // cold: cdx pages moved / tx copy — reopen handles fresh.
+            return;
+        }
+        foreach (var w in Session.OpenAreas)
+        {
+            if (!SamePath(w.Table.SourcePath, path)) continue;
+            w.Table.RefreshView();                    // drop the stale read buffer (cheap; no file open).
+            if (_meta.TryGetValue(w.Area, out var mm)) mm.Cached = null;
+            // mm.Ordered / mm.OrderedFor / mm.OrderPos PRESERVED — the on-disk index did not move.
+        }
+    }
+
+    /// <summary>True when any field in <paramref name="replacedFields"/> feeds the KEY expression of ANY
+    /// tag in the area's STRUCTURAL <c>.cdx</c> — i.e. the writer's incremental maintenance moved a cdx
+    /// entry, so the read cdx handle + ordered caches are stale and must be re-opened. Structural-only: the
+    /// writer maintains ONLY the structural cdx (extra <c>.idx</c>/<c>.cdx</c> are not writer-maintained, so
+    /// they never move on a write). Reads the already-open in-memory tag directory (no file open).</summary>
+    private static bool AnyStructuralTagKeyTouchedBy(VfpSession.WorkArea wa, IReadOnlyList<string> replacedFields)
+    {
+        if (replacedFields.Count == 0) return false;
+        var cdx = wa.Cdx;
+        if (cdx is null) return false;
+        foreach (var tagName in cdx.TagNames)
+        {
+            var tag = cdx.Tag(tagName);
+            if (tag is null) continue;
+            string key = tag.KeyExpression ?? string.Empty;
+            if (key.Length == 0) continue;
+            foreach (var f in replacedFields)
+                if (IdentifierAppears(key, f)) return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -276,7 +488,7 @@ public sealed partial class VfpInterpreter
     /// then on the caller's <c>path</c> is the copy, so EVERY downstream file touch in the same op — the
     /// pre-image snapshots (<see cref="CaptureSnapshot"/> for a trigger-abort revert, <see cref="SnapshotForTxn"/>
     /// for a PRG <c>BEGIN TRANSACTION</c> frame), the <see cref="DbfWriter"/>, the read-your-writes
-    /// <see cref="ReopenFileAreas"/>, and any <see cref="RestoreSnapshot"/> — all operate on the copy. The two
+    /// <c>ReopenFileAreas</c>, and any <see cref="RestoreSnapshot"/> — all operate on the copy. The two
     /// snapshot layers therefore compose rather than fight: the interpreter's own transaction/trigger-abort
     /// reverts happen WITHIN the copy, and the outer COW transaction commits or discards the copy as a whole.
     /// </para>
@@ -290,7 +502,13 @@ public sealed partial class VfpInterpreter
         if (Session.TxBeginWritePath is null) return path;   // autocommit — unchanged.
         string writePath = Session.RedirectWritePath(path);  // live → private copy (idempotent for a copy path).
         if (!SamePath(writePath, path))
+        {
+            // The write now lands on the tx's private copy; a writer this interpreter cached on the LIVE
+            // path (before the tx) must not linger — the Data layer swaps the copy over the live file on
+            // commit/rollback, and a live-path handle would block that. Drop it (tx writes never cache).
+            InvalidateCachedWriter(path);
             ReopenFileAreas(path);                            // repoint the live-riding area(s) at the copy.
+        }
         return writePath;
     }
 

@@ -38,6 +38,10 @@
   <ItemGroup>
     <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Public" />
     <InternalsVisibleTo Include="CrossVault.FoxDbf.Tests.Internal" />
+    <!-- The ADO.NET provider reads interpreter state (Memory) for SP results/EnforceRules; the
+         interpreter internals are deliberately NOT public API (finding 5.11) - same sibling-IVT
+         pattern Core already uses for Data. Decoupling via a public seam is tracked as 5.12. -->
+    <InternalsVisibleTo Include="CrossVault.FoxDbf.Data" />
   </ItemGroup>
 
 </Project>
