@@ -40,6 +40,10 @@ internal sealed class FoxDbfEnforcedWriteModel
     internal int Execute(string sql)
     {
         var stmt = SqlParser.Parse(sql);
+        // INSERT … FROM ARRAY | MEMVAR: expand into concrete per-row VALUES inserts (reading the active
+        // session's memvar store) so each row flows through the SAME DEFAULT/RULE/TRIGGER enforcement below.
+        if (stmt is InsertStatement { SourceKind: not InsertSourceKind.Values } insFrom)
+            return InsertFrom(insFrom);
         return stmt switch
         {
             InsertStatement ins => Insert(ins),
@@ -48,6 +52,67 @@ internal sealed class FoxDbfEnforcedWriteModel
             // Not a writing DML after all (shouldn't happen — IsWriteDml gated it): fall back to the raw path.
             _ => _connection.Session.Execute(sql)?.AffectedRecords ?? -1,
         };
+    }
+
+    // ─────────────────────────── INSERT … FROM ARRAY | MEMVAR (enforced) ───────────────────────────
+
+    /// <summary>Expand an <c>INSERT … FROM ARRAY | MEMVAR</c> into concrete per-row VALUES inserts and run each
+    /// through <see cref="Insert(InsertStatement)"/>, so DBC DEFAULTs (for fields the row does not reach),
+    /// field/record RULEs and the bound RI trigger all fire exactly as for the VALUES form. FROM ARRAY appends
+    /// one VALUES insert per array row (position-mapped; excess ignored); FROM MEMVAR one insert whose columns
+    /// are the fields that have a matching <c>m.&lt;field&gt;</c> memvar (missing fields fall to their DEFAULT).</summary>
+    private int InsertFrom(InsertStatement ins)
+    {
+        var bridge = _connection.Session.MemoryBridge
+            ?? throw new FoxDbfException("INSERT … FROM ARRAY/MEMVAR requires the microVFP memory store.");
+        var fields = FieldNames(ins.Table);
+        int total = 0;
+
+        if (ins.SourceKind == InsertSourceKind.Memvar)
+        {
+            var cols = new List<string>();
+            var vals = new List<VfpValue>();
+            foreach (var f in fields)
+                if (bridge.TryReadMemvar(f, out var v)) { cols.Add(f); vals.Add(VfpValue.FromClr(v)); }
+            total += Insert(BuildValuesInsert(ins.Table, cols, vals));
+        }
+        else // Array
+        {
+            var rows = bridge.ReadArrayRows(ins.SourceName!)
+                ?? throw new FoxDbfException($"INSERT … FROM ARRAY: '{ins.SourceName}' is not a memory array.");
+            foreach (var row in rows)
+            {
+                int k = Math.Min(row.Count, fields.Count);   // excess ignored; short row → DEFAULT/blank.
+                var cols = new List<string>(k);
+                var vals = new List<VfpValue>(k);
+                for (int i = 0; i < k; i++) { cols.Add(fields[i]); vals.Add(VfpValue.FromClr(row[i])); }
+                total += Insert(BuildValuesInsert(ins.Table, cols, vals));
+            }
+        }
+        return total;
+    }
+
+    /// <summary>A concrete <c>INSERT INTO table (cols) VALUES (literals)</c> statement whose VALUES are literal
+    /// renderings of the already-resolved memvar/array values — the shape <see cref="Insert(InsertStatement)"/>
+    /// enforces.</summary>
+    private static InsertStatement BuildValuesInsert(string table, List<string> cols, List<VfpValue> vals)
+    {
+        var exprs = new List<VfpExpression>(vals.Count);
+        foreach (var v in vals) exprs.Add(VfpExpression.Parse(ToVfpLiteral(v)));
+        return new InsertStatement(null, table, cols, exprs);
+    }
+
+    /// <summary>The target table's field names in physical order: the DBC rules metadata when present, else a
+    /// zero-row schema SELECT.</summary>
+    private List<string> FieldNames(string table)
+    {
+        var rules = _connection.Session.Database?.GetTableRules(table);
+        if (rules is not null && rules.Fields.Count > 0)
+            return rules.Fields.Select(f => f.FieldName).ToList();
+        var res = _connection.Session.Execute($"SELECT * FROM {table} WHERE 1 = 0");
+        return res?.Columns is { } cols
+            ? cols.Select(c => c.Name).ToList()
+            : new List<string>();
     }
 
     // ─────────────────────────── INSERT: DEFAULT → field RULE → record RULE → trigger ───────────────────────────

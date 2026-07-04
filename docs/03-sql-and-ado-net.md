@@ -73,10 +73,21 @@ int updated = cn.Execute(
 ### What SQL is supported
 
 `SELECT` with projection, `WHERE`, `INNER`/`LEFT`/`RIGHT`/`FULL JOIN`, `UNION [ALL]`, correlated
-subqueries, `GROUP BY`/`HAVING`, aggregates, `ORDER BY`, `DISTINCT`, `TOP`; `INSERT … VALUES`,
+subqueries, `GROUP BY`/`HAVING`, aggregates, `ORDER BY`, `DISTINCT`, `TOP [n [PERCENT]]`,
+`INTO CURSOR`/`TABLE`/`ARRAY`; `INSERT … VALUES`, `INSERT … FROM ARRAY`/`FROM MEMVAR`,
 `UPDATE`, `DELETE` (VFP soft-delete — see [1. Reading tables](01-reading-tables.md#deleted-records));
 `CREATE`/`ALTER`/`DROP TABLE`. Positional `?` and named `@`/`:` parameters. SQL `=` follows
 **`SET ANSI`** (the `Ansi` connection-string keyword above), not `SET EXACT`.
+
+`SELECT … INTO ARRAY name` lands the result in the connection's active-session memvar array store
+(a 2-D `rows × cols` array — even a single-column result is an `N×1` array, matching VFP9, *not* a
+true 1-D array; zero matching rows leave the array unchanged), and sets `_TALLY` to the row count,
+which `ExecuteNonQuery` returns. The array is then readable from a following microVFP expression
+(`?ALEN(name)`) or stored procedure on the **same** connection. `INSERT … FROM ARRAY arr` appends one
+row per array row (a 1-D array is a single row), mapping array columns to the table's fields by
+position (excess ignored, missing left blank); `INSERT … FROM MEMVAR` appends one row mapped by field
+name from the `m.<field>` memvars. Both flow through the normal DML path, so index maintenance, the
+copy-on-write transaction, buffering and `EnforceRules` all apply.
 
 ### Stored procedures and UDFs
 
@@ -173,6 +184,47 @@ DbProviderFactories.RegisterFactory("CrossVault.FoxDbf", FoxDbfProviderFactory.I
 Useful for tools that look up providers by name (config-driven data layers, some reporting tools)
 rather than `new`-ing `FoxDbfConnection` directly. The registered `FoxDbfProviderFactory` also creates
 data sources (`CreateDataSource`) and batches (`CreateBatch`).
+
+### Transactions and isolation
+
+`BeginTransaction()` returns a real, **copy-on-write** `FoxDbfTransaction`. DBF/VFP has no rollback log,
+so isolation is provided by **private per-table working copies**: the first time the transaction *writes*
+a table, that table's `.dbf` + its `.fpt`/`.cdx` sidecars are copied aside and this connection's reads and
+writes to it are redirected to the copy for the rest of the transaction. `Commit()` verifies each touched
+table's change-token still matches the live file (else it throws `FoxDbfTransactionConflictException`, so no
+foreign write is lost) and atomically swaps each copy in; `Rollback()` (and dispose-without-commit) simply
+discards the copies — the live files, including the `.cdx`, are left byte-for-byte untouched.
+
+```csharp
+using var cn = new FoxDbfConnection(@"Data Source=C:\data");
+cn.Open();
+using var tx = cn.BeginTransaction();          // IsolationLevel.ReadCommitted
+using (var c = cn.CreateCommand()) { c.CommandText = "INSERT INTO emp (id,name) VALUES (6,'Frank')"; c.ExecuteNonQuery(); }
+tx.Rollback();                                  // the row — and its index entry — never touched the live file
+```
+
+**Isolation level.** The reported `IsolationLevel` is **always** `ReadCommitted` — the level this model
+actually delivers. Whatever you pass to `BeginTransaction(IsolationLevel)` is **clamped** to it: a request for
+a *stronger* level (`RepeatableRead` / `Snapshot` / `Serializable`) is not honoured and is **not** echoed back
+(the property never claims a level the transaction cannot provide), and a *weaker* request
+(`ReadUncommitted` / `Chaos`) is likewise served as `ReadCommitted` (uncommitted writes stay isolated
+regardless). This is deliberate and honest — the transaction reports exactly what it does.
+
+**Isolation boundary — read this.** The transaction is honest
+[`ReadCommitted`](https://learn.microsoft.com/dotnet/api/system.data.isolationlevel) (its reported
+`IsolationLevel`). Concretely:
+
+- **Read-your-own-writes** — the transacting connection sees its own pending changes.
+- **Isolation of uncommitted writes** — another connection never sees them until `Commit()`.
+- **Stable reads for a *written* table** — once the transaction has written a table (a private copy exists),
+  its reads of that table come from the copy and are unaffected by a foreign writer touching the live file.
+- **Non-repeatable reads for a table the transaction has only *read*** — because such a table has **no**
+  private copy, its reads go straight to the live file, so a *foreign* process that commits a change to it
+  mid-transaction **becomes visible** to a later read in the same transaction. This is exactly what
+  `ReadCommitted` permits, and it is a **deliberate** boundary: upgrading to repeatable-read/snapshot
+  isolation would require snapshotting *every* table on first read (a large, always-on cost even for
+  read-only tables) and does not fit the optimistic, write-tracked concurrency model. If you need a stable
+  view of a table across a transaction, read it inside an explicit write, or serialize the foreign writer.
 
 ## Next
 

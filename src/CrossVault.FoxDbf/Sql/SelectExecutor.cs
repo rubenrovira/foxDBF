@@ -66,11 +66,6 @@ internal sealed class SelectExecutor
 
     public SqlResult Run(SelectStatement sel)
     {
-        // INTO ARRAY is a VFP-runtime feature (out of scope) — reject it up front with a clear message.
-        if (sel.Into is { Kind: IntoKind.Array })
-            throw new NotSupportedException(
-                "INTO ARRAY is a VFP-runtime feature — use INTO CURSOR/TABLE; arrays are microVFP scope.");
-
         // TOP … PERCENT and SELECT … INTO TABLE/CURSOR both need the FULLY materialized (ORDER BY-applied)
         // result before they can act, so they run the plain query first, then post-process. Plain SELECT
         // (no PERCENT, no INTO) keeps its original, unchanged path.
@@ -142,6 +137,19 @@ internal sealed class SelectExecutor
     /// the result is a DML-style row-count (the materialized record count, available as _TALLY).</summary>
     private SqlResult MaterializeInto(IntoClause into, IReadOnlyList<SqlColumn> columns, List<object?[]> rows)
     {
+        if (into.Kind == IntoKind.Array)
+        {
+            // SELECT … INTO ARRAY lands the result grid in the ACTIVE data session's memvar array store via
+            // the bound interpreter's bridge; the row count doubles as _TALLY (returned by ExecuteNonQuery).
+            // Per VFP the array is 2-D even for a single column (an N×1 array); ZERO rows leave the array
+            // untouched (the bridge handles that) and set _TALLY=0. No interpreter bound ⇒ no memvar store.
+            var bridge = _session.MemoryBridge
+                ?? throw new FoxDbfSqlException(
+                    "SELECT … INTO ARRAY requires the microVFP memory store; none is bound to this session.");
+            bridge.StoreQueryIntoArray(into.Name, rows.Count, columns.Count, rows);
+            return SqlResult.Dml(rows.Count);
+        }
+
         var defs = BuildColumnDefs(columns);
 
         if (into.Kind == IntoKind.Table)

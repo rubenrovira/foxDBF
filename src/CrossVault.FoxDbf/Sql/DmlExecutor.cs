@@ -46,6 +46,12 @@ internal sealed class DmlExecutor
 
     private SqlResult Insert(InsertStatement st)
     {
+        // Memory-source forms (VFP idioms heavily used in real SPs) map through the ACTIVE session's memvar
+        // store via the bound interpreter's bridge, then append through the SAME writer path as VALUES — so
+        // index maintenance, the COW transaction seam and buffering all apply unchanged.
+        if (st.SourceKind == InsertSourceKind.Array) return InsertFromArray(st);
+        if (st.SourceKind == InsertSourceKind.Memvar) return InsertFromMemvar(st);
+
         var ctx = _session.SqlContext();
         using var target = _session.OpenWritableTarget(st.Table);
         var writer = target.Writer;
@@ -87,6 +93,55 @@ internal sealed class DmlExecutor
                     $"INSERT value count {values.Length} does not match the table's {columns.Count} column(s) (no column list given).");
             writer.AppendRecord(values);
         }
+        return SqlResult.Dml(1);
+    }
+
+    // ---- INSERT ... FROM ARRAY | FROM MEMVAR ----------------------------------------------
+
+    /// <summary><c>INSERT INTO tbl FROM ARRAY arr</c>: one appended row per array row (a 1-D array is a single
+    /// row), each mapped to the table's fields by POSITION — excess array columns ignored, fields the row does
+    /// not reach left blank (VFP-pinned). Returns the appended-row count as _TALLY.</summary>
+    private SqlResult InsertFromArray(InsertStatement st)
+    {
+        var bridge = _session.MemoryBridge
+            ?? throw new FoxDbfSqlException(
+                "INSERT … FROM ARRAY requires the microVFP memory store; none is bound to this session.");
+        var rows = bridge.ReadArrayRows(st.SourceName!)
+            ?? throw new FoxDbfSqlException($"INSERT … FROM ARRAY: '{st.SourceName}' is not a memory array.")
+                { VfpErrorNumber = 12 };
+
+        using var target = _session.OpenWritableTarget(st.Table);
+        var writer = target.Writer;
+        var columns = writer.Schema.Columns;
+
+        int count = 0;
+        foreach (var row in rows)
+        {
+            var map = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            int k = Math.Min(row.Count, columns.Count);   // excess elements ignored; short row → blanks.
+            for (int i = 0; i < k; i++) map[columns[i].Name] = row[i];
+            writer.AppendRecord(map);
+            count++;
+        }
+        return SqlResult.Dml(count);
+    }
+
+    /// <summary><c>INSERT INTO tbl FROM MEMVAR</c>: a single row whose fields map by NAME from the same-named
+    /// <c>m.&lt;field&gt;</c> memvars; a field with no matching memvar is left blank (VFP-pinned).</summary>
+    private SqlResult InsertFromMemvar(InsertStatement st)
+    {
+        var bridge = _session.MemoryBridge
+            ?? throw new FoxDbfSqlException(
+                "INSERT … FROM MEMVAR requires the microVFP memory store; none is bound to this session.");
+
+        using var target = _session.OpenWritableTarget(st.Table);
+        var writer = target.Writer;
+        var columns = writer.Schema.Columns;
+
+        var map = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var col in columns)
+            if (bridge.TryReadMemvar(col.Name, out var v)) map[col.Name] = v;
+        writer.AppendRecord(map);
         return SqlResult.Dml(1);
     }
 

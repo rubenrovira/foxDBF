@@ -811,6 +811,34 @@ public static class SqlParser
                 Advance();
             }
 
+            // Memory-source forms: INSERT INTO tbl FROM ARRAY name | FROM MEMVAR (no column list / VALUES).
+            if (IsKw("FROM"))
+            {
+                // A column list is ONLY valid with VALUES. VFP9 rejects INSERT INTO tbl (cols) FROM ARRAY|MEMVAR
+                // with error 10 "Syntax error" (oracle-pinned, MicroVfpTypedErrorOracleTests). Mirror it here
+                // rather than silently ignoring the list and mapping to the table's full physical field order —
+                // which would put the array/memvar data into the WRONG columns (a statement VFP would never run).
+                if (cols is not null)
+                    throw new FoxDbfSqlException(
+                        "A column list is not allowed with INSERT ... FROM ARRAY/MEMVAR (only with VALUES).",
+                        Current.Start) { VfpErrorNumber = 10 };
+                Advance();
+                if (IsKw("ARRAY"))
+                {
+                    Advance();
+                    string arrName = ExpectWord("an array name after FROM ARRAY");
+                    return new InsertStatement(db, table, cols, System.Array.Empty<VfpExpression>(),
+                        InsertSourceKind.Array, arrName);
+                }
+                if (IsKw("MEMVAR"))
+                {
+                    Advance();
+                    return new InsertStatement(db, table, cols, System.Array.Empty<VfpExpression>(),
+                        InsertSourceKind.Memvar, null);
+                }
+                throw Err("Expected ARRAY or MEMVAR after INSERT ... FROM.");
+            }
+
             ExpectKw("VALUES");
             if (Current.Kind != TokKind.LParen) throw Err("Expected '(' after VALUES.");
             Advance();

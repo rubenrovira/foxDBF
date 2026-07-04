@@ -98,6 +98,7 @@ public sealed class FoxDbfCommand : DbCommand
         if (ShouldEnforce(sql))
             return ExecuteEnforcedDml(sql);
 
+        EnsureMemoryBridgeFor(sql);
         var result = _connection.Session.Execute(sql);
         return result?.AffectedRecords ?? -1;
     }
@@ -125,6 +126,7 @@ public sealed class FoxDbfCommand : DbCommand
             return null;
         }
 
+        EnsureMemoryBridgeFor(sql);
         var result = _connection.Session.Execute(sql);
         if (result?.Rows == null) return null;
 
@@ -170,6 +172,7 @@ public sealed class FoxDbfCommand : DbCommand
         if (ShouldEnforce(sql))
             throw new FoxDbfException("ExecuteReader cannot be used with DML statements; use ExecuteNonQuery.");
 
+        EnsureMemoryBridgeFor(sql);
         var result = _connection.Session.Execute(sql);
         if (result == null)
             throw new FoxDbfException("ExecuteReader can only be used with SELECT statements.");
@@ -193,6 +196,27 @@ public sealed class FoxDbfCommand : DbCommand
         if (t[0] is '?' or '=') { expression = t.Substring(1).Trim(); return true; }
         return false;
     }
+
+    /// <summary>
+    /// Ensure the connection's shared <c>VfpInterpreter</c> exists BEFORE a raw <c>Session.Execute</c> that
+    /// reaches the memvar store — <c>SELECT … INTO ARRAY</c> (writes an array) or <c>INSERT … FROM
+    /// ARRAY|MEMVAR</c> (reads one). Touching the interpreter registers its <c>IVfpMemoryBridge</c> on the
+    /// session, so the SQL engine can land / read the active-session arrays. A cheap keyword sniff; a false
+    /// positive merely instantiates the (cached, idempotent) interpreter a little earlier — harmless.
+    /// </summary>
+    private void EnsureMemoryBridgeFor(string? sql)
+    {
+        // Precise word-boundary match on the actual clauses (INTO ARRAY / FROM ARRAY / FROM MEMVAR) so an
+        // unrelated statement — a column named `arrayfield`, a table `arrays` — does NOT needlessly create the
+        // interpreter (which shares + adjusts the session's SET state).
+        if (sql is not null && MemorySourceRx.IsMatch(sql))
+            _ = _connection!.Interpreter;
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex MemorySourceRx = new(
+        @"\b(INTO\s+ARRAY|FROM\s+ARRAY|FROM\s+MEMVAR)\b",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase
+        | System.Text.RegularExpressions.RegexOptions.Compiled);
 
     /// <summary>True when the opt-in VFP write-model must run for <paramref name="sql"/>: EnforceRules is on,
     /// a DBC is open (enforcement is a DBC concept — a free-table / .dbf-only connection has no DEFAULT/RULE/

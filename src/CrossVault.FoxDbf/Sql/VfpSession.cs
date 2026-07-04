@@ -107,6 +107,15 @@ public sealed class VfpSession : IDisposable
     internal event Action? HandlesClosing;
 
     /// <summary>
+    /// Bridge to the ACTIVE session's microVFP memory-variable store, registered by the bound
+    /// <c>VfpInterpreter</c> in its constructor. It is the seam <c>SELECT … INTO ARRAY</c> writes through and
+    /// <c>INSERT … FROM ARRAY|MEMVAR</c> reads through, so both the microVFP SP path and the ADO.NET command
+    /// path surface those idioms against the same memvar store. <see langword="null"/> when no interpreter is
+    /// bound (pure-SQL use), in which case those forms raise a clear error.
+    /// </summary>
+    internal IVfpMemoryBridge? MemoryBridge { get; set; }
+
+    /// <summary>
     /// The optional query ACCELERATOR (e.g. the Highlike engine) that SELECT / DML candidate-set
     /// discovery routes through instead of the plain <see cref="QueryOptimizer"/>. When <see langword="null"/>
     /// (the default) the Core optimizer runs. An accelerator must return the SAME record set the Core

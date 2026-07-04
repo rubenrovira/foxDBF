@@ -35,11 +35,37 @@ namespace CrossVault.FoxDbf.Data;
 /// CREATE, the to-be-created table is recorded so a rollback deletes it); a <see cref="Commit"/> keeps the
 /// live change.
 /// </para>
+/// <para>
+/// ISOLATION LEVEL. The reported <see cref="IsolationLevel"/> is ALWAYS
+/// <see cref="System.Data.IsolationLevel.ReadCommitted"/> — the level this model actually delivers. Whatever a
+/// caller passed to <c>BeginTransaction(IsolationLevel)</c> is CLAMPED to it: a request for a stronger level
+/// (<see cref="System.Data.IsolationLevel.RepeatableRead"/> / <see cref="System.Data.IsolationLevel.Snapshot"/> /
+/// <see cref="System.Data.IsolationLevel.Serializable"/>) is NOT honoured (and NOT echoed back — the property
+/// never reports a level the transaction does not provide), and a request for a weaker one
+/// (<see cref="System.Data.IsolationLevel.ReadUncommitted"/> / <see cref="System.Data.IsolationLevel.Chaos"/>)
+/// is likewise served as ReadCommitted (uncommitted writes stay isolated regardless). This is DELIBERATE and
+/// honest: reporting ReadCommitted for every path is truthful, whereas honouring a stronger request would
+/// require snapshotting every table on first read (see the boundary note below).
+/// </para>
+/// <para>
+/// ISOLATION BOUNDARY (honest <see cref="System.Data.IsolationLevel.ReadCommitted"/>, the reported
+/// <see cref="IsolationLevel"/>). Read-your-own-writes and isolation-of-uncommitted-writes always hold, and a
+/// table the transaction has ALREADY WRITTEN reads its stable private copy (a foreign write to that table's
+/// live file is invisible to the transacting connection). A table the transaction has only READ, however, has
+/// NO private copy, so its reads go straight to the LIVE file: a FOREIGN process that commits a change to it
+/// mid-transaction BECOMES VISIBLE to a later read in the same transaction (a non-repeatable read). This is a
+/// DELIBERATE boundary — <see cref="System.Data.IsolationLevel.ReadCommitted"/> permits non-repeatable reads,
+/// and upgrading to repeatable-read/snapshot isolation would require snapshotting EVERY table on first read
+/// (a large, always-on cost even for read-only tables) and does not fit the optimistic, write-tracked
+/// concurrency model. To get a stable view of a table across the transaction, read it inside an explicit
+/// write (forcing a private copy) or serialize the foreign writer.
+/// </para>
 /// </summary>
 public sealed class FoxDbfTransaction : DbTransaction
 {
     private readonly FoxDbfConnection _connection;
     private readonly IsolationLevel _isolationLevel;
+    private readonly IsolationLevel _requestedIsolationLevel;
 
     // Per-table PRIVATE WORKING COPIES taken lazily on first DML write: live .dbf path -> the copy.
     private readonly Dictionary<string, WorkingCopy> _copies =
@@ -55,14 +81,28 @@ public sealed class FoxDbfTransaction : DbTransaction
     internal FoxDbfTransaction(FoxDbfConnection connection, IsolationLevel isolationLevel)
     {
         _connection = connection ?? throw new ArgumentNullException(nameof(connection));
-        _isolationLevel = isolationLevel == IsolationLevel.Unspecified
-            ? IsolationLevel.ReadCommitted
-            : isolationLevel;
+        // The copy-on-write model delivers EXACTLY ReadCommitted (read-your-own-writes + isolation of
+        // uncommitted writes, with the documented non-repeatable-read boundary for a not-yet-copied table).
+        // It can provide neither a STRONGER level (RepeatableRead / Snapshot / Serializable — that would need
+        // snapshotting every table on first read) nor a genuinely WEAKER one (ReadUncommitted / Chaos still
+        // hide another connection's uncommitted writes). So EVERY requested level — whatever the caller passed
+        // to BeginTransaction — is CLAMPED to ReadCommitted and the IsolationLevel property HONESTLY reports
+        // ReadCommitted, never echoing back a stronger level the transaction does not actually deliver.
+        _requestedIsolationLevel = isolationLevel;
+        _isolationLevel = IsolationLevel.ReadCommitted;
     }
 
     protected override DbConnection? DbConnection => _connection;
 
+    /// <summary>Always <see cref="System.Data.IsolationLevel.ReadCommitted"/> — the level the copy-on-write
+    /// model actually delivers. A caller that requested a stronger (or weaker) level via
+    /// <c>BeginTransaction(IsolationLevel)</c> was CLAMPED to it (<see cref="RequestedIsolationLevel"/> preserves
+    /// what was asked for); this property never reports a level the transaction does not honour.</summary>
     public override IsolationLevel IsolationLevel => _isolationLevel;
+
+    /// <summary>The isolation level the caller originally passed to <c>BeginTransaction</c> (before it was
+    /// clamped to the delivered <see cref="IsolationLevel"/> == ReadCommitted) — diagnostics only.</summary>
+    internal IsolationLevel RequestedIsolationLevel => _requestedIsolationLevel;
 
     /// <summary>True once this transaction has been committed, rolled back, or disposed — a second
     /// Commit/Rollback throws and the connection treats it as no longer active.</summary>

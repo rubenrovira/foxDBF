@@ -149,12 +149,33 @@ public sealed record ScalarSubqueryPredicate(
 //  INSERT / UPDATE / DELETE
 // ===========================================================================
 
-/// <summary><c>INSERT INTO [db'!']table [(col,...)] VALUES (expr,...)</c> (VALUES form only).</summary>
+/// <summary>The source of the rows an <c>INSERT</c> appends.</summary>
+public enum InsertSourceKind
+{
+    /// <summary><c>VALUES (expr,...)</c> — a single explicit row.</summary>
+    Values,
+    /// <summary><c>FROM ARRAY name</c> — one row per array row (2-D) or a single row (1-D), mapped to the
+    /// table's fields by POSITION (excess elements ignored, missing fields left blank).</summary>
+    Array,
+    /// <summary><c>FROM MEMVAR</c> — a single row whose fields map by NAME from the same-named
+    /// <c>m.&lt;field&gt;</c> memory variables (a field with no matching memvar is left blank).</summary>
+    Memvar,
+}
+
+/// <summary>
+/// <c>INSERT INTO [db'!']table [(col,...)] VALUES (expr,...)</c> — or, when <see cref="SourceKind"/> is
+/// <see cref="InsertSourceKind.Array"/> / <see cref="InsertSourceKind.Memvar"/>, the memory-source forms
+/// <c>INSERT INTO table FROM ARRAY name</c> / <c>INSERT INTO table FROM MEMVAR</c>. For the memory-source
+/// forms <see cref="Values"/> is empty and <see cref="Columns"/> is <see langword="null"/>;
+/// <see cref="SourceName"/> is the array name for the ARRAY form (and <see langword="null"/> for MEMVAR).
+/// </summary>
 public sealed record InsertStatement(
     string? Database,
     string Table,
     IReadOnlyList<string>? Columns,
-    IReadOnlyList<VfpExpression> Values) : SqlStatement;
+    IReadOnlyList<VfpExpression> Values,
+    InsertSourceKind SourceKind = InsertSourceKind.Values,
+    string? SourceName = null) : SqlStatement;
 
 /// <summary>One <c>col = expr</c> assignment in an UPDATE.</summary>
 public sealed record SetClause(

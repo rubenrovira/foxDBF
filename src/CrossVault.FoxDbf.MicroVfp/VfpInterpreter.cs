@@ -120,6 +120,10 @@ public sealed partial class VfpInterpreter
     {
         Session = session ?? throw new ArgumentNullException(nameof(session));
         Memory = new MemoryStore();
+        // Surface SELECT … INTO ARRAY / INSERT … FROM ARRAY|MEMVAR at the SQL layer against THIS session's
+        // memvar store: the SQL engine (SelectExecutor / DmlExecutor) reaches the store through this bridge,
+        // so both the microVFP SP path and the ADO.NET command path write/read the same active-session arrays.
+        Session.MemoryBridge = new MemvarBridge(this);
         Runtime = new RuntimeState();
         _row = new Row(this);
         _ctx = session.Context;
