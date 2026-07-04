@@ -88,6 +88,11 @@ public sealed partial class VfpInterpreter
     // microVFP writes through on every REPLACE/DELETE, so this only feeds SET("AUTOSAVE"). Default OFF.
     private bool _setAutosave;
 
+    // SET MEMOWIDTH TO n — the memo word-wrap column consulted by MEMLINES()/MLINE()/ATLINE()/…. VFP default
+    // is 50 and the MINIMUM is 8 (a smaller value is silently ignored — verified against vfp9.exe). Read back
+    // (as a NUMBER) by SET("MEMOWIDTH"). Global (not per-data-session), like the VFP setting.
+    private int _memoWidth = 50;
+
     // SET DATABASE TO [name] — the CURRENT-database designation over the single open DBC. An open DBC is
     // current by default (VFP: OPEN DATABASE makes it current); `SET DATABASE TO` with no name clears the
     // designation (DBC()/SET("DATABASE") = ""); `SET DATABASE TO name` re-selects it. Multi-DBC is out of
@@ -817,6 +822,7 @@ public sealed partial class VfpInterpreter
             case "NEAR": _setNear = OnOff(arg); break;          // failed-SEEK pointer parking; SET("NEAR").
             case "NULL": _ctx.NullSetting = OnOff(arg); break;  // CREATE/ALTER TABLE default nullability; SET("NULL").
             case "AUTOSAVE": _setAutosave = OnOff(arg); break;  // header-buffer flush policy; SET("AUTOSAVE").
+            case "MEMOWIDTH": SetMemoWidth(arg); break;         // memo word-wrap column for MEMLINES/MLINE; SET("MEMOWIDTH").
             case "DATASESSION": SetDataSession(arg); break;     // 5.14: SWITCH the active data session; TO current no-op, TO 0/non-existent → err 1540.
             case "DATABASE": SetDatabase(arg); break;           // current-DBC designation; feeds DBC()/SET("DATABASE").
             default: break; // TALK / COMPATIBLE / DATA / PROCEDURE / … — irrelevant to results.
@@ -866,6 +872,18 @@ public sealed partial class VfpInterpreter
     // DBC() (full path) and SET("DATABASE") (bare name) — see DbcPath / FnSet.
     private string CurrentDbPath()
         => (!_currentDbCleared && Session.Database is not null) ? (Session.DatabasePath ?? string.Empty) : string.Empty;
+
+    // SET MEMOWIDTH TO n. VFP silently IGNORES a value below the minimum of 8 (leaves the width unchanged —
+    // verified against vfp9.exe: after SET MEMOWIDTH TO 5, SET("MEMOWIDTH") still reports the prior value).
+    private void SetMemoWidth(string arg)
+    {
+        var parts = arg.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        int idx = parts.Length > 0 && parts[0].Equals("TO", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+        if (idx >= parts.Length) return;
+        var v = EvalText(parts[idx]);
+        int n = IsNumeric(v) ? (int)v.AsNumber : int.TryParse(v.AsString, out var p) ? p : -1;
+        if (n >= 8) _memoWidth = n;   // below 8 ⇒ ignored (width unchanged).
+    }
 
     private void SetReprocess(string arg)
     {

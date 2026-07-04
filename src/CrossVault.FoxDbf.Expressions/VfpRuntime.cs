@@ -414,8 +414,54 @@ internal static class VfpRuntime
             case "INLIST": return Inlist(args, ctx);
 
             default:
-                // Unknown function: never throw at evaluation time.
-                return VfpValue.Null;
+                // The §C.17/§C.18 string/DBCS-variant extras are dispatched in a SEPARATE method (below),
+                // NOT inline in this giant switch: keeping CallFunction's body — and hence its native stack
+                // frame, which the JIT allocates in full on entry even though a user-function call returns
+                // early at the host hook above — at its prior size is what preserves the MaxCallDepth
+                // recursion headroom (CallFunction sits on EVERY nested UDF call). Same rationale as the
+                // interpreter's TryInvokeFileIo split. Genuinely unknown names still fall through to .NULL.
+                return CallStringExtras(name, args);
+        }
+    }
+
+    /// <summary>The §C.17/§C.18 string / DBCS-variant additions (LEFTC/RIGHTC/SUBSTRC/STUFFC/CHRTRANC,
+    /// AT_C/RATC/ATCC, ISLEADBYTE, LIKE/LIKEC, NORMALIZE, TXTWIDTH), split out of <see cref="CallFunction"/>'s
+    /// hot switch on purpose (see its <c>default</c> arm). On a single-byte code page (CP1252, our target)
+    /// one char == one byte, so each C-variant is byte-identical to its base function (verified against the
+    /// VFP9 runtime); they exist purely for VFP9 name compatibility (FLAGGED: real double-byte behaviour is
+    /// untested). Returns <c>.NULL.</c> for a genuinely unknown name (CallFunction's former default).</summary>
+    private static VfpValue CallStringExtras(string name, VfpValue[] args)
+    {
+        switch (name)
+        {
+            case "LEFTC": return Left(args);
+            case "RIGHTC": return Right(args);
+            case "SUBSTRC": return Substr(args);
+            case "STUFFC": return Stuff(args);
+            case "CHRTRANC": return Chrtran(args);
+            case "AT_C": return VfpValue.Integer(At(args, fromEnd: false));
+            case "RATC": return VfpValue.Integer(At(args, fromEnd: true));
+            case "ATCC": return VfpValue.Integer(At(args, fromEnd: false, StringComparison.OrdinalIgnoreCase));
+            // ISLEADBYTE(cExpr): the first byte is a DBCS lead byte. Always .F. on a single-byte code page
+            // (VFP9-verified). Takes ONE argument only (a 2nd arg raises an error in VFP9); we ignore extras.
+            case "ISLEADBYTE": return VfpValue.Logical(false);
+            // LIKE(cPattern, cString) / LIKEC (its DBCS twin, identical on CP1252): anchored wildcard match,
+            // '*' = any run (incl. empty), '?' = exactly one char, everything else literal, case-SENSITIVE,
+            // trailing blanks significant on both sides (FOXPLUS default). No bracket classes.
+            case "LIKE":
+            case "LIKEC": return VfpValue.Logical(Like(Arg(args, 0).AsString, Arg(args, 1).AsString));
+            // NORMALIZE(cExpr): a PRAGMATIC canonicaliser — upper-cases outside string literals, drops
+            // whitespace, rewrites the `->` alias operator to `.`, and re-emits '/" literals double-quoted
+            // (content verbatim). FLAGGED (needs a full expression compiler, out of P3 scope): VFP also folds
+            // constant arithmetic ('1+2'→'3') and treats trailing text after a complete expression as a
+            // comment ('x y'→'X') — those two behaviours are deliberately NOT reproduced.
+            case "NORMALIZE": return VfpValue.Character(Normalize(Arg(args, 0).AsString));
+            // TXTWIDTH(cString [, cFont, nSize, cStyle]): headless — no GDI/font engine. Returns the CHARACTER
+            // COUNT, which is EXACT for a fixed-pitch font (VFP: TXTWIDTH(s,'Courier New',10) == LEN(s)) and a
+            // FLAGGED approximation for the proportional desktop font (that value is GUI-/machine-bound).
+            case "TXTWIDTH": return VfpValue.Integer(Arg(args, 0).AsString.Length);
+            // Unknown function: never throw at evaluation time.
+            default: return VfpValue.Null;
         }
     }
 
@@ -527,7 +573,7 @@ internal static class VfpRuntime
         }
     }
 
-    private static int At(VfpValue[] a, bool fromEnd)
+    private static int At(VfpValue[] a, bool fromEnd, StringComparison cmp = StringComparison.Ordinal)
     {
         string f = Arg(a, 0).AsString;
         string w = Arg(a, 1).AsString;
@@ -540,7 +586,7 @@ internal static class VfpRuntime
             int from = 0;
             for (int k = 0; k < occ; k++)
             {
-                idx = w.IndexOf(f, from, StringComparison.Ordinal);
+                idx = w.IndexOf(f, from, cmp);
                 if (idx < 0) break;
                 from = idx + 1;
             }
@@ -551,7 +597,7 @@ internal static class VfpRuntime
             for (int k = 0; k < occ; k++)
             {
                 if (start < 0) { idx = -1; break; }
-                idx = w.LastIndexOf(f, start, StringComparison.Ordinal);
+                idx = w.LastIndexOf(f, start, cmp);
                 if (idx < 0) break;
                 start = idx - 1;
             }
@@ -587,6 +633,51 @@ internal static class VfpRuntime
             // else: char is deleted (replacement shorter than search).
         }
         return VfpValue.Character(sb.ToString());
+    }
+
+    /// <summary>VFP <c>LIKE()</c> wildcard match: <c>*</c> matches any run (including empty), <c>?</c>
+    /// matches exactly one character, every other character is literal. Case-SENSITIVE and fully anchored
+    /// (the whole string must match), so trailing blanks are significant on both sides. Iterative
+    /// backtracking matcher (no recursion, linear-ish).</summary>
+    private static bool Like(string pat, string s)
+    {
+        int p = 0, si = 0, star = -1, ss = 0;
+        while (si < s.Length)
+        {
+            if (p < pat.Length && (pat[p] == '?' || pat[p] == s[si])) { p++; si++; }
+            else if (p < pat.Length && pat[p] == '*') { star = p; ss = si; p++; }
+            else if (star != -1) { p = star + 1; ss++; si = ss; }
+            else return false;
+        }
+        while (p < pat.Length && pat[p] == '*') p++;
+        return p == pat.Length;
+    }
+
+    /// <summary>VFP <c>NORMALIZE()</c> — pragmatic canonicaliser (see the dispatch comment for the FLAGGED
+    /// limits). Outside string literals: upper-case letters, drop spaces/tabs, rewrite <c>-&gt;</c> to
+    /// <c>.</c>. A <c>'</c>- or <c>"</c>-delimited literal is re-emitted double-quoted with its content
+    /// verbatim (case preserved, inner spaces preserved).</summary>
+    private static string Normalize(string e)
+    {
+        var sb = new StringBuilder(e.Length);
+        int i = 0;
+        while (i < e.Length)
+        {
+            char c = e[i];
+            if (c == '\'' || c == '"')
+            {
+                char q = c;
+                i++;
+                sb.Append('"');
+                while (i < e.Length && e[i] != q) { sb.Append(e[i]); i++; }
+                if (i < e.Length) i++;                 // consume the closing delimiter
+                sb.Append('"');
+            }
+            else if (c == ' ' || c == '\t') i++;       // whitespace dropped
+            else if (c == '-' && i + 1 < e.Length && e[i + 1] == '>') { sb.Append('.'); i += 2; }
+            else { sb.Append(char.ToUpperInvariant(c)); i++; }
+        }
+        return sb.ToString();
     }
 
     private static VfpValue Replicate(VfpValue[] a)

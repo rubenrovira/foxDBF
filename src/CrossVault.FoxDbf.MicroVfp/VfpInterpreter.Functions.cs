@@ -172,7 +172,81 @@ public sealed partial class VfpInterpreter
             case "FFLUSH": r = FnFFlush(a); return true;
             case "FCHSIZE": r = FnFChSize(a); return true;
             case "DBUSED": r = VfpValue.Logical(FnDbUsed(a)); return true;
-            default: r = VfpValue.Null; return false;
+            // STRTOFILE()/FILETOSTR() — high-level one-shot file write/read (no handle subsystem). Grouped
+            // with the low-level file I/O; they live here so HostInvoke's hot switch stays small (stack depth).
+            case "STRTOFILE": r = FnStrToFile(a); return true;
+            case "FILETOSTR": r = FnFileToStr(a); return true;
+            // Chain onwards to the memo-line (MEMLINES/MLINE/ATLINE…) dispatch — same rationale: keep each
+            // switch's native frame small so the MaxCallDepth recursion headroom is preserved.
+            default: return TryInvokeMemoLines(name, a, out r);
+        }
+    }
+
+    // ─────────────────────────── STRTOFILE / FILETOSTR (MICROVFP_EXTENSIONS_BACKLOG §C.18) ───────────────────────────
+
+    // STRTOFILE(cString, cFileName [, nFlag | lAdditive]) → bytes written. Flags (VFP9-verified):
+    //   .F./0 = overwrite (no BOM); .T./1 = ADDITIVE (append, no BOM);
+    //   2 = overwrite + UTF-16LE BOM (FF FE); 4 = overwrite + UTF-8 BOM (EF BB BF).
+    // The string bytes are written AS-IS (the BOM flags only PREPEND a marker — no re-encoding); the return
+    // value counts the BOM. SET SAFETY prompting is not modelled (headless) — it always overwrites, matching
+    // FCREATE. A numeric flag outside {0,1,2,4} raises VFP err 11 (verified against VFP9 — real VFP rejects
+    // it, it does NOT silently overwrite). On an I/O failure STRTOFILE returns 0 (VFP9-verified — NOT -1).
+    private VfpValue FnStrToFile(VfpValue[] a)
+    {
+        if (a.Length < 2)
+            throw new MicroVfpRuntimeException("Function argument value, type, or count is invalid.", 11); // VFP err 11.
+        string path = a[1].AsString;
+        byte[] data = LlEncoding.GetBytes(a[0].AsString);
+        bool additive = false;
+        byte[] bom = Array.Empty<byte>();
+        if (a.Length > 2)
+        {
+            var f = a[2];
+            if (f.Type == VfpType.Logical) additive = f.AsLogical;
+            else
+            {
+                int flag = (int)f.AsNumber;
+                switch (flag)
+                {
+                    case 0: break;                                       // overwrite, no BOM.
+                    case 1: additive = true; break;                     // ADDITIVE (append).
+                    case 2: bom = new byte[] { 0xFF, 0xFE }; break;      // UTF-16LE BOM.
+                    case 4: bom = new byte[] { 0xEF, 0xBB, 0xBF }; break;// UTF-8 BOM.
+                    default:
+                        // Not a bitmask — only exact {0,1,2,4} are valid; anything else is VFP err 11.
+                        throw new MicroVfpRuntimeException("Function argument value, type, or count is invalid.", 11);
+                }
+            }
+        }
+        try
+        {
+            if (additive)
+            {
+                using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                fs.Write(data, 0, data.Length);
+                return VfpValue.Integer(data.Length);
+            }
+            using var fw = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+            if (bom.Length > 0) fw.Write(bom, 0, bom.Length);
+            fw.Write(data, 0, data.Length);
+            return VfpValue.Integer(bom.Length + data.Length);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return VfpValue.Integer(0);   // VFP9 returns 0 on a write failure (verified) — NOT a -1 sentinel.
+        }
+    }
+
+    // FILETOSTR(cFileName) → the file's whole content as a (byte) string. A missing/unreadable file raises a
+    // trappable VFP err 1 "File does not exist." (verified against VFP9 — it does NOT return an empty string).
+    private VfpValue FnFileToStr(VfpValue[] a)
+    {
+        if (a.Length < 1)
+            throw new MicroVfpRuntimeException("Function argument value, type, or count is invalid.", 11); // VFP err 11.
+        try { return VfpValue.Character(LlEncoding.GetString(File.ReadAllBytes(a[0].AsString))); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            throw new MicroVfpRuntimeException("File does not exist.", 1);   // VFP err 1 (verified against VFP9).
         }
     }
 
@@ -265,6 +339,7 @@ public sealed partial class VfpInterpreter
             "NEAR" => VfpValue.Character(_setNear ? "ON" : "OFF"),
             "NULL" => VfpValue.Character(_ctx.NullSetting ? "ON" : "OFF"),
             "AUTOSAVE" => VfpValue.Character(_setAutosave ? "ON" : "OFF"),
+            "MEMOWIDTH" => VfpValue.Number((decimal)_memoWidth), // NUMERIC (verified vs vfp9.exe: VARTYPE = "N").
             "RELATION" => VfpValue.Character(RelationSetString(Session.CurrentArea)),  // reproduces the SET RELATION args.
             "SKIP" => VfpValue.Character(SkipSetString(Session.CurrentArea)),          // comma-list of 1:n aliases.
             "DATASESSION" => VfpValue.Number((decimal)Session.CurrentDataSessionId),   // NUMERIC (verified vs vfp9.exe) — the current data-session id (5.14).
@@ -334,6 +409,21 @@ public sealed partial class VfpInterpreter
             case 1: return VfpValue.Character(JulianDay(DateTime.Today).ToString(CultureInfo.InvariantCulture));
             // SYS(10, nJulianDay) — Julian-day number → date string (inverse of SYS(11)). STUB, RED until implemented.
             case 10: return FnSys10(a);
+            // SYS(15, cTransTable, cExpr) — character translation. Each char c of cExpr is replaced by the byte
+            // at 1-based position ASC(c) of cTransTable; a code outside [1, LEN(table)] keeps the char verbatim
+            // (verified vs vfp9.exe: identity table maps 'A'→'@', i.e. CHR(ASC(c)-1); table is arg2, expr arg3).
+            case 15:
+            {
+                if (a.Length < 3) return VfpValue.Character(string.Empty);
+                string table = a[1].AsString, src = a[2].AsString;
+                var sb = new StringBuilder(src.Length);
+                foreach (char c in src)
+                {
+                    int code = c;                                   // ASC (byte value on the Latin1-backed string)
+                    sb.Append(code >= 1 && code <= table.Length ? table[code - 1] : c);
+                }
+                return VfpValue.Character(sb.ToString());
+            }
             // SYS(14, nIndexNumber [, area]) — the KEY expression of the nth open index, ALL-CAPS (s4g266).
             // Unlike KEY(), SYS(14) REQUIRES the index number; an out-of-range number yields "" (no error).
             case 14:
