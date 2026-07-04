@@ -580,6 +580,7 @@ public static class PrgParser
                 "GATHER" => BuildGather(text),
                 "SCATTER" => BuildScatter(text),
                 "APPEND" => BuildAppend(text),
+                "BLANK" => BuildBlank(text),
                 "COPY" => BuildCopy(text),
                 "TOTAL" => BuildTotal(text),
                 "PACK" => BuildPack(text),
@@ -1066,9 +1067,14 @@ public static class PrgParser
             return new OnErrorStmt(OnErrorKind.Command, BuildSimple(command, line), null, command);
         }
 
-        private static ReplaceStmt BuildReplace(string text)
+        private static PrgStatement BuildReplace(string text)
         {
             string rest = PrgScan.AfterFirstWord(text);
+            // REPLACE FROM ARRAY aArray [FIELDS cList] [scope] [FOR][WHILE][IN] — the SCATTER inverse: a
+            // structurally different grammar (no field-WITH pairs), so it is peeled off up front.
+            if (PrgScan.FirstWord(rest) == "FROM" && PrgScan.SecondWord(rest) == "ARRAY")
+                return BuildReplaceFromArray(PrgScan.AfterFirstWord(PrgScan.AfterFirstWord(rest)));
+
             var (body, segs) = Carve(rest, "FOR", "WHILE", "IN");
             // A leading scope (ALL / REST / NEXT n / RECORD n) precedes the first field-WITH pair;
             // peel it off so ToNameRef never builds a malformed field like "ALL setup.value".
@@ -1099,6 +1105,37 @@ public static class PrgParser
                 else if (k == "IN") inArea = ToNameRef(FirstToken(b));
             }
             return new ReplaceStmt(clauses, scope, forE, whileE, inArea);
+        }
+
+        /// <summary><c>REPLACE FROM ARRAY aArray [FIELDS cList] [scope] [FOR][WHILE][IN]</c> (the text after
+        /// <c>FROM ARRAY</c>). The array name leads; FIELDS/scope/FOR/WHILE/IN follow.</summary>
+        private static PrgStatement BuildReplaceFromArray(string rest)
+        {
+            var (head, segs) = Carve(rest, "FIELDS", "FOR", "WHILE", "IN");
+            var (leadScope, arrayPart) = CarveLeadingScope(head);
+            // Per VFP syntax the scope TRAILS the array name (REPLACE FROM ARRAY a ALL) — peel it so the
+            // executor sees the scope (and rejects the unmodelled multi-record form) instead of silently
+            // dropping "ALL" and doing a current-record-only write.
+            string? trailScope = PeelTrailingScope(ref arrayPart);
+            string? scope = leadScope ?? trailScope;
+            string arrayName = FirstToken(arrayPart);
+            PrgExpr? forE = SegBody(segs, "FOR") is { Length: > 0 } fb ? PrgExpr.Parse(fb) : null;
+            PrgExpr? whileE = SegBody(segs, "WHILE") is { Length: > 0 } wb ? PrgExpr.Parse(wb) : null;
+            NameRef? inArea = SegBody(segs, "IN") is { Length: > 0 } ib ? ToNameRef(FirstToken(ib)) : null;
+            return new ReplaceFromArrayStmt(arrayName, FieldsOf(segs), scope, forE, whileE, inArea);
+        }
+
+        /// <summary><c>BLANK [FIELDS cList] [scope] [FOR lExpr] [WHILE lExpr] [IN area]</c>. An absent FIELDS
+        /// list blanks every field of the (scoped) record(s).</summary>
+        private static PrgStatement BuildBlank(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);   // after BLANK
+            var (head, segs) = Carve(rest, "FIELDS", "FOR", "WHILE", "IN");
+            var (scope, _) = CarveLeadingScope(head);
+            PrgExpr? forE = SegBody(segs, "FOR") is { Length: > 0 } fb ? PrgExpr.Parse(fb) : null;
+            PrgExpr? whileE = SegBody(segs, "WHILE") is { Length: > 0 } wb ? PrgExpr.Parse(wb) : null;
+            NameRef? inArea = SegBody(segs, "IN") is { Length: > 0 } ib ? ToNameRef(FirstToken(ib)) : null;
+            return new BlankStmt(FieldsOf(segs), scope, forE, whileE, inArea);
         }
 
         /// <summary>Peels a leading record scope (<c>ALL</c> / <c>REST</c> / <c>NEXT n</c> /
@@ -1273,6 +1310,16 @@ public static class PrgParser
         private static PrgStatement BuildAppend(string text)
         {
             string rest = PrgScan.AfterFirstWord(text);   // after APPEND
+            // APPEND MEMO mField FROM cFile [OVERWRITE] [AS nCodePage] — copy a file's content into a memo.
+            if (PrgScan.FirstWord(rest) == "MEMO")
+            {
+                string r2 = PrgScan.AfterFirstWord(rest);   // after MEMO
+                var (memoHead, memoSegs) = Carve(r2, "FROM", "OVERWRITE", "AS");
+                var memoField = ToNameRef(FirstToken(memoHead));
+                var memoSource = ToNameRef(FirstToken(SegBody(memoSegs, "FROM") ?? string.Empty));
+                string? asCp = SegBody(memoSegs, "AS") is { Length: > 0 } asBody ? asBody.Trim() : null;
+                return new AppendMemoStmt(memoField, memoSource, HasKw(memoSegs, "OVERWRITE"), asCp);
+            }
             if (PrgScan.FirstWord(rest) != "FROM")
                 return new UnknownCommand("APPEND", rest);
             string body = PrgScan.AfterFirstWord(rest);   // after FROM
@@ -1314,6 +1361,28 @@ public static class PrgParser
                 var memoField = ToNameRef(FirstToken(head));
                 var target = ToNameRef(FirstToken(SegBody(segs, "TO") ?? string.Empty));
                 return new CopyToStmt(target, Array.Empty<string>(), null, null, Memo: true, memoField);
+            }
+            // COPY INDEXES cIdxList | ALL [TO cCdx] — convert open standalone .idx files into cdx tags.
+            if (fw is "INDEXES" or "INDEX")
+            {
+                string r2 = PrgScan.AfterFirstWord(rest);   // after INDEXES
+                var (head, segs) = Carve(r2, "TO");
+                bool all = PrgScan.FirstWord(head).Equals("ALL", StringComparison.OrdinalIgnoreCase);
+                var sources = all
+                    ? (IReadOnlyList<NameRef>)Array.Empty<NameRef>()
+                    : PrgScan.SplitTopCommas(head).Select(FirstToken).Where(t => t.Length > 0).Select(ToNameRef).ToList();
+                NameRef? toCdx = SegBody(segs, "TO") is { Length: > 0 } tb ? ToNameRef(FirstToken(tb)) : null;
+                return new CopyIndexesStmt(sources, all, toCdx);
+            }
+            // COPY TAG cTag [OF cCdx] TO cIdx — extract one cdx tag as a standalone .idx.
+            if (fw == "TAG")
+            {
+                string r2 = PrgScan.AfterFirstWord(rest);   // after TAG
+                var (head, segs) = Carve(r2, "OF", "TO");
+                var tag = ToNameRef(FirstToken(head));
+                NameRef? ofCdx = SegBody(segs, "OF") is { Length: > 0 } ob ? ToNameRef(FirstToken(ob)) : null;
+                var toIdx = ToNameRef(FirstToken(SegBody(segs, "TO") ?? string.Empty));
+                return new CopyTagStmt(tag, ofCdx, toIdx);
             }
             return new UnknownCommand("COPY", rest);
         }

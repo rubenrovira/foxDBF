@@ -513,6 +513,11 @@ public sealed partial class VfpInterpreter
             case CopyStructureStmt cs: ExecCopyStructure(cs); break;
             case CopyToStmt ct: ExecCopyTo(ct); break;
             case CreateFromStmt cf: ExecCreateFrom(cf); break;
+            case BlankStmt bl: ExecBlank(bl); break;
+            case AppendMemoStmt am: ExecAppendMemo(am); break;
+            case CopyIndexesStmt ci: ExecCopyIndexes(ci); break;
+            case CopyTagStmt cta: ExecCopyTag(cta); break;
+            case ReplaceFromArrayStmt rfa: ExecReplaceFromArray(rfa); break;
             case TotalStmt tot: ExecTotal(tot); break;
             case PackStmt pk: ExecPack(pk); break;
             case RenameTableStmt rt: ExecRenameTable(rt); break;
@@ -825,6 +830,12 @@ public sealed partial class VfpInterpreter
             case "MEMOWIDTH": SetMemoWidth(arg); break;         // memo word-wrap column for MEMLINES/MLINE; SET("MEMOWIDTH").
             case "DATASESSION": SetDataSession(arg); break;     // 5.14: SWITCH the active data session; TO current no-op, TO 0/non-existent → err 1540.
             case "DATABASE": SetDatabase(arg); break;           // current-DBC designation; feeds DBC()/SET("DATABASE").
+            case "BLOCKSIZE": SetBlockSize(arg); break;         // memo (.fpt) block size for the NEXT created table; SET("BLOCKSIZE").
+            case "TEXTMERGE": SetTextMerge(arg); break;         // ON/OFF + DELIMITERS TO; SET("TEXTMERGE"); default delims for TEXTMERGE().
+            // SET NOCPTRANS TO [FieldList] [ADDITIVE] — a FoxPro-2.x runtime relic. The real (persistent)
+            // NOCPTRANS semantics live on the column 0x04 flag (already fully honoured on the read path);
+            // this runtime override is accepted as a no-op. FLAG: no runtime per-field code-page override.
+            case "NOCPTRANS": break;
             default: break; // TALK / COMPATIBLE / DATA / PROCEDURE / … — irrelevant to results.
         }
     }

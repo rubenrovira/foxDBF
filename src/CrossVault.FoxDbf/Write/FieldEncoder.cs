@@ -232,6 +232,13 @@ public static class FieldEncoder
 
     private static void WriteDate(Span<byte> dest, DateOnly d)
     {
+        // The EMPTY date ({}) is stored as all-spaces (the blank-date bytes VFP writes), NOT "00010101" —
+        // so REPLACE dfield WITH {} blanks the field (and ISBLANK()/EMPTY() read it back as blank/null).
+        if (d == default)
+        {
+            dest.Fill((byte)' ');
+            return;
+        }
         // YYYYMMDD, zero-padded; the inverse of FieldDecoder.DecodeDate.
         string s = $"{d.Year:0000}{d.Month:00}{d.Day:00}";
         int n = Math.Min(s.Length, dest.Length);
@@ -246,6 +253,15 @@ public static class FieldEncoder
     {
         if (dest.Length < 8)
             return;
+        // The EMPTY datetime ({}) is stored as all-zero bytes — exactly the days==0 sentinel
+        // FieldDecoder.DecodeDateTime maps back to null — mirroring WriteDate's blank handling. Without
+        // this, default(DateTime) would encode days=JdnEpoch (a REAL {^0001-01-01}), so REPLACE tfield
+        // WITH {} would round-trip to a non-empty value and EMPTY()/ISBLANK() would flip to .F.
+        if (dt == default)
+        {
+            dest[..8].Clear();
+            return;
+        }
         int days = DateOnly.FromDateTime(dt).DayNumber + JdnEpoch;
         int ms = (int)Math.Round(dt.TimeOfDay.TotalMilliseconds, MidpointRounding.AwayFromZero);
         BinaryPrimitives.WriteInt32LittleEndian(dest, days);

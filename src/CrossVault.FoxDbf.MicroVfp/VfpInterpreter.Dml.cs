@@ -513,7 +513,8 @@ public sealed partial class VfpInterpreter
         int savRec = m.RecNo; bool savEof = m.Eof, savBof = m.Bof;
         try
         {
-            using var writer = DbfWriter.Create(targetPath, defs, new DbfCreateOptions { Overwrite = true });
+            // SET BLOCKSIZE feeds the .fpt block size of the memo file this COPY TO creates.
+            using var writer = DbfWriter.Create(targetPath, defs, new DbfCreateOptions { Overwrite = true, MemoBlockSize = MemoBlockBytes() });
             int rc = wa.Table.RecordCount;
             for (int rec = 1; rec <= rc; rec++)
             {

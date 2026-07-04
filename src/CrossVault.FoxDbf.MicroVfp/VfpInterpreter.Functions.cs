@@ -109,7 +109,6 @@ public sealed partial class VfpInterpreter
             case "TABLEUPDATE": r = FnTableUpdate(a); return true;
             case "TABLEREVERT": r = FnTableRevert(a); return true;
             case "GETFLDSTATE": r = FnGetFldState(a); return true;
-            case "SETFLDSTATE": r = VfpValue.Logical(true); return true;      // s4g395: practically inert for real tables — accepted, no-op.
             case "OLDVAL": r = FnOldVal(a); return true;
             case "CURVAL": r = FnCurVal(a); return true;
             case "MESSAGEBOX": r = VfpValue.Integer(6); return true;           // IDYES (never reached in targets).
@@ -145,10 +144,11 @@ public sealed partial class VfpInterpreter
             case "AUSED": r = VfpValue.Integer(FnAUsed(a)); return true;
             case "ASESSIONS": r = VfpValue.Integer(FnASessions(a)); return true;
 
-            // Low-level file I/O (§C.2) + DBUSED (§C.5) live in their OWN dispatch method, NOT inline here:
-            // keeping this hot switch's method body (and hence its native stack frame) at its prior size is
-            // what preserves the MaxCallDepth recursion headroom — HostInvoke sits on EVERY nested UDF call.
-            default: return TryInvokeFileIo(name, a, out r);
+            // Low-level file I/O (§C.2) + DBUSED (§C.5) + the P3 field/record/index batch (§C.6/8/9/11/12)
+            // live in their OWN dispatch methods, NOT inline here: keeping this hot switch's method body (and
+            // hence its native stack frame) at its prior size is what preserves the MaxCallDepth recursion
+            // headroom — HostInvoke sits on EVERY nested UDF call.
+            default: return TryInvokeFieldIdx(name, a, out r);
         }
     }
 
@@ -340,6 +340,13 @@ public sealed partial class VfpInterpreter
             "NULL" => VfpValue.Character(_ctx.NullSetting ? "ON" : "OFF"),
             "AUTOSAVE" => VfpValue.Character(_setAutosave ? "ON" : "OFF"),
             "MEMOWIDTH" => VfpValue.Number((decimal)_memoWidth), // NUMERIC (verified vs vfp9.exe: VARTYPE = "N").
+            // SET("BLOCKSIZE") returns the RAW value that was set (1..32 = ×512, 33+ = bytes) — NOT the byte
+            // count SYS(2012) reports (hackfox s4g089). NUMERIC. TEXTMERGE reads back ON/OFF; SET("TEXTMERGE",1)
+            // is the concatenated begin+end delimiters (default "<<>>").
+            "BLOCKSIZE" => VfpValue.Number((decimal)_blockSize),
+            "TEXTMERGE" => a.Length > 1 && IsNumeric(a[1]) && (int)a[1].AsNumber == 1
+                ? VfpValue.Character(_tmDelimBegin + _tmDelimEnd)
+                : VfpValue.Character(_textMerge ? "ON" : "OFF"),
             "RELATION" => VfpValue.Character(RelationSetString(Session.CurrentArea)),  // reproduces the SET RELATION args.
             "SKIP" => VfpValue.Character(SkipSetString(Session.CurrentArea)),          // comma-list of 1:n aliases.
             "DATASESSION" => VfpValue.Number((decimal)Session.CurrentDataSessionId),   // NUMERIC (verified vs vfp9.exe) — the current data-session id (5.14).
@@ -432,6 +439,15 @@ public sealed partial class VfpInterpreter
                 var slot = ResolveSlot(a.Skip(1).ToArray());
                 return VfpValue.Character(slot?.KeyExpr.ToUpperInvariant() ?? string.Empty);
             }
+            // SYS(21 [, area]) — the NUMBER of the controlling index (legacy TAGNO of the master), "0" when
+            // natural order. SYS(22 [, area]) — its NAME (legacy ORDER()), "" when natural. Both return a
+            // CHARACTER string (verified vs vfp9.exe). hackfox rates them obsolete vs TAGNO()/ORDER().
+            case 21: return VfpValue.Character(FnTagNo(a.Skip(1).ToArray()).ToString(CultureInfo.InvariantCulture));
+            case 22: return VfpValue.Character(a.Length > 1 ? FnOrder(a.Skip(1).ToArray()) : FnOrder(Array.Empty<VfpValue>()));
+            // SYS(2021, nIndexNumber [, area]) — the FOR filter of the n-th open index, ALL-CAPS (like FOR();
+            // the number is REQUIRED). FLAG: VFP preserves the case of QUOTED strings inside the FOR here
+            // (s4g266) — microVFP uppercases the whole expression (no re-tokenizer), matching non-quoted FORs.
+            case 2021: return VfpValue.Character(a.Length < 2 ? string.Empty : (ResolveSlot(a.Skip(1).ToArray())?.ForExpr.ToUpperInvariant() ?? string.Empty));
             case 2007: return VfpValue.Character(Crc16Ccitt(a.Length > 1 ? a[1].AsString : string.Empty).ToString(CultureInfo.InvariantCulture));
             case 2015: return VfpValue.Character("_" + Guid.NewGuid().ToString("N")[..9].ToUpperInvariant());
             default: return VfpValue.Character(string.Empty);

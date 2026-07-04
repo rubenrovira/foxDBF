@@ -379,6 +379,43 @@ internal sealed record CopyToStmt(
 /// structure-descriptor table (the inverse of <c>COPY STRUCTURE EXTENDED</c>).</summary>
 internal sealed record CreateFromStmt(NameRef Table, NameRef From) : PrgStatement;
 
+/// <summary><c>BLANK [FIELDS cList] [scope] [FOR lExpr] [WHILE lExpr] [IN area]</c> — reset the current
+/// (or scoped) record's fields to their type-specific BLANK bytes (all-spaces for C/N/D/L, all-zero for
+/// binary), the write-side counterpart of <c>ISBLANK()</c>. An empty <see cref="Fields"/> list blanks
+/// every field. microVFP P3 §C.8.</summary>
+internal sealed record BlankStmt(
+    IReadOnlyList<string> Fields,
+    string? Scope,
+    PrgExpr? For,
+    PrgExpr? While,
+    NameRef? In) : PrgStatement;
+
+/// <summary><c>APPEND MEMO mField FROM cFile [OVERWRITE] [AS nCodePage]</c> — copy the file's content into
+/// the current record's memo field; additive by default, replacing when <see cref="Overwrite"/>. The bytes
+/// are copied 1:1 (binary-safe). <see cref="AsCodePage"/> carries the raw <c>AS</c> argument when present
+/// (codepage translation is unsupported → rejected by the executor). microVFP P3 §C.12.</summary>
+internal sealed record AppendMemoStmt(NameRef Field, NameRef Source, bool Overwrite, string? AsCodePage = null) : PrgStatement;
+
+/// <summary><c>COPY INDEXES cIdxList | ALL [TO cCdx]</c> — compile the named open standalone <c>.idx</c>
+/// files as new tags (named after each source file's stem) in the structural (or named <see cref="ToCdx"/>)
+/// compound index. <see cref="All"/> converts every open standalone index. microVFP P3 §C.9.</summary>
+internal sealed record CopyIndexesStmt(IReadOnlyList<NameRef> Sources, bool All, NameRef? ToCdx) : PrgStatement;
+
+/// <summary><c>COPY TAG cTag [OF cCdx] TO cIdx</c> — extract one compound-index tag as a standalone legacy
+/// <c>.idx</c> file. microVFP P3 §C.9.</summary>
+internal sealed record CopyTagStmt(NameRef Tag, NameRef? OfCdx, NameRef ToIdx) : PrgStatement;
+
+/// <summary><c>REPLACE FROM ARRAY aArray [FIELDS cList] [scope] [FOR lExpr] [WHILE lExpr] [IN area]</c> —
+/// update the current (or scoped) record's fields from an array, element i → field i in physical field
+/// order (or the FIELDS list). The SCATTER inverse. microVFP P3 §C.12.</summary>
+internal sealed record ReplaceFromArrayStmt(
+    string ArrayName,
+    IReadOnlyList<string> Fields,
+    string? Scope,
+    PrgExpr? For,
+    PrgExpr? While,
+    NameRef? In) : PrgStatement;
+
 /// <summary><c>TOTAL ON eKey TO cFile [FIELDS nList] [FOR lExpr]</c> — one output row per group of
 /// consecutive equal <see cref="Key"/> values, with the numeric <see cref="Fields"/> summed across the
 /// group (all numeric fields when the list is empty). Requires the source ordered on the key.</summary>

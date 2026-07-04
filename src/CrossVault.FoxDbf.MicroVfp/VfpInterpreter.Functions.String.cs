@@ -388,8 +388,10 @@ public sealed partial class VfpInterpreter
     {
         if (a.Length == 0) return string.Empty;
         string s = a[0].AsString;
-        string beg = a.Length > 2 && a[2].Type == VfpType.Character && a[2].AsString.Length > 0 ? a[2].AsString : "<<";
-        string end = a.Length > 3 && a[3].Type == VfpType.Character && a[3].AsString.Length > 0 ? a[3].AsString : ">>";
+        // Per-call delimiters win; otherwise the session default set by SET TEXTMERGE DELIMITERS TO (which
+        // itself defaults to "<<"/">>").
+        string beg = a.Length > 2 && a[2].Type == VfpType.Character && a[2].AsString.Length > 0 ? a[2].AsString : _tmDelimBegin;
+        string end = a.Length > 3 && a[3].Type == VfpType.Character && a[3].AsString.Length > 0 ? a[3].AsString : _tmDelimEnd;
         var sb = new StringBuilder(s.Length);
         int i = 0;
         while (i < s.Length)

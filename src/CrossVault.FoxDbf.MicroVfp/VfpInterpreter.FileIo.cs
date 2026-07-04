@@ -77,8 +77,15 @@ public sealed partial class VfpInterpreter : IDisposable
     // (DATABASES/TABLES/INDEXES) do NOT touch them; work-area/database closing stays as it was.
     private void ExecCloseCommand(string args)
     {
-        if (string.Equals(PrgScan.FirstWord(args), "ALL", StringComparison.OrdinalIgnoreCase))
+        string what = PrgScan.FirstWord(args);
+        if (string.Equals(what, "ALL", StringComparison.OrdinalIgnoreCase))
             CloseAllLowLevelHandles();
+        // CLOSE INDEXES — close every NON-structural index of the current work area (standalone .idx +
+        // non-structural .cdx); the structural .cdx (auto-opened by USE) is untouched (hackfox s4g792).
+        // Identical effect to SET INDEX TO with no files.
+        else if (string.Equals(what, "INDEXES", StringComparison.OrdinalIgnoreCase)
+              || string.Equals(what, "INDEX", StringComparison.OrdinalIgnoreCase))
+            CloseNonStructuralIndexes(Session.CurrentArea);
     }
 
     // Only ReadOnly/Hidden/System are meaningful for FCREATE's nAttribute (0 = normal). Best-effort — the
