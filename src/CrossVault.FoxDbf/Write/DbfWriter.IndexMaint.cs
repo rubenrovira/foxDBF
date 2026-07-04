@@ -44,6 +44,24 @@ public sealed partial class DbfWriter
     // (read fresh from the header on every edit), so caching the computer is safe.
     private Dictionary<string, CdxIndexBuilder.TagKeyComputer?>? _tagComputers;
 
+    // ── cached incremental-CDX maintenance editor (ROADMAP item 2 — write battle W1 + W3 fix) ─────────
+    // A single-row APPEND or keyed-UPDATE loop previously re-OPENED the structural .cdx, re-parsed its header,
+    // re-walked the tag directory (ReadTags) and re-resolved every tag's key computer on EVERY row — that
+    // per-row open/parse dominated the cost (the bulk AppendRecords path already amortizes all of it under
+    // ONE editor session, and was ~87x faster for the identical inserts). We now keep the read/write .cdx
+    // stream + its CdxTreeEditor + the resolved per-tag plans open ACROSS a run of incremental edits (appends
+    // AND in-place updates share ONE editor), reusing them, and STILL flush after every row — so on-disk
+    // visibility and the resulting .cdx bytes are IDENTICAL to the per-row open/edit/flush/close path (a fresh
+    // editor re-reads rw.Length for its _end; the cached editor tracks the same value in memory; every tag
+    // root is re-read live on each Insert/Delete, so a split/shrink mid-loop is honoured).
+    //   The cache is a PURE incremental accelerator: any operation that opens its OWN .cdx handle or replaces
+    // the file (a BATCH append's one-shot session, PACK/ZAP/tag-DDL invalidation, a §D5 Alter reopen) or a
+    // public Flush/Dispose tears it down first (CloseCdxMaint), so two editors never coexist on the file and
+    // no stale handle blocks a delete.
+    private FileStream? _cdxMaintStream;
+    private CdxTreeEditor? _cdxMaintEditor;
+    private List<(CdxTreeEditor.TagHandle Tag, CdxIndexBuilder.TagKeyComputer Computer)>? _cdxMaintPlans;
+
     /// <summary>True when a structural <c>.cdx</c> exists and should be incrementally maintained on writes.
     /// False for a table with no structural index (must stay 100% untouched) or once maintenance has already
     /// physically invalidated the sidecar (it no longer exists on disk — a rebuild is pending anyway). This
@@ -59,37 +77,83 @@ public sealed partial class DbfWriter
     private void MaintainIndexesAfterAppend(int recNo, DbfRecord newRecord)
     {
         if (!ShouldMaintainIndexes())
+        {
+            CloseCdxMaint(flush: true);   // sidecar vanished (e.g. a prior invalidation) → drop any cached handle
             return;
-        bool deferred = false;
+        }
         try
         {
             ThrowIfInjectedFault();
-            using (var rw = OpenCdxReadWrite())
-            using (var editor = new CdxTreeEditor(rw))
+            if (!EnsureCdxMaint())
             {
-                if (!TryResolveComputers(editor, out var plans))
-                    deferred = true;   // an un-derivable tag → invalidate below (handle closed first)
-                else
-                {
-                    foreach (var (tag, computer) in plans)
-                    {
-                        if (!computer.TryComputeKey(newRecord, recNo, _recordCount, out var key))
-                            continue;   // FOR filter excludes this record from the tag
-                        if (computer.Unique && editor.ContainsKey(tag.HeaderOffset, key, computer.KeyLen, computer.Pad))
-                            continue;   // UNIQUE tag already holds the key (keep the first record — VFP semantics)
-                        editor.Insert(tag.HeaderOffset, key, (uint)recNo, computer.KeyLen, computer.Pad, _recordCount);
-                    }
-                    editor.Flush();
-                }
+                // An un-derivable tag → invalidate (which first tears down any handle EnsureCdxMaint left).
+                InvalidateStructuralCdxForMaintenance();
+                return;
             }
+            var editor = _cdxMaintEditor!;
+            foreach (var (tag, computer) in _cdxMaintPlans!)
+            {
+                if (!computer.TryComputeKey(newRecord, recNo, _recordCount, out var key))
+                    continue;   // FOR filter excludes this record from the tag
+                if (computer.Unique && editor.ContainsKey(tag.HeaderOffset, key, computer.KeyLen, computer.Pad))
+                    continue;   // UNIQUE tag already holds the key (keep the first record — VFP semantics)
+                editor.Insert(tag.HeaderOffset, key, (uint)recNo, computer.KeyLen, computer.Pad, _recordCount);
+            }
+            // Flush after every append so on-disk visibility is byte-for-byte what the per-append
+            // open/insert/flush/close path produced — only the redundant re-open/re-parse is removed.
+            editor.Flush();
         }
         catch
         {
             InvalidateStructuralCdxForMaintenance();
             throw;
         }
-        if (deferred)
-            InvalidateStructuralCdxForMaintenance();
+    }
+
+    /// <summary>
+    /// Ensure the cached incremental-maintenance CDX editor + resolved per-tag plans are open, reusing them
+    /// across a run of single-row appends AND in-place updates (both share ONE editor). Returns
+    /// <see langword="true"/> when an editor is ready; <see langword="false"/> when ANY structural tag is
+    /// un-derivable (nothing is cached — the caller invalidates the sidecar). The resolved plans are cached
+    /// for the writer's life on the SAME stability grounds as <see cref="GetComputer"/> (tag definition +
+    /// header offset are stable; only the on-disk root moves, and that is re-read live on every
+    /// <see cref="CdxTreeEditor.Insert"/> / <see cref="CdxTreeEditor.Delete"/>).
+    /// </summary>
+    private bool EnsureCdxMaint()
+    {
+        if (_cdxMaintEditor is not null && _cdxMaintPlans is not null)
+            return true;
+
+        FileStream rw = OpenCdxReadWrite();
+        var editor = new CdxTreeEditor(rw);
+        if (!TryResolveComputers(editor, out var plans))
+        {
+            editor.Dispose();
+            rw.Dispose();
+            return false;
+        }
+        _cdxMaintStream = rw;
+        _cdxMaintEditor = editor;
+        _cdxMaintPlans = plans;
+        return true;
+    }
+
+    /// <summary>
+    /// Tear down the cached incremental-maintenance CDX editor (if any): optionally flush its stream, dispose
+    /// the editor's reader (leaveOpen — does not close the stream) and the read/write stream, and forget the
+    /// plans. Idempotent. Called before any operation that opens its own <c>.cdx</c> handle, replaces the
+    /// file, or closes the writer, so the incremental cache is a pure accelerator that never outlives its loop.
+    /// </summary>
+    private void CloseCdxMaint(bool flush)
+    {
+        if (_cdxMaintEditor is null && _cdxMaintStream is null)
+            return;
+        try { if (flush) _cdxMaintStream?.Flush(); } catch { /* best-effort */ }
+        try { _cdxMaintEditor?.Dispose(); } catch { /* best-effort */ }
+        try { _cdxMaintStream?.Dispose(); } catch { /* best-effort */ }
+        _cdxMaintEditor = null;
+        _cdxMaintStream = null;
+        _cdxMaintPlans = null;
     }
 
     /// <summary>
@@ -104,6 +168,9 @@ public sealed partial class DbfWriter
     /// </summary>
     private void MaintainIndexesAfterAppendBatch(IReadOnlyList<(int RecNo, byte[] Record)> appended)
     {
+        // A batch opens its OWN editor session below; never let a lingering per-row incremental editor (from
+        // an earlier single-row append/update loop on this same writer) coexist with it on the file.
+        CloseCdxMaint(flush: true);
         if (appended.Count == 0 || !ShouldMaintainIndexes())
             return;
         bool deferred = false;
@@ -146,43 +213,43 @@ public sealed partial class DbfWriter
     private void MaintainIndexesAfterUpdate(int recNo, DbfRecord oldRecord, DbfRecord newRecord)
     {
         if (!ShouldMaintainIndexes())
+        {
+            CloseCdxMaint(flush: true);   // sidecar vanished → drop any cached handle
             return;
-        bool deferred = false;
+        }
         try
         {
             ThrowIfInjectedFault();
-            using (var rw = OpenCdxReadWrite())
-            using (var editor = new CdxTreeEditor(rw))
+            if (!EnsureCdxMaint())
             {
-                if (!TryResolveComputers(editor, out var plans))
-                    deferred = true;
-                else
-                {
-                    foreach (var (tag, computer) in plans)
-                    {
-                        bool oldIn = computer.TryComputeKey(oldRecord, recNo, _recordCount, out var oldKey);
-                        bool newIn = computer.TryComputeKey(newRecord, recNo, _recordCount, out var newKey);
-
-                        // Unchanged membership AND identical key → nothing to do for this tag.
-                        if (oldIn && newIn && oldKey.AsSpan().SequenceEqual(newKey))
-                            continue;
-
-                        if (oldIn)
-                            editor.Delete(tag.HeaderOffset, oldKey, (uint)recNo, computer.KeyLen, computer.Pad, _recordCount);
-                        if (newIn && !(computer.Unique && editor.ContainsKey(tag.HeaderOffset, newKey, computer.KeyLen, computer.Pad)))
-                            editor.Insert(tag.HeaderOffset, newKey, (uint)recNo, computer.KeyLen, computer.Pad, _recordCount);
-                    }
-                    editor.Flush();
-                }
+                // An un-derivable tag → invalidate (which first tears down any handle EnsureCdxMaint left).
+                InvalidateStructuralCdxForMaintenance();
+                return;
             }
+            var editor = _cdxMaintEditor!;
+            foreach (var (tag, computer) in _cdxMaintPlans!)
+            {
+                bool oldIn = computer.TryComputeKey(oldRecord, recNo, _recordCount, out var oldKey);
+                bool newIn = computer.TryComputeKey(newRecord, recNo, _recordCount, out var newKey);
+
+                // Unchanged membership AND identical key → nothing to do for this tag.
+                if (oldIn && newIn && oldKey.AsSpan().SequenceEqual(newKey))
+                    continue;
+
+                if (oldIn)
+                    editor.Delete(tag.HeaderOffset, oldKey, (uint)recNo, computer.KeyLen, computer.Pad, _recordCount);
+                if (newIn && !(computer.Unique && editor.ContainsKey(tag.HeaderOffset, newKey, computer.KeyLen, computer.Pad)))
+                    editor.Insert(tag.HeaderOffset, newKey, (uint)recNo, computer.KeyLen, computer.Pad, _recordCount);
+            }
+            // Flush after every update so on-disk visibility is byte-for-byte what the per-update
+            // open/edit/flush/close path produced — only the redundant re-open/re-parse is removed.
+            editor.Flush();
         }
         catch
         {
             InvalidateStructuralCdxForMaintenance();
             throw;
         }
-        if (deferred)
-            InvalidateStructuralCdxForMaintenance();
     }
 
     /// <summary>

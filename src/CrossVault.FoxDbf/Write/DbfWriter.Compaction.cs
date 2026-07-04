@@ -214,6 +214,9 @@ public sealed partial class DbfWriter
     /// </summary>
     private void InvalidateStructuralCdx()
     {
+        // Release the incremental .cdx accelerator FIRST — an open handle would block DeleteStructuralCdx,
+        // and the sidecar is about to be discarded anyway (no need to flush pending edits).
+        CloseCdxMaint(flush: false);
         if (!_hasStructuralCdx)
             return;
 

@@ -386,6 +386,9 @@ public sealed partial class DbfWriter
     /// </summary>
     private void CloseHandlesForReplace()
     {
+        // Release the incremental .cdx accelerator (it holds a handle on the OLD sidecar that is about to be
+        // replaced/reopened); ApplyState re-points the writer afterwards and the next append re-opens it.
+        CloseCdxMaint(flush: true);
 #pragma warning disable CA1416 // FileStream.Lock/Unlock — Windows VFP coexistence (§D3).
         foreach (var (position, length) in _heldLocks)
         {

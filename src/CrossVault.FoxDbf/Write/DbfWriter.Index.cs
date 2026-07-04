@@ -341,7 +341,14 @@ public sealed partial class DbfWriter
     /// <summary>Drop the cached per-tag key computers after any tag DDL — a tag's DEFINITION may have changed
     /// (REPLACE), been added or removed, so incremental write-path maintenance must re-derive them from the
     /// fresh on-disk headers rather than trust a stale name-keyed cache.</summary>
-    private void InvalidateTagComputerCache() => _tagComputers = null;
+    private void InvalidateTagComputerCache()
+    {
+        // Any tag DDL (add/replace/drop) can move header offsets or change a tag's definition, so the cached
+        // incremental editor's resolved plans are now stale — flush + release it (some DDL fast paths, e.g.
+        // TryFastUnlinkTags, do not route through Flush()). It re-resolves on the next append/update.
+        CloseCdxMaint(flush: true);
+        _tagComputers = null;
+    }
 
     /// <summary>
     /// Try to add (or REPLACE) tag <paramref name="def"/> in the compound <c>.cdx</c> at <paramref name="cdxPath"/>

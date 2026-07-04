@@ -302,6 +302,7 @@ public sealed partial class DbfWriter : IDisposable
     public void Flush()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        CloseCdxMaint(flush: true);   // flush + release the incremental .cdx accelerator (finalises the sidecar)
         _stream.Flush();
         _fpt?.Flush();
     }
@@ -904,6 +905,7 @@ public sealed partial class DbfWriter : IDisposable
 #pragma warning restore CA1416
 
         _disposed = true;
+        CloseCdxMaint(flush: true);   // flush + release the incremental .cdx accelerator before the stream closes
         try { _stream.Flush(); } catch { /* best-effort */ }
         try { _fpt?.Flush(); } catch { /* best-effort */ }
         // The schema rides our stream with leaveOpen:true, so disposing it does not close it.
