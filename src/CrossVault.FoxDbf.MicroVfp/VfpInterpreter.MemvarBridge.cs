@@ -12,7 +12,7 @@ public sealed partial class VfpInterpreter
     /// <summary>The <see cref="IVfpMemoryBridge"/> the interpreter registers on its <see cref="Session"/> so
     /// the SQL <c>SelectExecutor</c> / <c>DmlExecutor</c> read and write THIS interpreter's memory-variable
     /// store. It converts CLR result values to/from <see cref="VfpValue"/> and applies the VFP array shape +
-    /// <c>_TALLY</c> rules (pinned to vfp9.exe).</summary>
+    /// <c>_TALLY</c> rules (pinned to the VFP9 runtime).</summary>
     private sealed class MemvarBridge : IVfpMemoryBridge
     {
         private readonly VfpInterpreter _it;

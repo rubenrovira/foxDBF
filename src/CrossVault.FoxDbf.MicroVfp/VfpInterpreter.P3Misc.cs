@@ -15,7 +15,7 @@ namespace CrossVault.FoxDbf.MicroVfp;
 /// microVFP P3 batch 4 (the FINAL backlog batch) — the remaining array / variable / DB-lifecycle / table
 /// items: ADIR() / COPY TO ARRAY / AFONT (§C.1); SAVE TO / RESTORE FROM / WAIT / LIST|DISPLAY MEMORY (§C.4);
 /// APPEND|COPY PROCEDURES / PACK DATABASE / VALIDATE DATABASE (§C.7); DISPLAY STRUCTURE|TABLES (§C.14);
-/// SET FIELDS (§C.15); ZAP (§C.16). Behaviours pinned against vfp9.exe (see the P3Misc oracle tests).
+/// SET FIELDS (§C.15); ZAP (§C.16). Behaviours pinned against the VFP9 runtime (see the P3Misc oracle tests).
 /// EXPORT / IMPORT (office/Lotus/SYLK/DIF formats) are FLAGGED — see the completeness ledger.
 /// </summary>
 public sealed partial class VfpInterpreter
@@ -27,7 +27,7 @@ public sealed partial class VfpInterpreter
     private bool _setFieldsOn;
     private string _setFieldsAlias = string.Empty;
     // TRUE once the list was established via SET FIELDS TO ALL: SET("FIELDS",1) then reports the LITERAL
-    // "ALL" while FLDLIST() still enumerates every field (hackfox s4g091). Oracle-pinned vs vfp9.exe: the
+    // "ALL" while FLDLIST() still enumerates every field (hackfox s4g091). Oracle-pinned vs the VFP9 runtime: the
     // flag PERSISTS across SET FIELDS ON/OFF (SET("FIELDS",1) stays "ALL" after either) and is cleared only
     // by an explicit field list or an empty SET FIELDS TO.
     private bool _setFieldsAll;
@@ -75,7 +75,7 @@ public sealed partial class VfpInterpreter
     /// ARRAY. Records copy from the TOP of the (default ALL) scope. An UNDEFINED array auto-dimensions to
     /// (records × fields) 2-D; an EXISTING 2-D array is filled capped by its dimensions (never redimensioned);
     /// an EXISTING 1-D array takes the FIRST scoped record's fields (error when too small). Memo/general/blob
-    /// /picture cells hold a <c>.F.</c> placeholder (hackfox s4g386). Oracle-pinned vs vfp9.exe.</summary>
+    /// /picture cells hold a <c>.F.</c> placeholder (hackfox s4g386). Oracle-pinned vs the VFP9 runtime.</summary>
     private void ExecCopyToArray(CopyToArrayStmt s)
     {
         int area = Session.CurrentArea;
@@ -490,7 +490,7 @@ public sealed partial class VfpInterpreter
     /// Attributes (C, the VFP 5-position "RASHD" dotted string). Returns the match count (0 leaves the array
     /// untouched). Normal (incl. READ-ONLY) files are listed by default; HIDDEN / SYSTEM files are excluded
     /// unless cAttributes contains the matching "H" / "S" letter; directories are included when it contains
-    /// "D" (all oracle-pinned vs vfp9.exe: default listing shows the read-only file but not the hidden/system
+    /// "D" (all oracle-pinned vs the VFP9 runtime: default listing shows the read-only file but not the hidden/system
     /// ones — read-only is NOT a default-exclude). FLAG: the file listing is confined to the session data
     /// directory (headless sandbox); the VFP DOS-isms of a "*." directory-only skeleton and the synthesized
     /// "."/".." pseudo-entries are not reproduced.</summary>
@@ -541,7 +541,7 @@ public sealed partial class VfpInterpreter
     }
 
     /// <summary>VFP's ADIR column-5 attribute string: a fixed 5-position "RASHD" dotted mask (position present
-    /// ⇒ that letter, else "."), oracle-pinned vs vfp9.exe (".A..." normal, "RA..." read-only, ".AS.." system,
+    /// ⇒ that letter, else "."), oracle-pinned vs the VFP9 runtime (".A..." normal, "RA..." read-only, ".AS.." system,
     /// ".A.H." hidden, "....D" directory).</summary>
     private static string AttrString(FileAttributes fa) => new(new[]
     {

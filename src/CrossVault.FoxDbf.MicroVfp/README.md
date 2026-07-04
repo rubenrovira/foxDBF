@@ -21,9 +21,12 @@ the rest of this project (byte-compatible reads/writes, the same Rushmore-optimi
 - **Procedures/functions**: `PROCEDURE`/`FUNCTION` definitions, `DO proc [WITH args]` and
   `=func(args)` call forms, `PARAMETERS`, by-value vs. by-reference (`DO … WITH`) passing, loading
   stored procedures straight from a `.dbc`.
-- **Data access**: `USE`/`SELECT` work areas, `SEEK`/`GO`/`SKIP`, `REPLACE`/`DELETE`/`RECALL`/
-  `INSERT`, `GATHER`/`SCATTER`, `APPEND FROM`/`COPY TO` (`.dbf`), `PACK`, `SUM`/`TOTAL`,
-  `BEGIN`/`END TRANSACTION`/`ROLLBACK` (copy-on-write), and an embedded VFP-SQL `SELECT`.
+- **Data access**: `USE`/`SELECT` work areas, `SEEK`/`GO`/`SKIP`, `LOCATE`/`CONTINUE` (full
+  `FOR`/`WHILE` + scope, in the current index order, with per-area `CONTINUE` state),
+  `REPLACE`/`DELETE`/`RECALL`/`INSERT`, `GATHER`/`SCATTER`, `APPEND FROM`/`COPY TO` (`.dbf`), `PACK`,
+  `SUM`/`TOTAL`, `BEGIN`/`END TRANSACTION`/`ROLLBACK` (copy-on-write), and an embedded VFP-SQL `SELECT`.
+- **Low-level file I/O**: the `FOPEN`/`FCREATE`/`FREAD`/`FGETS`/`FPUTS`/`FWRITE`/`FSEEK`/`FEOF`/
+  `FCLOSE`/`FFLUSH`/`FCHSIZE`/`FERROR` handle family, plus `FILETOSTR()`/`STRTOFILE()` and `ADIR()`.
 - **Indexes**: `INDEX ON … TAG` (structural `.cdx`), `… TAG … OF <cdx>` (non-structural),
   `INDEX ON … TO <idx>` (standalone `.idx`), `SET ORDER`/`SET INDEX`/`USE … INDEX`, `REINDEX`,
   `DELETE TAG`, and tag introspection (`TAG()`/`TAGCOUNT()`/`KEY()`/`ORDER()`/`CDX()`/…).
@@ -49,9 +52,13 @@ byte-range locks on the live `.dbf` (honouring `SET REPROCESS` and `SET MULTILOC
 that coordinates via `RLOCK` is mutually exclusive with a concurrent VFP client — only the `SET REPROCESS
 TO … SECONDS` wait timing is approximated (a headless library cannot block a UI thread indefinitely).
 
-The rest of the VFP9 command surface (low-level file I/O, the form/class model) is being built out
-incrementally — this targets running real-world VFP9 business-logic stored procedures correctly, not 100%
-language coverage on day one.
+What is still out: the **form/class/visual object model**, **`.mem`
+variable-file interop**, **non-DBF import/export formats** (Excel/other office types), the
+**GUI-bound functions** (`MESSAGEBOX()`, `AFONT()`, font-extent queries), **view buffering**, and
+**multi-user optimistic conflict detection** (a buffered `TABLEUPDATE()` is not diffed against a
+concurrent writer). This targets running the
+data side of real-world VFP9 business-logic stored procedures correctly, not 100% coverage of the
+IDE-facing language surface.
 
 ## Quick start
 

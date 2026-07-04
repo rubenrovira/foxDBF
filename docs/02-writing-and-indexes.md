@@ -52,6 +52,18 @@ foreach (var rec in table.Query("NAME = \"Grace\"").GetRecords(table))
 (`REINDEX` is still available for a full rebuild — e.g. after loading a table whose `.cdx` was
 deleted or is stale — but ordinary appends/updates no longer require it.)
 
+### Add or drop a single tag without touching the others
+
+Adding a further tag to an existing `.cdx` appends it as its **own** pages with a single
+tag-directory splice — the sibling tags are not re-read or rewritten, so only the new tag costs a
+table scan. Dropping a tag unlinks just that one (the file itself is deleted only when its **last**
+tag goes, matching VFP's `DELETE TAG ALL`):
+
+```csharp
+w.CreateTag(new CdxTagDefinition("NAME_UP", "UPPER(NAME)"));  // appended to the existing people.cdx
+int remaining = w.DeleteTagsIn("people.cdx", structural: true, new[] { "AGE_DESC" });   // drop one tag
+```
+
 ## Update / delete / recall
 
 ```csharp

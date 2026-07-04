@@ -78,6 +78,57 @@ PrgProgram program = PrgParser.Parse(prgSourceText);
 // or: PrgParser.ParseFile(@"C:\data\business_logic.prg");
 ```
 
+## Search a table with `LOCATE` / `CONTINUE`
+
+`LOCATE` positions the record pointer on the first record satisfying its `FOR` clause — in the work
+area's **current order** (the master index if one is set, otherwise physical) and honouring
+`SET DELETED` — and `CONTINUE` resumes that same search from the next record. There's
+no `?`/`??` console, so open the table source, run the search as top-level statements and read the outcome back with
+`EvalExpression`:
+
+```csharp
+using CrossVault.FoxDbf.MicroVfp;
+using CrossVault.FoxDbf.Sql;
+
+using var session = new VfpSession();
+session.OpenDirectory(@"C:\data");
+
+var interp = new VfpInterpreter(session);
+interp.Execute(@"
+    USE people
+    LOCATE FOR AGE > 30
+");
+
+bool hit = interp.EvalExpression("FOUND()").AsLogical;      // .T. if a match exists
+double rec = (double)interp.EvalExpression("RECNO()").AsNumber;   // the matched record number
+
+interp.Execute("CONTINUE");                                 // next match, same FOR + scope window
+bool more = interp.EvalExpression("FOUND()").AsLogical;
+```
+
+## Isolate work in a second data session
+
+`CreateDataSession()` opens a fresh, isolated session (its own work areas, record pointers, locks and
+session-scoped `SET`s); `SET DATASESSION TO n` switches between them, exactly like moving between two
+forms with different `DataSession` properties:
+
+```csharp
+using CrossVault.FoxDbf.MicroVfp;
+using CrossVault.FoxDbf.Sql;
+
+using var session = new VfpSession();
+session.OpenDirectory(@"C:\data");
+
+var interp = new VfpInterpreter(session);
+
+int s2 = interp.CreateDataSession();          // a second, isolated data session
+interp.Execute($"SET DATASESSION TO {s2}");
+interp.Execute("USE orders");                 // opens in session 2 — invisible to session 1's areas
+
+interp.Execute("SET DATASESSION TO 1");        // back to the default session
+interp.ReleaseDataSession(s2);                 // ASESSIONS()/AUSED() enumerate live sessions/areas
+```
+
 ## What's implemented
 
 - **Control flow**: `IF/ENDIF`, `DO CASE/ENDCASE`, `DO WHILE/ENDDO`, `FOR/ENDFOR`,
@@ -91,10 +142,26 @@ PrgProgram program = PrgParser.Parse(prgSourceText);
   variable's current text and run).
 - **Parameters**: `PARAMETERS`/`LPARAMETERS`, by-value (`=Func(args)`/`(...)`) vs. by-reference
   (`DO proc WITH args`) passing.
-- **Data access**: `USE`/`SELECT` work areas, `SEEK`/`GO`/`SKIP`, `REPLACE`/`DELETE`/`RECALL`/
-  `INSERT`, `GATHER`/`SCATTER`, `APPEND FROM`/`COPY TO` (`.dbf`), `PACK`, `SUM`/`TOTAL`,
-  `BEGIN`/`END TRANSACTION`/`ROLLBACK` (copy-on-write), and an embedded VFP-SQL `SELECT` (routed
-  through the same [SQL engine](03-sql-and-ado-net.md) as everything else).
+- **Data access**: `USE`/`SELECT` work areas, `SEEK`/`GO`/`SKIP`,
+  `LOCATE`/`CONTINUE` (full `FOR`/`WHILE` + scope, evaluated in the work area's current index order,
+  with per-area `CONTINUE` state), `REPLACE`/`DELETE`/`RECALL`/`INSERT`, `GATHER`/`SCATTER`,
+  `APPEND FROM`/`COPY TO` (`.dbf`), `PACK`, `SUM`/`TOTAL`, `BEGIN`/`END TRANSACTION`/`ROLLBACK`
+  (copy-on-write), and an embedded VFP-SQL `SELECT` (routed through the same
+  [SQL engine](03-sql-and-ado-net.md) as everything else).
+- **Data sessions**: a **real** multi-datasession model. The host API
+  `VfpInterpreter.CreateDataSession()` / `ReleaseDataSession(n)` opens and closes an isolated data
+  session — the headless equivalent of a form with `DataSession = 2` (a `.prg` itself cannot create
+  one, matching VFP) — and `SET DATASESSION TO n` switches among the live sessions. Each session has
+  its own work areas, record pointers, orders, relations, buffering, byte-range locks and
+  session-scoped `SET`s (`DELETED`/`EXACT`/…); `ASESSIONS()`/`AUSED()` enumerate them.
+- **Record locking**: `RLOCK()`/`LOCK()`, `FLOCK()`, `UNLOCK`, `ISRLOCKED()`/`ISFLOCKED()` take
+  **real** VFP-byte-compatible byte-range locks on the live `.dbf` (honouring `SET REPROCESS` /
+  `SET MULTILOCKS`, released on close) — a stored proc that coordinates via `RLOCK` is mutually
+  exclusive with a concurrent VFP client. (Only the `SET REPROCESS TO … SECONDS` wait *timing* is
+  approximated — see [Deviations](#deviations-from-vfp).)
+- **Low-level file I/O**: the `FOPEN`/`FCREATE`/`FREAD`/`FGETS`/`FPUTS`/`FWRITE`/`FSEEK`/`FEOF`/
+  `FCLOSE`/`FFLUSH`/`FCHSIZE`/`FERROR` handle family, plus whole-file `FILETOSTR()`/`STRTOFILE()`
+  and `ADIR()` listing of the session data directory.
 - **Parent-child navigation**: `SET RELATION TO <key> INTO <alias>` and `SET SKIP TO` — moving the
   parent's record pointer repositions each related child; `RELATION()`/`TARGET()` read the links back.
 - **Table / row buffering**: `CURSORSETPROP('Buffering', 1-5)` / `CURSORGETPROP`, `TABLEUPDATE()` /
@@ -141,6 +208,20 @@ Every function below runs as real VFP semantics, not a stub — see
 | `STRCONV()`, `CPCONVERT()` | string / code-page conversions |
 | `TEXTMERGE()` | expand `<< >>` expression bits in a template |
 | `ALINES()` | split text into a memory array of lines |
+| `CHRTRAN()`, `CHRTRANC()` | translate characters (the `…C` surface — see the note below) |
+| `ICASE()` | first matching condition → value (an inline `CASE`) |
+| `LIKE()`, `LIKEC()` | wildcard (`*`/`?`) match (the `…C` surface — see the note below) |
+| `NORMALIZE()`, `ISLEADBYTE()` | string normalisation / lead-byte test (`ISLEADBYTE()` returns `.F.` — see the note below) |
+| `MEMLINES()`, `MLINE()` | line count / N-th line of a memo (honours `SET MEMOWIDTH`) |
+| `ATLINE()`, `ATCLINE()`, `RATLINE()` | line number of a substring (first / case-insensitive / last) |
+| `STRTOFILE()`, `FILETOSTR()` | whole-string ↔ whole-file |
+| `LEFTC()`, `RIGHTC()`, `SUBSTRC()`, `STUFFC()`, `AT_C()`, `ATCC()`, `RATC()`, `LENC()` | the `…C` function surface — see the note below |
+
+> **The `…C` functions carry single-byte-code-page semantics.** `CHRTRANC()`, `LIKEC()`,
+> `NORMALIZE()`, `ISLEADBYTE()` and the `…C` variants (`LEFTC`/`RIGHTC`/`SUBSTRC`/`STUFFC`/`AT_C`/
+> `ATCC`/`RATC`/`LENC`) route to single-byte code paths (byte == character; `ISLEADBYTE()` always
+> returns `.F.`). This matches VFP exactly on a single-byte code page; true double-byte handling on
+> DBCS data (cp932/936/949/950) is **not** implemented.
 
 **Date / time**
 
@@ -157,7 +238,8 @@ Every function below runs as real VFP semantics, not a stub — see
 |---|---|
 | `ABS()`, `INT()`, `ROUND()`, `MOD()`, `MAX()`, `MIN()` | |
 | `IIF()`, `BETWEEN()`, `INLIST()` | |
-| `EMPTY()`, `ISNULL()` | |
+| `EMPTY()`, `ISNULL()`, `ISBLANK()` | emptiness / `.NULL.` / blank-field tests |
+| `BLANK()` | the blank value for a field's type |
 | `TYPE()` | returns a VFP type code (`C`, `N`, `L`, `D`, …) from an expression *string* |
 | `VARTYPE()` | returns the type code of a *value* (no re-evaluation) |
 | `EVALUATE()` / `EVAL()` | evaluates a text expression at runtime |
@@ -178,9 +260,10 @@ not a context-free default), and take precedence over any same-named generic fun
 
 | Function | Notes |
 |---|---|
-| `SELECT()`, `USED()`, `ALIAS()` | |
+| `SELECT()`, `USED()`, `ALIAS()`, `DBUSED()` | current/ named work area, alias, whether a `.dbc` is open |
 | `DBF()`, `DBC()` | current table's / current database's source path |
 | `INDBC()`, `ISEXCLUSIVE()`, `ISREADONLY()` | membership / open-mode of a table or database |
+| `SETFLDSTATE()`, `GETNEXTMODIFIED()` | set a field/row edit state / walk the modified rows in a buffer |
 | `HEADER()`, `RECNO()`, `RECCOUNT()`, `LUPDATE()` | header size / record pointer / count / last-update date |
 | `EOF()`, `BOF()`, `FOUND()`, `DELETED()` | |
 | `SEEK()`, `LOOKUP()` | function-form seek / seek-and-return-a-field |
@@ -197,7 +280,8 @@ not a context-free default), and take precedence over any same-named generic fun
 | `TAG()`, `TAGCOUNT()`, `TAGNO()` | tag name by position / count / number of a named tag |
 | `KEY()`, `FOR()`, `ORDER()` | a tag's key / `FOR` filter / the controlling order |
 | `CANDIDATE()`, `PRIMARY()`, `UNIQUE()`, `DESCENDING()` | a tag's flags |
-| `CDX()`, `IDXCOLLATE()`, `ATAGINFO()` | `.cdx` path / collation / all tag info into an array |
+| `CDX()`, `MDX()`, `NDX()`, `IDXCOLLATE()`, `ATAGINFO()` | `.cdx`/`.idx` path by position / collation / all tag info into an array |
+| `KEYMATCH()`, `FLDLIST()` | probe whether a key exists in a tag / the current `SET FIELDS` list |
 
 **Error handling**
 
@@ -211,16 +295,30 @@ not a context-free default), and take precedence over any same-named generic fun
 
 | Function | Notes |
 |---|---|
-| `SYS(0)` | `"<machine> # <user>"` — verified byte-for-byte against `vfp9.exe`'s own format |
+| `SYS(0)` | `"<machine> # <user>"` — verified byte-for-byte against the VFP9 runtime's own format |
 | `SYS(1)` | today's Julian day number |
 | `SYS(2007, cExpr)` | CRC-16/CCITT checksum |
 | `SYS(2015)` | a unique procedure/object name (`_` + 9 hex chars) |
+| `SYS(14, n)`, `SYS(2021, n)` | the KEY / `FOR` filter of the N-th open index (all-caps) |
+| `SYS(21)`, `SYS(22)` | controlling-index number / name (legacy `TAGNO()`/`ORDER()`) |
+| `SYS(2029)` | the DBF header's version/type byte as a decimal string (a VFP table is `"48"`) |
 | other `SYS(n)` codes | return `""` — see deviations |
 | `SECONDS()` | |
 | `COCREATEGUID()` | |
 | `TXNLEVEL()` | transaction nesting depth |
-| `RLOCK()`/`LOCK()`, `FLOCK()`, `ISRLOCKED()`/`ISFLOCKED()` | see deviations — a single in-process interpreter never sees lock contention, so a lock is always granted |
-| `MESSAGEBOX()` | stub — see deviations |
+| `CPCURRENT()`, `CPDBF()`, `CPCONVERT()`, `STRCONV()` | current / table code page, code-page conversion |
+| `RLOCK()`/`LOCK()`, `FLOCK()`, `UNLOCK`, `ISRLOCKED()`/`ISFLOCKED()` | **real** VFP-byte-compatible byte-range locks on the live `.dbf` (`SET REPROCESS`/`SET MULTILOCKS`), released on close — only the `REPROCESS` wait *timing* is approximated (see deviations) |
+| `MESSAGEBOX()`, `AFONT()` | GUI-bound stubs — see deviations |
+
+**Low-level file I/O** — byte/line handles onto arbitrary files, plus directory listing:
+
+| Function | Notes |
+|---|---|
+| `FOPEN()`, `FCREATE()`, `FCLOSE()` | open / create / close a file handle |
+| `FREAD()`, `FGETS()`, `FWRITE()`, `FPUTS()` | read/write bytes or a line |
+| `FSEEK()`, `FEOF()`, `FCHSIZE()`, `FFLUSH()`, `FERROR()` | position / EOF / truncate / flush / last error |
+| `FILETOSTR()`, `STRTOFILE()` | whole-file read / write in one call |
+| `ADIR()` | fill an array with the **session data directory**'s file entries (name skeleton only — see deviations) |
 
 ## Deviations from VFP
 
@@ -233,33 +331,41 @@ differences below are deliberate, verified simplifications, not bugs to be worke
   no output, no exception). To observe a value, return it from a `FUNCTION`/`PROCEDURE` and read the
   `Call(...)` result in C# (as the snippets above do), or evaluate it with
   `interp.EvalExpression("expr")`.
-- **`LOCATE`/`CONTINUE` parse but do not move the record pointer.** The syntax is recognized (a
-  `.prg` containing `LOCATE FOR …` still parses cleanly), but neither command currently performs the
-  scan — `LOCATE` is a no-op today, not a search. Use `SCAN FOR … / EXIT / ENDSCAN` instead, which
-  *is* fully implemented and covers the same use case.
-- **Locking is modelled, not contested.** `RLOCK()`/`LOCK()`/`FLOCK()` always return `.T.` and
-  `ISRLOCKED()`/`ISFLOCKED()` always return `.F.` — a single in-process interpreter never sees lock
-  contention, so a lock is always granted immediately. This is about the *PRG-level lock functions*
-  only: the underlying `CrossVault.FoxDbf` table API has real byte-range `RLOCK()`/`FLOCK()` locking
-  that interoperates with a live VFP9 process (see
-  [2. Writing and indexes](02-writing-and-indexes.md#vfp-compatible-locking)) — it's just not wired
-  through these interpreter-level function calls, since the interpreter itself is always the sole
-  writer in its own process.
+- **Only the lock *wait timing* is approximated.** `RLOCK()`/`LOCK()`/`FLOCK()`/`UNLOCK`/
+  `ISRLOCKED()`/`ISFLOCKED()` now take **real** VFP-byte-compatible byte-range locks on the live
+  `.dbf` (see [What's implemented](#whats-implemented) and
+  [2. Writing and indexes](02-writing-and-indexes.md#vfp-compatible-locking)) — a stored proc that
+  coordinates via `RLOCK` is genuinely mutually exclusive with a concurrent VFP9 client, verified
+  against one. The single remaining simplification is the `SET REPROCESS TO … SECONDS` **retry
+  timing**: a headless library will not block a thread indefinitely the way an interactive VFP
+  session parks the UI, so the wait/retry cadence on a *contended* lock is approximate — the grant /
+  deny outcome and the byte ranges themselves are real.
 - **An unrecognized command is captured, not rejected — and not executed either.** Any command verb
   the parser doesn't model yet still parses (so a whole `.prg` file continues to load even if it uses
   a handful of exotic commands), but it silently does nothing at runtime. A `.prg` parsing cleanly is
   therefore not proof that every line in it actually ran — check
   [What's implemented](#whats-implemented) and the [function reference](#function-reference) above
   for what's real.
-- **A few functions are intentional stubs**, always returning the same constant: `MESSAGEBOX()`
-  always returns `6` (`IDYES`) since there is no UI to show; unimplemented `SYS(n)` codes return `""`
-  rather than their real per-code VFP9 behavior. (`DBC()`, `CURSORGETPROP()`/`GETFLDSTATE()` used to
-  be on this list — they now return real values; see [What's implemented](#whats-implemented).)
+- **The genuinely GUI-bound functions are stubs**, because a headless interpreter has no window,
+  screen or font metrics to answer them: `MESSAGEBOX()` always returns `6` (`IDYES`), `AFONT()`
+  returns an empty font list, and `TXTWIDTH()`/font-extent style queries have no pixel geometry.
+  Unimplemented `SYS(n)` codes still return `""` rather than their real per-code VFP9 behavior.
+  (`LOCATE`/`CONTINUE`, real locking, `DBC()`, `CURSORGETPROP()`/`GETFLDSTATE()`, the low-level file
+  I/O family all used to be on the deviations list — they are now fully implemented; see
+  [What's implemented](#whats-implemented).)
+- **`ADIR()` lists the session data directory only.** It enumerates the directory the session was
+  opened on, filtered by the name skeleton; a path-qualified skeleton (e.g.
+  `ADIR(a, 'C:\other\*.dbf')`) is not supported.
 
-The remaining VFP9 command surface (low-level file I/O, `LOCATE`/`CONTINUE` movement, contested
-locking) is being built out incrementally, prioritized by what real
-`.prg` business-logic corpora actually use — the goal is correctly running real-world stored
-procedures, not 100% language coverage on day one.
+What is still out: the **form/class/visual object model**, **`.mem`
+variable-file interop** (`SAVE TO`/`RESTORE FROM` work in-process, but not the on-disk `.mem`
+format), **non-DBF import/export formats** (Excel/other office file types), the **GUI-bound
+functions** above, **view buffering**, and **multi-user optimistic conflict detection** (a buffered
+`TABLEUPDATE()` is not diffed against a concurrent writer, so cross-writer optimistic conflicts are
+not detected). Most of what the data side of a real `.prg` business-logic stored procedure touches
+— tables, indexes, table/row buffering, transactions, RI, locking, sessions, low-level file I/O — is
+implemented; the goal is correctly running real-world stored procedures, not 100% coverage of the
+IDE-facing language surface.
 
 ## Next
 

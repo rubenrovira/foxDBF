@@ -339,7 +339,7 @@ public sealed partial class VfpInterpreter
             "NEAR" => VfpValue.Character(_setNear ? "ON" : "OFF"),
             "NULL" => VfpValue.Character(_ctx.NullSetting ? "ON" : "OFF"),
             "AUTOSAVE" => VfpValue.Character(_setAutosave ? "ON" : "OFF"),
-            "MEMOWIDTH" => VfpValue.Number((decimal)_memoWidth), // NUMERIC (verified vs vfp9.exe: VARTYPE = "N").
+            "MEMOWIDTH" => VfpValue.Number((decimal)_memoWidth), // NUMERIC (verified vs the VFP9 runtime: VARTYPE = "N").
             // SET("BLOCKSIZE") returns the RAW value that was set (1..32 = ×512, 33+ = bytes) — NOT the byte
             // count SYS(2012) reports (hackfox s4g089). NUMERIC. TEXTMERGE reads back ON/OFF; SET("TEXTMERGE",1)
             // is the concatenated begin+end delimiters (default "<<>>").
@@ -349,13 +349,13 @@ public sealed partial class VfpInterpreter
                 : VfpValue.Character(_textMerge ? "ON" : "OFF"),
             "RELATION" => VfpValue.Character(RelationSetString(Session.CurrentArea)),  // reproduces the SET RELATION args.
             "SKIP" => VfpValue.Character(SkipSetString(Session.CurrentArea)),          // comma-list of 1:n aliases.
-            "DATASESSION" => VfpValue.Number((decimal)Session.CurrentDataSessionId),   // NUMERIC (verified vs vfp9.exe) — the current data-session id (5.14).
+            "DATASESSION" => VfpValue.Number((decimal)Session.CurrentDataSessionId),   // NUMERIC (verified vs the VFP9 runtime) — the current data-session id (5.14).
             // SET("DATABASE") — the current DBC's NAME only (no drive/path/extension), "" when none current.
             "DATABASE" => VfpValue.Character(CurrentDbPath() is { Length: > 0 } p ? Path.GetFileNameWithoutExtension(p) : string.Empty),
             // SET("FIELDS") → ON/OFF; SET("FIELDS",1) → the bare field list, ", "-separated, uppercase (no
             // alias) — matches FLDLIST()'s list but without the alias qualifier — EXCEPT after SET FIELDS TO
             // ALL, when it is the literal "ALL" while FLDLIST() still enumerates every field (oracle-pinned
-            // vs vfp9.exe, incl. that "ALL" survives SET FIELDS ON/OFF; hackfox s4g091).
+            // vs the VFP9 runtime, incl. that "ALL" survives SET FIELDS ON/OFF; hackfox s4g091).
             "FIELDS" => a.Length > 1 && IsNumeric(a[1]) && (int)a[1].AsNumber == 1
                 ? VfpValue.Character(_setFieldsAll ? "ALL" : string.Join(", ", _setFields.Select(f => f.ToUpperInvariant())))
                 : VfpValue.Character(_setFieldsOn ? "ON" : "OFF"),
@@ -415,7 +415,7 @@ public sealed partial class VfpInterpreter
         switch (n)
         {
             // SYS(0) = "<machine> # <station/user>" (network-dependent — see MICROVFP_SEMANTICS.md Nachtrag:
-            // "netzabhängig, unzuverlässig"). VERIFIED against vfp9.exe on this box: it returns
+            // "netzabhängig, unzuverlässig"). VERIFIED against the VFP9 runtime on this box: it returns
             // "<MachineName> # <UserName>" (the part after "#" is the logged-on network user, NOT a numeric
             // station id). Matching that exactly is what lets createId's SYS(2007) workstation/user checksums
             // equal VFP9's. Stable + non-crashing: both halves come from the OS identity.
@@ -425,7 +425,7 @@ public sealed partial class VfpInterpreter
             case 10: return FnSys10(a);
             // SYS(15, cTransTable, cExpr) — character translation. Each char c of cExpr is replaced by the byte
             // at 1-based position ASC(c) of cTransTable; a code outside [1, LEN(table)] keeps the char verbatim
-            // (verified vs vfp9.exe: identity table maps 'A'→'@', i.e. CHR(ASC(c)-1); table is arg2, expr arg3).
+            // (verified vs the VFP9 runtime: identity table maps 'A'→'@', i.e. CHR(ASC(c)-1); table is arg2, expr arg3).
             case 15:
             {
                 if (a.Length < 3) return VfpValue.Character(string.Empty);
@@ -448,7 +448,7 @@ public sealed partial class VfpInterpreter
             }
             // SYS(21 [, area]) — the NUMBER of the controlling index (legacy TAGNO of the master), "0" when
             // natural order. SYS(22 [, area]) — its NAME (legacy ORDER()), "" when natural. Both return a
-            // CHARACTER string (verified vs vfp9.exe). hackfox rates them obsolete vs TAGNO()/ORDER().
+            // CHARACTER string (verified vs the VFP9 runtime). hackfox rates them obsolete vs TAGNO()/ORDER().
             case 21: return VfpValue.Character(FnTagNo(a.Skip(1).ToArray()).ToString(CultureInfo.InvariantCulture));
             case 22: return VfpValue.Character(a.Length > 1 ? FnOrder(a.Skip(1).ToArray()) : FnOrder(Array.Empty<VfpValue>()));
             // SYS(2021, nIndexNumber [, area]) — the FOR filter of the n-th open index, ALL-CAPS (like FOR();
@@ -458,7 +458,7 @@ public sealed partial class VfpInterpreter
             case 2007: return VfpValue.Character(Crc16Ccitt(a.Length > 1 ? a[1].AsString : string.Empty).ToString(CultureInfo.InvariantCulture));
             case 2015: return VfpValue.Character("_" + Guid.NewGuid().ToString("N")[..9].ToUpperInvariant());
             // SYS(2029 [, area]) — the DBF header's first (version/type) byte as a decimal string; "0" when
-            // no table is open in the addressed area. A VFP table is "48" (0x30) — oracle-pinned vs vfp9.exe.
+            // no table is open in the addressed area. A VFP table is "48" (0x30) — oracle-pinned vs the VFP9 runtime.
             case 2029:
             {
                 var wa = AreaArg(a.Skip(1).ToArray(), 0);

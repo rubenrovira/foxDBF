@@ -89,7 +89,7 @@ public sealed partial class VfpInterpreter
     private bool _setAutosave;
 
     // SET MEMOWIDTH TO n — the memo word-wrap column consulted by MEMLINES()/MLINE()/ATLINE()/…. VFP default
-    // is 50 and the MINIMUM is 8 (a smaller value is silently ignored — verified against vfp9.exe). Read back
+    // is 50 and the MINIMUM is 8 (a smaller value is silently ignored — verified against the VFP9 runtime). Read back
     // (as a NUMBER) by SET("MEMOWIDTH"). Global (not per-data-session), like the VFP setting.
     private int _memoWidth = 50;
 
@@ -882,7 +882,7 @@ public sealed partial class VfpInterpreter
         if (s.StartsWith("TO", StringComparison.OrdinalIgnoreCase)) s = s.Substring(2).Trim();
         if (s.Length == 0) { _currentDbCleared = true; return; }   // TO (no name) clears the designation.
         // A NAME must reference the actually-open DBC (VFP raises "Database 'X' is not open." otherwise —
-        // verified against vfp9.exe). Compare path/extension-insensitively (bare DBC name) case-insensitively.
+        // verified against the VFP9 runtime). Compare path/extension-insensitively (bare DBC name) case-insensitively.
         s = s.Trim('\'', '"', ' ');
         string requested = Path.GetFileNameWithoutExtension(s);
         string open = Session.Database is not null ? Path.GetFileNameWithoutExtension(Session.DatabasePath ?? string.Empty) : string.Empty;
@@ -897,7 +897,7 @@ public sealed partial class VfpInterpreter
         => (!_currentDbCleared && Session.Database is not null) ? (Session.DatabasePath ?? string.Empty) : string.Empty;
 
     // SET MEMOWIDTH TO n. VFP silently IGNORES a value below the minimum of 8 (leaves the width unchanged —
-    // verified against vfp9.exe: after SET MEMOWIDTH TO 5, SET("MEMOWIDTH") still reports the prior value).
+    // verified against the VFP9 runtime: after SET MEMOWIDTH TO 5, SET("MEMOWIDTH") still reports the prior value).
     private void SetMemoWidth(string arg)
     {
         var parts = arg.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);

@@ -84,9 +84,13 @@ full API detail.
 ## Status
 
 Actively developed. Read/write/index/SQL/ADO.NET are exercised against real Visual FoxPro 9 as an
-oracle (byte-for-byte comparisons, not just "looks right"). The microVFP interpreter covers the
-VFP9 language constructs needed to run real stored-procedure business logic, and is growing towards
-broader VFP9 function/command coverage over time.
+oracle (byte-for-byte comparisons, not just "looks right"), including **real byte-range record
+locking** proven against a live VFP9 client and a **multi-datasession** model. The microVFP
+interpreter runs the data side of real stored-procedure business logic — control flow, buffering,
+transactions, `LOCATE`/`CONTINUE`, indexing, referential integrity, low-level file I/O and a broad
+VFP9 function library — with the remaining gaps largely confined to the IDE-facing surface
+(forms/classes, `.mem` interop, non-DBF import/export, GUI-bound functions), plus view buffering and
+multi-user optimistic conflict detection.
 
 ## License
 

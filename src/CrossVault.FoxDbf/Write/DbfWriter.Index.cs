@@ -252,7 +252,7 @@ public sealed partial class DbfWriter
             // The directory enumerates tags in NAME (B-tree) order, but VFP numbers tags by their
             // HEADER-PAGE LAYOUT order (= creation order — the directory's "recno" is the header byte
             // offset). Collect with that offset and sort by it so a rebuild preserves creation order —
-            // which is what TAG()/SYS(14)/DESCENDING() enumerate over (verified vs vfp9.exe).
+            // which is what TAG()/SYS(14)/DESCENDING() enumerate over (verified vs the VFP9 runtime).
             var byOffset = new List<(uint Offset, CdxTagDefinition Def)>();
             foreach (var (headerOffset, nameBytes) in
                      IndexTraversal.EnumerateCompact(index, fileHeader.Root, fileHeader.KeyLength, isCharacter: true))

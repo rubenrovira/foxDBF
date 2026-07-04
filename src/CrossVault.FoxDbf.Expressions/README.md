@@ -13,9 +13,13 @@ sits alongside `CrossVault.FoxDbf.dll` in the same package).
 - **`Evaluate(IRowContext row, EvaluationContext? context = null)`** — evaluates against a row
   (table record, SQL result row, or a synthetic context) honoring `SET EXACT` / `SET ANSI` /
   collation settings via `EvaluationContext`.
-- A broad **VFP9 function library**: string (`SUBSTR`, `ALLTRIM`, `PADL/R/C`, `STRTRAN`, …), date
-  (`DTOC`, `DTOS`, `GOMONTH`, …), numeric (`ROUND`, `INT`, `MOD`, …), and logical/type functions
-  (`IIF`, `EMPTY`, `ISNULL`, `TYPE`, `BETWEEN`, `INLIST`, …), growing towards full VFP9 coverage.
+- A broad **VFP9 function library**: string (`SUBSTR`, `ALLTRIM`, `PADL/R/C`, `STRTRAN`, `CHRTRAN`,
+  `LIKE`, `ICASE`, plus the `…C` function surface — `LEFTC`/`SUBSTRC`/`AT_C`/`NORMALIZE`/`ISLEADBYTE`,
+  … — with single-byte-code-page semantics (byte == character; `ISLEADBYTE()` returns `.F.`), matching
+  VFP on single-byte code pages; true double-byte handling is not implemented),
+  date (`DTOC`, `DTOS`, `GOMONTH`, …), numeric (`ROUND`, `INT`, `MOD`, …), and logical/type functions
+  (`IIF`, `EMPTY`, `ISNULL`, `ISBLANK`, `TYPE`, `BETWEEN`, `INLIST`, …), growing towards full VFP9
+  coverage.
 - **Byte-exact MACHINE / GENERAL collation** — the same two collating sequences Visual FoxPro uses
   for indexing and comparisons, reverse-engineered against real VFP9 CDX keys.
 

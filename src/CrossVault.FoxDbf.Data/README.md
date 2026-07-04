@@ -46,11 +46,14 @@ int n = cn.Execute("UPDATE customer SET region = @r WHERE customer_id = @id", ne
 ## Supported SQL
 
 `SELECT` with projection, `WHERE`, `INNER`/`LEFT`/`RIGHT`/`FULL JOIN`, `UNION [ALL]`, correlated
-subqueries, `GROUP BY`/`HAVING`, aggregates, `ORDER BY`, `DISTINCT`, `TOP`; `INSERT … VALUES`,
-`UPDATE`, `DELETE` (VFP soft-delete); `CREATE`/`ALTER`/`DROP TABLE`; the VFP work-area model via
-`USE` / `SELECT` commands. Positional `?` and named `@`/`:` parameters. Real transactions
-(`BeginTransaction` → atomic commit/rollback), `DataAdapter`/`CommandBuilder`, and `GetSchema`
-metadata collections.
+subqueries, `GROUP BY`/`HAVING`, aggregates, `ORDER BY`, `DISTINCT`, `TOP`, `INTO CURSOR`/`TABLE`/
+`ARRAY`; `INSERT … VALUES`, `INSERT … FROM ARRAY`/`FROM MEMVAR`, `UPDATE`, `DELETE` (VFP soft-delete);
+`CREATE`/`ALTER`/`DROP TABLE`; the VFP work-area model via `USE` / `SELECT` commands. Positional `?`
+and named `@`/`:` parameters. Real transactions (`BeginTransaction` → atomic commit/rollback),
+`DataAdapter`/`CommandBuilder`, and `GetSchema` metadata collections. `SELECT … INTO ARRAY` lands the
+result in the connection's active data session (readable from a following stored proc /
+`?ALEN(name)`, with `_TALLY` set); `INSERT … FROM ARRAY`/`FROM MEMVAR` flow through the normal DML
+path (index maintenance, buffering, `EnforceRules`).
 
 ## Stored procedures, UDFs, and opt-in rule enforcement
 

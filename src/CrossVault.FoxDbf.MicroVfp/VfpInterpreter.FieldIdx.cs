@@ -14,7 +14,7 @@ namespace CrossVault.FoxDbf.MicroVfp;
 
 /// <summary>microVFP P3 batch 3 — field/record/index manipulation + introspection: ISBLANK/BLANK,
 /// FLDLIST, KEYMATCH, GETNEXTMODIFIED, SETFLDSTATE, APPEND MEMO, REPLACE FROM ARRAY, COPY INDEXES /
-/// COPY TAG, CLOSE INDEXES, SET BLOCKSIZE / SET TEXTMERGE [DELIMITERS]. All behaviours pinned to vfp9.exe.</summary>
+/// COPY TAG, CLOSE INDEXES, SET BLOCKSIZE / SET TEXTMERGE [DELIMITERS]. All behaviours pinned to the VFP9 runtime.</summary>
 public sealed partial class VfpInterpreter
 {
     // ── session state (P3 batch 3) ──
@@ -83,7 +83,7 @@ public sealed partial class VfpInterpreter
     /// <summary>ISBLANK(eExpression) — .T. when the value is BLANK. For a bare FIELD reference (rewritten to
     /// <c>ISBLANK('name', .T.)</c> by <see cref="MicroVfpExprRewrite"/>) the blank state is a RAW-byte
     /// property (a blanked numeric reads 0 but is byte-distinct from a written 0); a non-field expression is
-    /// judged by VALUE. Verified vs vfp9.exe: C/D blank iff empty; N/L blank iff never assigned; integer
+    /// judged by VALUE. Verified vs the VFP9 runtime: C/D blank iff empty; N/L blank iff never assigned; integer
     /// (and other binary types) NEVER blank; numeric 0 / logical .F. NOT blank.</summary>
     private bool FnIsBlank(VfpValue[] a)
     {
@@ -109,7 +109,7 @@ public sealed partial class VfpInterpreter
     /// <summary>The BLANK state of a FIELD's current-record bytes: C/V/M/G blank iff the decoded content is
     /// empty/all-whitespace; N/F/D/L blank iff every raw byte is a space (the never-assigned / BLANKed state);
     /// T (datetime) blank iff every raw byte is ZERO — the {} / never-assigned sentinel a real datetime can
-    /// never share (its Julian day is always large + non-zero), verified vs vfp9.exe; the remaining binary
+    /// never share (its Julian day is always large + non-zero), verified vs the VFP9 runtime; the remaining binary
     /// types (I/Y/B/…) are NEVER blank (a written 0 and a blank share all-zero bytes — oracle-pinned for I).</summary>
     private bool IsFieldBlank(VfpSession.WorkArea wa, int area, int colIdx)
     {
@@ -170,7 +170,7 @@ public sealed partial class VfpInterpreter
 
     // ─────────────────────────── FLDLIST() ───────────────────────────
 
-    /// <summary>FLDLIST([n]) — the field list set by SET FIELDS (verified vs vfp9.exe: it is the SET FIELDS
+    /// <summary>FLDLIST([n]) — the field list set by SET FIELDS (verified vs the VFP9 runtime: it is the SET FIELDS
     /// list, NOT a FIELD()-style by-number lookup), alias-qualified + uppercase, comma-no-space
     /// (e.g. <c>SALES.ID,SALES.AMT</c>). Empty when no list is set. FLAG: the n-th-item form FLDLIST(n) and
     /// the actual field-visibility RESTRICTION (fields behaving as absent) are not modelled — SET FIELDS here
@@ -182,7 +182,7 @@ public sealed partial class VfpInterpreter
     // ─────────────────────────── KEYMATCH() ───────────────────────────
 
     /// <summary>KEYMATCH(uKey [, nWhichKey [, area]]) — .T. iff uKey exists in the addressed index, WITHOUT
-    /// moving the record pointer (verified vs vfp9.exe: RECNO() is unchanged after a hit AND a miss). Unlike
+    /// moving the record pointer (verified vs the VFP9 runtime: RECNO() is unchanged after a hit AND a miss). Unlike
     /// SEEK, no AreaMeta state is touched. nWhichKey is the 1-based index number across the open set; absent
     /// ⇒ the controlling order.</summary>
     private bool FnKeyMatch(VfpValue[] a)
@@ -225,7 +225,7 @@ public sealed partial class VfpInterpreter
     // ─────────────────────────── GETNEXTMODIFIED() ───────────────────────────
 
     /// <summary>GETNEXTMODIFIED(nRec [, area [, nMask]]) — over the REAL TableBuffer, the VFP iteration
-    /// protocol (verified vs vfp9.exe): for nRec ≥ 0, the recno of the next modified EXISTING row after nRec;
+    /// protocol (verified vs the VFP9 runtime): for nRec ≥ 0, the recno of the next modified EXISTING row after nRec;
     /// once those are exhausted the FIRST buffered APPEND (−1). Buffered appends are walked as DESCENDING
     /// negative recnos: feeding −n back returns the next append −(n+1), until 0 signals none left. An
     /// UNBUFFERED area raises catchable VFP error 1596 (not a silent 0). FLAG: nMask (GETFLDSTATE filter) is
@@ -282,7 +282,7 @@ public sealed partial class VfpInterpreter
     // ─────────────────────────── APPEND MEMO … FROM ───────────────────────────
 
     /// <summary>APPEND MEMO mField FROM cFile [OVERWRITE] [AS nCodePage] — copy the file's content into the
-    /// current record's memo field (additive by default; replacing on OVERWRITE — verified vs vfp9.exe). The
+    /// current record's memo field (additive by default; replacing on OVERWRITE — verified vs the VFP9 runtime). The
     /// source is read as RAW BYTES and copied 1:1 (binary-safe — hackfox s4g066: works for .FXP / arbitrary
     /// binary, not just text): the bytes are decoded with the SAME single-byte encoding the memo write path
     /// re-encodes with (Latin1 for a NOCPTRANS/binary memo, else the table code page), so the round-trip is
@@ -374,7 +374,7 @@ public sealed partial class VfpInterpreter
 
     /// <summary>COPY TAG cTag [OF cCdx] TO cIdx — extract one compound-index tag as a standalone legacy
     /// <c>.idx</c>, rebuilt over the live table from the tag's KEY/FOR expression (byte-sane + seekable —
-    /// verified vs vfp9.exe). The new <c>.idx</c> is NOT auto-opened (VFP behaviour).</summary>
+    /// verified vs the VFP9 runtime). The new <c>.idx</c> is NOT auto-opened (VFP behaviour).</summary>
     private void ExecCopyTag(CopyTagStmt ct)
     {
         int area = Session.CurrentArea;
@@ -443,7 +443,7 @@ public sealed partial class VfpInterpreter
 
     /// <summary>Close every NON-structural index of <paramref name="area"/> (standalone <c>.idx</c> +
     /// non-structural <c>.cdx</c>), leaving the structural <c>.cdx</c> open; revert the controlling order to
-    /// natural when it was one of the closed indexes (verified vs vfp9.exe).</summary>
+    /// natural when it was one of the closed indexes (verified vs the VFP9 runtime).</summary>
     private void CloseNonStructuralIndexes(int area)
     {
         var m = Meta(area);

@@ -88,7 +88,7 @@ internal sealed class DdlExecutor
     }
 
     /// <summary>The descriptor decimal-count for a DDL column, matching the AUTHORITATIVE VFP9
-    /// behaviour (verified against vfp9.exe): Currency (<c>Y</c>) always stores <c>4</c>; Double
+    /// behaviour (verified against the VFP9 runtime): Currency (<c>Y</c>) always stores <c>4</c>; Double
     /// (<c>B</c>) stores the ambient <c>SET DECIMALS</c> (VFP default <c>2</c>) when the syntax
     /// states none; every other type keeps the stated decimals (or <c>0</c>).</summary>
     private static int DefaultDecimals(char type, int? stated) => type switch

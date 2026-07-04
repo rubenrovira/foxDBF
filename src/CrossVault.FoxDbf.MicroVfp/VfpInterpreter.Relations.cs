@@ -49,7 +49,7 @@ public sealed partial class VfpInterpreter
             var cwa = Session.AreaAt(child);
             // VFP9 orders relations MOST-RECENTLY-SET FIRST, for BOTH a single multi-target statement AND
             // cumulative ADDITIVE — so RELATION(1)/TARGET(1)/SET("RELATION") reflect the latest link. Insert
-            // at the front (a multi-target statement's targets thus land reversed, matching vfp9.exe).
+            // at the front (a multi-target statement's targets thus land reversed, matching the VFP9 runtime).
             m.Relations.Insert(0, new Relation
             {
                 Key = t.Key,

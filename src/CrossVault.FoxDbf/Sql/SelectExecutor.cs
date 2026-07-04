@@ -421,7 +421,7 @@ internal sealed class SelectExecutor
     private static bool? Not3(bool? a) => a is null ? null : !a.Value;
 
     /// <summary><c>x IN set</c>, matching what VFP9 actually does (cross-checked against the local
-    /// vfp9.exe oracle): a NULL <paramref name="x"/> is unknown (never IN, never NOT IN); a NULL set
+    /// the VFP9 oracle): a NULL <paramref name="x"/> is unknown (never IN, never NOT IN); a NULL set
     /// member is simply IGNORED — it does NOT poison the result. So <c>x IN set</c> is true on a match,
     /// else false; <c>x NOT IN set</c> (the caller negates) is therefore true when x matches no non-null
     /// member, even when the set contains a NULL. An empty set ⇒ false.

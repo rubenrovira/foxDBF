@@ -41,6 +41,10 @@ provider built on this package). Need to run VFP9 stored-procedure `.prg` busine
   edits it in place (`O(log n)`), so a `REPLACE` followed by a `SEEK` finds the row without a
   `REINDEX` — exactly as Visual FoxPro does. (`Delete`/`Recall` leave the key in the index, matching
   VFP soft-delete semantics — it clears at `PACK`.)
+- **Page-level tag DDL**: adding a further tag (`CreateTag`/`CreateTagIn`) appends it as its own
+  `.cdx` pages with a single tag-directory splice — the sibling tags are neither re-read nor
+  rewritten; `DeleteTagsIn` (`DELETE TAG`) unlinks a single tag, deleting the file only when its
+  last tag is removed.
 
 ### Expressions & query engine
 - A VFP **expression engine** (`CrossVault.FoxDbf.Expressions`): hand-written lexer + Pratt
@@ -64,10 +68,10 @@ Rushmore optimizer and writer above:
   resolution, auto-open of tables named in a query.
 - **Executor** — `SELECT` (projection, `WHERE` pushed to Rushmore, `GROUP BY`/`HAVING`, aggregates,
   `ORDER BY`, `DISTINCT`, `TOP`, `INNER`/`LEFT`/`RIGHT`/`FULL JOIN`, `UNION [ALL]`, correlated
-  subqueries) and DML (`INSERT … VALUES`, `UPDATE … SET`, `DELETE` = VFP soft-delete) plus DDL
-  (`CREATE`/`ALTER`/`DROP TABLE`). Returns a `SqlResult` (column schema + streamed rows, or affected
-  count). SQL `=` follows **`SET ANSI`** (not `SET EXACT`); `UPDATE`/`DELETE` without a `WHERE`
-  affect all rows.
+  subqueries, `INTO CURSOR`/`TABLE`/`ARRAY`) and DML (`INSERT … VALUES`, `INSERT … FROM ARRAY`/
+  `FROM MEMVAR`, `UPDATE … SET`, `DELETE` = VFP soft-delete) plus DDL (`CREATE`/`ALTER`/`DROP TABLE`).
+  Returns a `SqlResult` (column schema + streamed rows, or affected count). SQL `=` follows
+  **`SET ANSI`** (not `SET EXACT`); `UPDATE`/`DELETE` without a `WHERE` affect all rows.
 
 Most users want **CrossVault.FoxDbf.Data** (ADO.NET) rather than `SqlParser`/`VfpSession` directly.
 

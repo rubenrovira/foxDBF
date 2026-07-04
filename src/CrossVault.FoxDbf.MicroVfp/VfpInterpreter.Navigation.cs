@@ -18,8 +18,8 @@ public sealed partial class VfpInterpreter
     // ─────────────────────────── LOCATE / CONTINUE (project-review 5.2) ───────────────────────────
     //
     // LOCATE positions on the FIRST record — in the area's CURRENT order (the master index if one is set,
-    // else physical) — that satisfies FOR within the scope/WHILE window, honouring SET DELETED / SET FILTER /
-    // SET KEY visibility through the SAME Visible() gate GO/SKIP use. Found ⇒ pointer on the record,
+    // else physical) — that satisfies FOR within the scope/WHILE window, honouring SET DELETED /
+    // SET KEY visibility through the SAME Visible() gate GO/SKIP use (SET FILTER is not modelled). Found ⇒ pointer on the record,
     // FOUND()=.T.; the search runs off the end ⇒ EOF(), FOUND()=.F. LOCATE with no FOR positions on the
     // first visible record. CONTINUE resumes the LAST LOCATE of the CURRENT work area from the record AFTER
     // the current one, reusing its remembered FOR/WHILE + scope window (per AreaMeta); CONTINUE with no
