@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Text;
@@ -23,6 +24,8 @@ public static class FieldEncoder
     // The Julian Day Number of 0001-01-01 (proleptic Gregorian) — the offset between
     // FoxPro 'T' day numbers and .NET DayNumber (0 == 0001-01-01). Mirrors FieldDecoder.
     private const int JdnEpoch = 1_721_426;
+    private const int MaxStackEncodeBytes = 256;
+    private const int MaxStackNumberChars = 128;
 
     private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
 
@@ -53,7 +56,8 @@ public static class FieldEncoder
 
             case 'N':
             case 'F':
-                WriteAsciiRightJustified(FormatNumber(value, column.Decimal), dest);
+                if (!TryWriteNumberRightJustified(value, column.Decimal, dest))
+                    WriteAsciiRightJustified(FormatNumber(value, column.Decimal), dest);
                 return false;
 
             case 'I':
@@ -129,16 +133,51 @@ public static class FieldEncoder
 
     private static void WriteCharacter(string s, Encoding encoding, Span<byte> dest)
     {
-        var bytes = encoding.GetBytes(s);
-        int n = Math.Min(bytes.Length, dest.Length);
-        bytes.AsSpan(0, n).CopyTo(dest);
+        int byteCount = WriteEncodedPrefix(s, encoding, dest);
+        int n = Math.Min(byteCount, dest.Length);
         // Space-pad the remainder (the inverse of the decoder's trailing-space trim).
         dest[n..].Fill((byte)' ');
     }
 
+    private static int WriteEncodedPrefix(string s, Encoding encoding, Span<byte> dest)
+    {
+        ReadOnlySpan<char> chars = s.AsSpan();
+        int byteCount = encoding.GetByteCount(chars);
+        int n = Math.Min(byteCount, dest.Length);
+        if (n == 0)
+            return byteCount;
+
+        if (byteCount <= dest.Length)
+        {
+            encoding.GetBytes(chars, dest);
+            return byteCount;
+        }
+
+        if (byteCount <= MaxStackEncodeBytes)
+        {
+            Span<byte> encoded = stackalloc byte[MaxStackEncodeBytes];
+            encoding.GetBytes(chars, encoded[..byteCount]);
+            encoded[..n].CopyTo(dest);
+            return byteCount;
+        }
+
+        byte[] rented = ArrayPool<byte>.Shared.Rent(byteCount);
+        try
+        {
+            Span<byte> encoded = rented.AsSpan(0, byteCount);
+            encoding.GetBytes(chars, encoded);
+            encoded[..n].CopyTo(dest);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+        return byteCount;
+    }
+
     // ---- numeric (N / F): right-justified ASCII, Decimal places ----------------
 
-    private static void WriteAsciiRightJustified(string s, Span<byte> dest)
+    private static void WriteAsciiRightJustified(ReadOnlySpan<char> s, Span<byte> dest)
     {
         int w = dest.Length;
         if (s.Length > w)
@@ -153,6 +192,102 @@ public static class FieldEncoder
         // s is pure ASCII (digits, '.', '-'); a 1:1 byte cast is exact.
         for (int i = 0; i < s.Length; i++)
             dest[pad + i] = (byte)s[i];
+    }
+
+    private static bool TryWriteNumberRightJustified(object value, int decimals, Span<byte> dest)
+    {
+        char[]? rented = null;
+        Span<char> chars = dest.Length <= MaxStackNumberChars
+            ? stackalloc char[MaxStackNumberChars]
+            : (rented = ArrayPool<char>.Shared.Rent(dest.Length)).AsSpan();
+        chars = chars[..dest.Length];
+
+        try
+        {
+            if (TryFormatNumber(value, decimals, chars, out int charsWritten, out bool handled))
+            {
+                WriteAsciiRightJustified(chars[..charsWritten], dest);
+                return true;
+            }
+
+            if (handled)
+            {
+                dest.Fill((byte)'*');
+                return true;
+            }
+
+            return false;
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<char>.Shared.Return(rented);
+        }
+    }
+
+    private static bool TryFormatNumber(
+        object value,
+        int decimals,
+        Span<char> dest,
+        out int charsWritten,
+        out bool handled)
+    {
+        handled = true;
+        if (decimals <= 0)
+        {
+            ReadOnlySpan<char> defaultFormat = default;
+            Span<char> f0 = stackalloc char[2];
+            f0[0] = 'F';
+            f0[1] = '0';
+
+            switch (value)
+            {
+                case long l:
+                    return l.TryFormat(dest, out charsWritten, defaultFormat, Inv);
+                case int i:
+                    return i.TryFormat(dest, out charsWritten, defaultFormat, Inv);
+                case short sh:
+                    return ((long)sh).TryFormat(dest, out charsWritten, defaultFormat, Inv);
+                case byte b:
+                    return ((long)b).TryFormat(dest, out charsWritten, defaultFormat, Inv);
+                case decimal m:
+                    return decimal.Round(m, 0, MidpointRounding.AwayFromZero)
+                        .TryFormat(dest, out charsWritten, f0, Inv);
+                case double d:
+                    return Math.Round(d, MidpointRounding.AwayFromZero)
+                        .TryFormat(dest, out charsWritten, f0, Inv);
+                case float f:
+                    return Math.Round((double)f, MidpointRounding.AwayFromZero)
+                        .TryFormat(dest, out charsWritten, f0, Inv);
+                default:
+                    handled = false;
+                    charsWritten = 0;
+                    return false;
+            }
+        }
+
+        Span<char> format = stackalloc char[11];
+        format[0] = 'F';
+        _ = decimals.TryFormat(format[1..], out int precisionChars, provider: Inv);
+        ReadOnlySpan<char> fixedFormat = format[..(precisionChars + 1)];
+
+        switch (value)
+        {
+            case decimal m:
+                return m.TryFormat(dest, out charsWritten, fixedFormat, Inv);
+            case double d:
+                return d.TryFormat(dest, out charsWritten, fixedFormat, Inv);
+            case float f:
+                return ((double)f).TryFormat(dest, out charsWritten, fixedFormat, Inv);
+            case long l:
+                return l.TryFormat(dest, out charsWritten, fixedFormat, Inv);
+            case int i:
+                return i.TryFormat(dest, out charsWritten, fixedFormat, Inv);
+            default:
+                handled = false;
+                charsWritten = 0;
+                return false;
+        }
     }
 
     private static string FormatNumber(object value, int decimals)
@@ -240,10 +375,18 @@ public static class FieldEncoder
             return;
         }
         // YYYYMMDD, zero-padded; the inverse of FieldDecoder.DecodeDate.
-        string s = $"{d.Year:0000}{d.Month:00}{d.Day:00}";
-        int n = Math.Min(s.Length, dest.Length);
-        for (int i = 0; i < n; i++)
-            dest[i] = (byte)s[i];
+        int n = Math.Min(8, dest.Length);
+        int y = d.Year;
+        Span<byte> ascii = stackalloc byte[8];
+        ascii[0] = (byte)('0' + (y / 1000) % 10);
+        ascii[1] = (byte)('0' + (y / 100) % 10);
+        ascii[2] = (byte)('0' + (y / 10) % 10);
+        ascii[3] = (byte)('0' + y % 10);
+        ascii[4] = (byte)('0' + d.Month / 10);
+        ascii[5] = (byte)('0' + d.Month % 10);
+        ascii[6] = (byte)('0' + d.Day / 10);
+        ascii[7] = (byte)('0' + d.Day % 10);
+        ascii[..n].CopyTo(dest);
         dest[n..].Fill((byte)' ');
     }
 
@@ -276,14 +419,15 @@ public static class FieldEncoder
         if (w == 0)
             return false;
 
-        byte[] bytes = t == 'V'
-            ? encoding.GetBytes(CoerceString(value))
-            : (value as byte[] ?? Array.Empty<byte>());
+        if (t == 'V')
+            return WriteVarchar(CoerceString(value), encoding, dest);
+
+        ReadOnlySpan<byte> bytes = value is byte[] b ? b : ReadOnlySpan<byte>.Empty;
 
         if (bytes.Length >= w)
         {
             // Exactly (or over-) fills the field: no trailing length byte, no varlen bit.
-            bytes.AsSpan(0, w).CopyTo(dest);
+            bytes[..w].CopyTo(dest);
             return false;
         }
 
@@ -293,6 +437,19 @@ public static class FieldEncoder
         byte pad = t == 'V' ? (byte)' ' : (byte)0x00;
         dest[bytes.Length..(w - 1)].Fill(pad);
         dest[w - 1] = (byte)bytes.Length;
+        return true;
+    }
+
+    private static bool WriteVarchar(string s, Encoding encoding, Span<byte> dest)
+    {
+        int w = dest.Length;
+        int byteCount = WriteEncodedPrefix(s, encoding, dest);
+        if (byteCount >= w)
+            return false;
+
+        // Pad the gap with spaces, then write the effective length into the last byte.
+        dest[byteCount..(w - 1)].Fill((byte)' ');
+        dest[w - 1] = (byte)byteCount;
         return true;
     }
 
