@@ -145,6 +145,10 @@ public sealed partial class VfpInterpreter
         // session, not the interpreter), so no .dbf stays locked past the session's life. 5.14: this now
         // covers EVERY data session's writers, not just the active one.
         Session.Disposing += DisposeCachedWritersAllSessions;
+        // P3 §C.2: release every open low-level file handle (FOPEN/FCREATE) when the session is disposed —
+        // low-level handles are interpreter-global (independent of work areas), so no OS handle outlives the
+        // session. VfpInterpreter.Dispose() does the same for a caller that disposes the interpreter directly.
+        Session.Disposing += CloseAllLowLevelHandles;
         // 5.13: an ADO.NET copy-on-write transaction Commit/Rollback QUIESCES the session (CloseAllHandles)
         // right before it swaps each private copy over the live file. A byte-range lock (RLOCK/FLOCK) an SP
         // took inside the transaction rides a cached writer on the LIVE file (coordination happens there);
@@ -513,7 +517,12 @@ public sealed partial class VfpInterpreter
             case MacroSubstStmt ms: ExecMacroSubst(ms); break;
             case LocateStmt loc: ExecLocate(loc); break;
             case ContinueStmt: ExecContinue(); break;
-            case UnknownCommand or ProcDef: break;
+            case UnknownCommand uc:
+                // CLOSE ALL sweeps open low-level file handles (P3 §C.2); every other unrecognised command
+                // (and CLOSE DATABASES/TABLES/…) stays a headless no-op.
+                if (string.Equals(uc.Verb, "CLOSE", StringComparison.OrdinalIgnoreCase)) ExecCloseCommand(uc.Arguments);
+                break;
+            case ProcDef: break;
             default: break;
         }
     }

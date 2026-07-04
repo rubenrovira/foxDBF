@@ -145,6 +145,33 @@ public sealed partial class VfpInterpreter
             case "AUSED": r = VfpValue.Integer(FnAUsed(a)); return true;
             case "ASESSIONS": r = VfpValue.Integer(FnASessions(a)); return true;
 
+            // Low-level file I/O (§C.2) + DBUSED (§C.5) live in their OWN dispatch method, NOT inline here:
+            // keeping this hot switch's method body (and hence its native stack frame) at its prior size is
+            // what preserves the MaxCallDepth recursion headroom — HostInvoke sits on EVERY nested UDF call.
+            default: return TryInvokeFileIo(name, a, out r);
+        }
+    }
+
+    // ─── P3 low-level file I/O (MICROVFP_EXTENSIONS_BACKLOG §C.2) + DBUSED (§C.5) — split OUT of the giant
+    // HostInvoke switch on purpose (see the `default` arm above): a separate, sequentially-called method so
+    // the file-I/O cases do NOT inflate HostInvoke's per-frame stack cost, which the recursion cap depends on.
+    private bool TryInvokeFileIo(string name, VfpValue[] a, out VfpValue r)
+    {
+        switch (name)
+        {
+            case "FOPEN": r = FnFOpen(a); return true;
+            case "FCREATE": r = FnFCreate(a); return true;
+            case "FCLOSE": r = FnFClose(a); return true;
+            case "FREAD": r = FnFRead(a); return true;
+            case "FGETS": r = FnFGets(a); return true;
+            case "FWRITE": r = FnFWrite(a); return true;
+            case "FPUTS": r = FnFPuts(a); return true;
+            case "FSEEK": r = FnFSeek(a); return true;
+            case "FEOF": r = FnFEof(a); return true;
+            case "FERROR": r = FnFError(); return true;
+            case "FFLUSH": r = FnFFlush(a); return true;
+            case "FCHSIZE": r = FnFChSize(a); return true;
+            case "DBUSED": r = VfpValue.Logical(FnDbUsed(a)); return true;
             default: r = VfpValue.Null; return false;
         }
     }

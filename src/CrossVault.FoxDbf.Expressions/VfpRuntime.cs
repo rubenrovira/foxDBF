@@ -422,6 +422,10 @@ internal static class VfpRuntime
     private static VfpValue Arg(VfpValue[] a, int i) => i < a.Length ? a[i] : VfpValue.Null;
     private static int IntArg(VfpValue[] a, int i) => i < a.Length ? (int)a[i].AsDouble : 0;
 
+    /// <summary>Truthiness of a condition value the SAME way IIF/ICASE treat it: a <c>.NULL.</c> is false,
+    /// otherwise the logical value. Used by the compiled + tree-walk ICASE special form.</summary>
+    internal static bool AsCondition(VfpValue v) => !v.IsNull && v.AsLogical;
+
     private static VfpValue Left(VfpValue[] a)
     {
         var s = Arg(a, 0).AsString;

@@ -184,19 +184,55 @@ internal sealed class FunctionNode : AstNode
 
     public override VfpValue Eval(IRowContext row, EvaluationContext ctx)
     {
+        // ICASE(c1,v1[,c2,v2…][,default]) is a LAZY special form (no hackfox entry — pinned to the VFP9
+        // runtime): conditions are evaluated left→right, the FIRST true one's value is returned, and NOTHING
+        // else is evaluated (unmatched conditions AND unmatched value expressions are skipped). No match with
+        // an odd trailing arg ⇒ that default; no match with no default ⇒ .NULL. (NOT .F.). So it cannot go
+        // through the eager arg-array path below.
+        if (_upper == "ICASE") return EvalIcase(row, ctx);
         var values = new VfpValue[_args.Length];
         for (int i = 0; i < _args.Length; i++) values[i] = _args[i].Eval(row, ctx);
         return VfpRuntime.CallFunction(_upper, values, ctx, row);
     }
 
+    private VfpValue EvalIcase(IRowContext row, EvaluationContext ctx)
+    {
+        int n = _args.Length;
+        int i = 0;
+        for (; i + 1 < n; i += 2)
+            if (VfpRuntime.AsCondition(_args[i].Eval(row, ctx)))
+                return _args[i + 1].Eval(row, ctx);
+        return i < n ? _args[i].Eval(row, ctx) : VfpValue.Null;   // odd trailing arg = default; else .NULL.
+    }
+
     public override Expression Build(BuildContext b)
     {
+        if (_upper == "ICASE") return BuildIcase(b);
         var elems = new Expression[_args.Length];
         for (int i = 0; i < _args.Length; i++) elems[i] = _args[i].Build(b);
         Expression array = Expression.NewArrayInit(typeof(VfpValue), elems);
         // Pass the already-uppercased name as a constant: zero string work per record.
         return Expression.Call(typeof(VfpRuntime), nameof(VfpRuntime.CallFunction), null,
             Expression.Constant(_upper), array, b.Ctx, b.Row);
+    }
+
+    // Compiled ICASE: nested Expression.Condition so only the taken branch (and the conditions up to the
+    // first true one) are evaluated — same laziness as the tree-walk EvalIcase. Each condition expression is
+    // built ONCE and passed through VfpRuntime.AsCondition (single evaluation, no double-eval of side effects).
+    private Expression BuildIcase(BuildContext b)
+    {
+        int n = _args.Length;
+        Expression acc;
+        int pairEnd;
+        if ((n & 1) == 1) { acc = _args[n - 1].Build(b); pairEnd = n - 1; }   // odd trailing arg = default
+        else { acc = Expression.Constant(VfpValue.Null, typeof(VfpValue)); pairEnd = n; }
+        for (int i = pairEnd - 2; i >= 0; i -= 2)
+        {
+            Expression isTrue = Expression.Call(
+                typeof(VfpRuntime), nameof(VfpRuntime.AsCondition), null, _args[i].Build(b));
+            acc = Expression.Condition(isTrue, _args[i + 1].Build(b), acc);
+        }
+        return acc;
     }
 
     public override VfpTypeInfo Infer(ISchema schema)
@@ -246,6 +282,7 @@ internal sealed class FunctionNode : AstNode
                 return new VfpTypeInfo(VfpType.Logical, 1);
 
             case "IIF": return ArgInfer(schema, 1);
+            case "ICASE": return ArgInfer(schema, 1);   // result type ≈ the first pair's value expression
             default: return new VfpTypeInfo(VfpType.Unknown);
         }
     }
