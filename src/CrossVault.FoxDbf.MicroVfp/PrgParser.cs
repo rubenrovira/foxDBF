@@ -590,6 +590,12 @@ public static class PrgParser
                 "SUM" => BuildSum(text),
                 "CLEAR" => BuildClear(text),
                 "UNLOCK" => BuildUnlock(text),
+                "ZAP" => BuildZap(text),
+                "WAIT" => BuildWait(text),
+                "SAVE" => BuildSave(text),
+                "RESTORE" => BuildRestore(text),
+                "VALIDATE" => BuildValidate(text),
+                "DISPLAY" or "LIST" => BuildDisplayOrList(text),
                 "ROLLBACK" => new RollbackStmt(),
                 "BEGIN" => PrgScan.SecondWord(text) == "TRANSACTION"
                     ? new BeginTxnStmt()
@@ -1310,6 +1316,12 @@ public static class PrgParser
         private static PrgStatement BuildAppend(string text)
         {
             string rest = PrgScan.AfterFirstWord(text);   // after APPEND
+            // APPEND PROCEDURES FROM cFile — append text into the current DBC's stored-procedure source (§C.7).
+            if (PrgScan.FirstWord(rest) == "PROCEDURES")
+            {
+                var (_, psegs) = Carve(PrgScan.AfterFirstWord(rest), "FROM");
+                return new ProceduresStmt(Append: true, ToNameRef(FirstToken(SegBody(psegs, "FROM") ?? string.Empty)));
+            }
             // APPEND MEMO mField FROM cFile [OVERWRITE] [AS nCodePage] — copy a file's content into a memo.
             if (PrgScan.FirstWord(rest) == "MEMO")
             {
@@ -1345,9 +1357,27 @@ public static class PrgParser
                 var target = ToNameRef(FirstToken(SegBody(segs, "TO") ?? string.Empty));
                 return new CopyStructureStmt(target, extended, FieldsOf(segs));
             }
+            // COPY PROCEDURES TO cFile — extract the current DBC's stored-procedure source (§C.7).
+            if (fw == "PROCEDURES")
+            {
+                var (_, psegs) = Carve(PrgScan.AfterFirstWord(rest), "TO", "ADDITIVE");
+                return new ProceduresStmt(Append: false, ToNameRef(FirstToken(SegBody(psegs, "TO") ?? string.Empty)));
+            }
             if (fw == "TO")
             {
                 string r2 = PrgScan.AfterFirstWord(rest);   // after TO
+                // COPY TO ARRAY aName [FIELDS][scope][FOR][WHILE] — the read counterpart of APPEND FROM ARRAY.
+                if (PrgScan.FirstWord(r2).Equals("ARRAY", StringComparison.OrdinalIgnoreCase))
+                {
+                    string r3 = PrgScan.AfterFirstWord(r2);   // after ARRAY
+                    var (ahead, asegs) = Carve(r3, "FIELDS", "FOR", "WHILE");
+                    // the array name is the first token of ahead; any scope keyword (ALL/NEXT n/…) follows it.
+                    var (scope, _) = CarveLeadingScope(PrgScan.AfterFirstWord(ahead));
+                    string arrName = FirstToken(ahead);
+                    PrgExpr? aFor = SegBody(asegs, "FOR") is { Length: > 0 } afb ? PrgExpr.Parse(afb) : null;
+                    PrgExpr? aWhile = SegBody(asegs, "WHILE") is { Length: > 0 } awb ? PrgExpr.Parse(awb) : null;
+                    return new CopyToArrayStmt(arrName, FieldsOf(asegs), scope, aFor, aWhile);
+                }
                 var (head, segs) = Carve(r2, "FIELDS", "FOR", "WHILE", "TYPE");
                 var target = ToNameRef(FirstToken(head));
                 PrgExpr? forE = SegBody(segs, "FOR") is { Length: > 0 } fb ? PrgExpr.Parse(fb) : null;
@@ -1403,11 +1433,119 @@ public static class PrgParser
             return new TotalStmt(target, key, FieldsOf(segs), forE);
         }
 
-        /// <summary><c>PACK [MEMO | DBF]</c>.</summary>
+        /// <summary><c>PACK [MEMO | DBF]</c> or <c>PACK DATABASE</c> (all member tables of the current DBC).</summary>
         private static PrgStatement BuildPack(string text)
         {
             string kind = PrgScan.FirstWord(PrgScan.AfterFirstWord(text));
+            if (kind == "DATABASE") return new PackDatabaseStmt();
             return new PackStmt(kind is "MEMO" or "DBF" ? kind : null);
+        }
+
+        /// <summary><c>ZAP [IN nArea | cAlias]</c> — remove all records of the (current or named) table.</summary>
+        private static PrgStatement BuildZap(string text)
+        {
+            var (_, segs) = Carve(PrgScan.AfterFirstWord(text), "IN");
+            NameRef? inArea = SegBody(segs, "IN") is { Length: > 0 } ib ? ToNameRef(FirstToken(ib)) : null;
+            return new ZapStmt(inArea);
+        }
+
+        /// <summary><c>WAIT [cMsg] [WINDOW …] [TIMEOUT n] [TO mVar] [NOWAIT] [CLEAR]</c> — only the TO target
+        /// is modelled (headless: never blocks; the message/window/timeout are ignored).</summary>
+        private static PrgStatement BuildWait(string text)
+        {
+            var (_, segs) = Carve(PrgScan.AfterFirstWord(text), "TO", "WINDOW", "TIMEOUT", "NOWAIT", "CLEAR", "AT", "NOCLEAR");
+            // TO mVar: the memvar receiving the (empty, headless) keypress.
+            string? toVar = SegBody(segs, "TO") is { Length: > 0 } tb ? LeadingIdent(tb) : null;
+            return new WaitStmt(toVar is { Length: > 0 } ? toVar : null);
+        }
+
+        /// <summary><c>SAVE TO cFile [ALL LIKE skel | ALL EXCEPT skel]</c>. The <c>TO MEMO</c> memofield form
+        /// is left un-modelled (FLAG).</summary>
+        private static PrgStatement BuildSave(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);   // after SAVE
+            if (!PrgScan.FirstWord(rest).Equals("TO", StringComparison.OrdinalIgnoreCase))
+                return new UnknownCommand("SAVE", rest);
+            string body = PrgScan.AfterFirstWord(rest);   // after TO
+            var (all, like, except, _, _) = ParseAllLikeExcept(body, out string target);
+            return new SaveToStmt(ToNameRef(target), all ? like : null, all ? except : null);
+        }
+
+        /// <summary><c>RESTORE FROM cFile [ADDITIVE]</c>. The <c>FROM MEMO</c> memofield form is un-modelled.</summary>
+        private static PrgStatement BuildRestore(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);   // after RESTORE
+            if (!PrgScan.FirstWord(rest).Equals("FROM", StringComparison.OrdinalIgnoreCase))
+                return new UnknownCommand("RESTORE", rest);
+            var (_, segs) = Carve(PrgScan.AfterFirstWord(rest), "ADDITIVE");
+            // the file is the head (first token before ADDITIVE).
+            string body = PrgScan.AfterFirstWord(rest);
+            var (head, _) = Carve(body, "ADDITIVE");
+            return new RestoreFromStmt(ToNameRef(FirstToken(head)), HasKw(segs, "ADDITIVE"));
+        }
+
+        /// <summary><c>VALIDATE DATABASE [NOCONSOLE] [RECOVER]</c> — read-only diagnostic (RECOVER FLAGGED).</summary>
+        private static PrgStatement BuildValidate(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);   // after VALIDATE
+            if (!PrgScan.FirstWord(rest).Equals("DATABASE", StringComparison.OrdinalIgnoreCase))
+                return new UnknownCommand("VALIDATE", rest);
+            var words = PrgScan.TopWords(rest).Select(w => w.Upper).ToList();
+            return new ValidateDatabaseStmt(words.Contains("RECOVER"));
+        }
+
+        /// <summary><c>DISPLAY | LIST MEMORY | STRUCTURE | TABLES [TO FILE cFile]</c> (+ MEMORY <c>LIKE skel</c>).
+        /// Other DISPLAY/LIST forms (record listings, STATUS, …) stay un-modelled no-ops.</summary>
+        private static PrgStatement BuildDisplayOrList(string text)
+        {
+            string rest = PrgScan.AfterFirstWord(text);   // after DISPLAY/LIST
+            string what = PrgScan.FirstWord(rest);
+            string body = PrgScan.AfterFirstWord(rest);   // after MEMORY/STRUCTURE/TABLES
+
+            NameRef? toFile = ToFileTarget(body);
+            switch (what)
+            {
+                case "MEMORY":
+                {
+                    var (_, segs) = Carve(body, "LIKE", "TO");
+                    string? like = SegBody(segs, "LIKE") is { Length: > 0 } lb ? FirstToken(lb) : null;
+                    return new MemoryDumpStmt(like, toFile);
+                }
+                case "STRUCTURE" or "STRU":
+                {
+                    var (_, segs) = Carve(body, "IN", "TO");
+                    NameRef? inArea = SegBody(segs, "IN") is { Length: > 0 } ib ? ToNameRef(FirstToken(ib)) : null;
+                    return new DisplayStructureStmt(inArea, toFile);
+                }
+                case "TABLES":
+                    return new DisplayTablesStmt(toFile);
+                default:
+                    return new UnknownCommand(PrgScan.FirstWord(text), rest);
+            }
+        }
+
+        /// <summary>Extract the <c>TO FILE cFile</c> target of a DISPLAY/LIST clause (null when absent —
+        /// e.g. TO PRINTER / no redirection, a headless no-op).</summary>
+        private static NameRef? ToFileTarget(string body)
+        {
+            var (_, segs) = Carve(body, "TO");
+            if (SegBody(segs, "TO") is not { Length: > 0 } tb) return null;
+            string first = PrgScan.FirstWord(tb);
+            if (!first.Equals("FILE", StringComparison.OrdinalIgnoreCase)) return null;   // TO PRINTER/… → no file.
+            return ToNameRef(FirstToken(PrgScan.AfterFirstWord(tb)));
+        }
+
+        /// <summary>Parse <c>cFile [ALL LIKE skel | ALL EXCEPT skel]</c>: the leading token is the target
+        /// file; ALL LIKE/EXCEPT supply the wildcard skeletons.</summary>
+        private static (bool All, string? Like, string? Except, string F1, string F2) ParseAllLikeExcept(string body, out string target)
+        {
+            var (head, segs) = Carve(body, "ALL", "LIKE", "EXCEPT");
+            target = FirstToken(head);
+            bool all = HasKw(segs, "ALL");
+            string? like = SegBody(segs, "LIKE") is { Length: > 0 } lb ? FirstToken(lb) : null;
+            string? except = SegBody(segs, "EXCEPT") is { Length: > 0 } eb ? FirstToken(eb) : null;
+            if (like is not null || except is not null) all = true;   // LIKE/EXCEPT imply the ALL form.
+            return (all, like, except, string.Empty, string.Empty);
         }
 
         /// <summary><c>RENAME TABLE cOld TO cNew</c> (the DBC-member form). A file-level

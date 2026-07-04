@@ -521,6 +521,17 @@ public sealed partial class VfpInterpreter
             case TotalStmt tot: ExecTotal(tot); break;
             case PackStmt pk: ExecPack(pk); break;
             case RenameTableStmt rt: ExecRenameTable(rt); break;
+            case CopyToArrayStmt cta: ExecCopyToArray(cta); break;
+            case ZapStmt zp: ExecZap(zp); break;
+            case WaitStmt wt: ExecWait(wt); break;
+            case SaveToStmt sv: ExecSaveTo(sv); break;
+            case RestoreFromStmt rf: ExecRestoreFrom(rf); break;
+            case MemoryDumpStmt md: ExecMemoryDump(md); break;
+            case ProceduresStmt pr: ExecProcedures(pr); break;
+            case PackDatabaseStmt: ExecPackDatabase(); break;
+            case ValidateDatabaseStmt vd: ExecValidateDatabase(vd); break;
+            case DisplayStructureStmt ds: ExecDisplayStructure(ds); break;
+            case DisplayTablesStmt dtb: ExecDisplayTables(dtb); break;
             case SqlPassthroughStmt sp: ExecSqlPassthrough(sp); break;
             case FlushStmt: break;                           // write-through model — persisted already; no-op.
             case ClearStmt cl: ExecClear(cl); break;
@@ -832,6 +843,7 @@ public sealed partial class VfpInterpreter
             case "DATABASE": SetDatabase(arg); break;           // current-DBC designation; feeds DBC()/SET("DATABASE").
             case "BLOCKSIZE": SetBlockSize(arg); break;         // memo (.fpt) block size for the NEXT created table; SET("BLOCKSIZE").
             case "TEXTMERGE": SetTextMerge(arg); break;         // ON/OFF + DELIMITERS TO; SET("TEXTMERGE"); default delims for TEXTMERGE().
+            case "FIELDS": SetFields(arg); break;               // field-list restriction tracking; FLDLIST()/SET("FIELDS").
             // SET NOCPTRANS TO [FieldList] [ADDITIVE] — a FoxPro-2.x runtime relic. The real (persistent)
             // NOCPTRANS semantics live on the column 0x04 flag (already fully honoured on the read path);
             // this runtime override is accepted as a no-op. FLAG: no runtime per-field code-page override.

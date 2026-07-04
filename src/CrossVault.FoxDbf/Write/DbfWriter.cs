@@ -158,7 +158,9 @@ public sealed partial class DbfWriter : IDisposable
             bool hasMemo = schema.Columns.Any(c => c.Type is 'M' or 'W' or 'G' or 'P');
             if (hasMemo)
             {
-                string? fptPath = FindFpt(path);
+                // Honour an explicit memo sidecar override when given (e.g. a .dbc container whose memo is
+                // the sibling .DCT, not a .fpt); otherwise auto-discover the .fpt beside the .dbf.
+                string? fptPath = options.MemoPath is { Length: > 0 } mp && File.Exists(mp) ? mp : FindFpt(path);
                 if (fptPath is not null)
                 {
                     // FileShare.ReadWrite (not just Read) so a memo-bearing table can be opened by two

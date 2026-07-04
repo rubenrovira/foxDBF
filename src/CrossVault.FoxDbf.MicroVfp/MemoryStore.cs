@@ -328,6 +328,44 @@ internal sealed class MemoryStore
         foreach (var f in _frames) f.Vars.Clear();
     }
 
+    /// <summary>A visible binding snapshot for LIST/DISPLAY MEMORY and SAVE TO / RESTORE FROM: name + kind
+    /// plus EITHER the scalar value OR the array (never both). Walks frames top-down (nearest wins,
+    /// ancestor LOCALs hidden) and yields each DEFINED name once.</summary>
+    public readonly record struct Binding(string Name, VarKind Kind, VfpValue? Scalar, VfpArray? Array);
+
+    /// <summary>Enumerate the currently VISIBLE, DEFINED memory bindings (scalars + arrays), nearest frame
+    /// first, each name once — the read side that LIST MEMORY / SAVE TO share.</summary>
+    public IReadOnlyList<Binding> EnumerateVisible()
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<Binding>();
+        int cur = _frames.Count - 1;
+        for (int f = cur; f >= 0; f--)
+        {
+            foreach (var kv in _frames[f].Vars)
+            {
+                if (f != cur && kv.Value.Kind == VarKind.Local) continue;   // ancestor LOCAL: invisible to callees.
+                if (!kv.Value.Defined) continue;                            // reserved-but-unassigned PRIVATE: skip.
+                if (!seen.Add(kv.Key)) continue;                            // a nearer frame already shadowed it.
+                result.Add(new Binding(kv.Key, kv.Value.Kind,
+                    kv.Value.Array is null ? kv.Value.Value : (VfpValue?)null, kv.Value.Array));
+            }
+        }
+        return result;
+    }
+
+    /// <summary>Bind <paramref name="name"/> as a restored ARRAY (RESTORE FROM). Always private scope, in the
+    /// current frame (VFP restores every variable as PRIVATE — hackfox s4g222).</summary>
+    public void SetArray(string name, VfpArray array)
+        => Current.Vars[name] = new Cell { Array = array, Defined = true, Kind = VarKind.Private };
+
+    /// <summary>Bind <paramref name="name"/> = <paramref name="value"/> as a restored SCALAR (RESTORE FROM):
+    /// UNCONDITIONALLY private in the current frame — the scalar sibling of <see cref="SetArray"/>. Unlike
+    /// <see cref="Set"/> it does NOT keep an existing binding's kind, so a RESTORE (ADDITIVE) over a same-named
+    /// PUBLIC re-binds it PRIVATE, exactly as VFP restores every variable with private scope (hackfox s4g222).</summary>
+    public void SetPrivate(string name, VfpValue value)
+        => Current.Vars[name] = new Cell { Value = value, Defined = true, Kind = VarKind.Private };
+
     /// <summary>RELEASE <paramref name="name"/> (no error if absent): drop the nearest visible binding.</summary>
     public void Release(string name)
     {

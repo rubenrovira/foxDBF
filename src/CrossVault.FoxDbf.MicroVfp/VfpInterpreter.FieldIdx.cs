@@ -36,6 +36,8 @@ public sealed partial class VfpInterpreter
         {
             case "ISBLANK": r = VfpValue.Logical(FnIsBlank(a)); return true;
             case "FLDLIST": r = VfpValue.Character(FnFldList(a)); return true;
+            case "ADIR": r = VfpValue.Integer(FnADir(a)); return true;
+            case "AFONT": r = FnAFont(a); return true;
             case "KEYMATCH": r = VfpValue.Logical(FnKeyMatch(a)); return true;
             case "GETNEXTMODIFIED": r = VfpValue.Integer(FnGetNextModified(a)); return true;
             case "SETFLDSTATE": r = VfpValue.Logical(FnSetFldState(a)); return true; // s4g395: validated but inert for real tables.
@@ -169,9 +171,13 @@ public sealed partial class VfpInterpreter
     // ─────────────────────────── FLDLIST() ───────────────────────────
 
     /// <summary>FLDLIST([n]) — the field list set by SET FIELDS (verified vs vfp9.exe: it is the SET FIELDS
-    /// list, NOT a FIELD()-style by-number lookup). microVFP does not model SET FIELDS, so with none set it
-    /// returns "" (the VFP9 value in that state). FLAG: SET FIELDS TO … is not modelled.</summary>
-    private string FnFldList(VfpValue[] a) => string.Empty;
+    /// list, NOT a FIELD()-style by-number lookup), alias-qualified + uppercase, comma-no-space
+    /// (e.g. <c>SALES.ID,SALES.AMT</c>). Empty when no list is set. FLAG: the n-th-item form FLDLIST(n) and
+    /// the actual field-visibility RESTRICTION (fields behaving as absent) are not modelled — SET FIELDS here
+    /// only tracks the list for FLDLIST()/SET("FIELDS") introspection (hackfox s4g091: views supersede it).</summary>
+    private string FnFldList(VfpValue[] a)
+        => string.Join(",", _setFields.Select(f => (_setFieldsAlias.Length > 0 ? _setFieldsAlias + "." : string.Empty)
+                                                    + f.ToUpperInvariant()));
 
     // ─────────────────────────── KEYMATCH() ───────────────────────────
 

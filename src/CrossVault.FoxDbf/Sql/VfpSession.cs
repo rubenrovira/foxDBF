@@ -330,6 +330,19 @@ public sealed class VfpSession : IDisposable
         _dataDir = Path.GetDirectoryName(_dbcPath);
     }
 
+    /// <summary>Close the current DBC handle, run <paramref name="writeToDbc"/> (which mutates the container
+    /// file directly — e.g. APPEND PROCEDURES rewriting the stored-procedure memo) while nothing holds it
+    /// open, then RE-OPEN it so subsequent reads see the change. No-op when no DBC is open.</summary>
+    internal void RewriteDatabase(Action<string> writeToDbc)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_dbcPath is null) return;
+        _db?.Dispose();
+        _db = null;
+        try { writeToDbc(_dbcPath); }
+        finally { _db = DbfDatabase.OpenFoxpro(_dbcPath); }
+    }
+
     /// <summary>Opens a directory of free <c>.dbf</c> tables as the session's data source: bare
     /// table names resolve to <c>&lt;dir&gt;/&lt;name&gt;.dbf</c>.</summary>
     public void OpenDirectory(string directory)

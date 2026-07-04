@@ -54,6 +54,8 @@ internal static class MicroVfpExprRewrite
         s = QuoteArrayFnArg(s, "ADATABASES"); // ADATABASES(ArrayName)
         s = QuoteArrayFnArg(s, "AUSED");      // AUSED(ArrayName [, nDataSessionId])
         s = QuoteArrayFnArg(s, "ASESSIONS");  // ASESSIONS(ArrayName)
+        s = QuoteArrayFnArg(s, "ADIR");       // ADIR(ArrayName [, cSkeleton [, cAttributes]])
+        s = QuoteArrayFnArg(s, "AFONT");      // AFONT(ArrayName [, cFontName [, nFontSize]]) — headless stub
         // ACOPY takes TWO array names by reference (source AND destination).
         s = QuoteArrayFn2Args(s, "ACOPY");    // ACOPY(aSource, aDest [, nStart [, nCount [, nDestStart]]])
         s = QuoteLookupArgs(s);               // LOOKUP(rReturn, eSearch, rSearched [, cTag]) — field names by reference.

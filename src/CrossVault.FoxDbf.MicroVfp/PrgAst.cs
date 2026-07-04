@@ -441,6 +441,61 @@ internal sealed record FlushStmt(bool Force) : PrgStatement;
 /// executor (<see cref="Sql"/>). CREATE TABLE additionally opens the new table in a work area (VFP).</summary>
 internal sealed record SqlPassthroughStmt(string Sql) : PrgStatement;
 
+// ── P3 batch 4 (FINAL): remaining array / variable / DB-lifecycle / table items ──────────────
+
+/// <summary><c>COPY TO ARRAY aName [FIELDS cList] [scope] [FOR lExpr] [WHILE lExpr]</c> — the read
+/// counterpart of APPEND/REPLACE FROM ARRAY. An UNDEFINED array auto-dimensions to (records × fields);
+/// an EXISTING 2-D array is filled without redimensioning; an EXISTING 1-D array takes the FIRST scoped
+/// record's fields. Memo/general/blob/picture cells hold a <c>.F.</c> placeholder. microVFP P3 §C.1.</summary>
+internal sealed record CopyToArrayStmt(
+    string ArrayName,
+    IReadOnlyList<string> Fields,
+    string? Scope,
+    PrgExpr? For,
+    PrgExpr? While) : PrgStatement;
+
+/// <summary><c>SAVE TO cFile [ALL LIKE skel | ALL EXCEPT skel]</c> — persist the visible memvars/arrays to
+/// a file (microVFP's OWN round-trip format; the proprietary <c>.mem</c> binary is not interop — FLAG).
+/// <see cref="Like"/>/<see cref="Except"/> are the wildcard skeletons. microVFP P3 §C.4.</summary>
+internal sealed record SaveToStmt(NameRef Target, string? Like, string? Except) : PrgStatement;
+
+/// <summary><c>RESTORE FROM cFile [ADDITIVE]</c> — reload memvars/arrays saved by <see cref="SaveToStmt"/>;
+/// without <see cref="Additive"/> the memory is cleared first (implicit CLEAR MEMORY). microVFP P3 §C.4.</summary>
+internal sealed record RestoreFromStmt(NameRef Source, bool Additive) : PrgStatement;
+
+/// <summary><c>WAIT [cMsg] [WINDOW …] [TIMEOUT n] [TO mVar] [NOWAIT] [CLEAR]</c> — headless: NEVER blocks;
+/// a <see cref="ToVar"/> receives "" (no keypress). microVFP P3 §C.4.</summary>
+internal sealed record WaitStmt(string? ToVar) : PrgStatement;
+
+/// <summary><c>LIST | DISPLAY MEMORY [LIKE skel] [TO FILE cFile]</c> — a headless text dump of the visible
+/// memvars to <see cref="ToFile"/> (no console). <see cref="Like"/> filters. microVFP P3 §C.4.</summary>
+internal sealed record MemoryDumpStmt(string? Like, NameRef? ToFile) : PrgStatement;
+
+/// <summary><c>APPEND PROCEDURES FROM cFile</c> (<see cref="Append"/>=true) / <c>COPY PROCEDURES TO cFile</c>
+/// — extract/append the current DBC's stored-procedure SOURCE text. microVFP P3 §C.7.</summary>
+internal sealed record ProceduresStmt(bool Append, NameRef File) : PrgStatement;
+
+/// <summary><c>PACK DATABASE</c> — physical delete-compaction of every member table of the current DBC.
+/// microVFP P3 §C.7.</summary>
+internal sealed record PackDatabaseStmt : PrgStatement;
+
+/// <summary><c>VALIDATE DATABASE [NOCONSOLE] [RECOVER]</c> — a read-only diagnostic over the current DBC
+/// (member-path existence). <see cref="Recover"/> is FLAGGED (no automatic repair). microVFP P3 §C.7.</summary>
+internal sealed record ValidateDatabaseStmt(bool Recover) : PrgStatement;
+
+/// <summary><c>DISPLAY | LIST STRUCTURE [IN area] [TO FILE cFile]</c> — a text dump of a table's field
+/// structure (name/type/width/dec). microVFP P3 §C.14.</summary>
+internal sealed record DisplayStructureStmt(NameRef? In, NameRef? ToFile) : PrgStatement;
+
+/// <summary><c>DISPLAY | LIST TABLES [TO FILE cFile]</c> — list the current DBC's member tables + paths.
+/// microVFP P3 §C.14.</summary>
+internal sealed record DisplayTablesStmt(NameRef? ToFile) : PrgStatement;
+
+/// <summary><c>ZAP [IN nArea | cAlias]</c> — remove ALL records of the (current or named) table, structure
+/// + indexes kept. Requires exclusive open; the DBC delete-trigger is intentionally NOT fired (VFP
+/// bug-compatible). microVFP P3 §C.16.</summary>
+internal sealed record ZapStmt(NameRef? In) : PrgStatement;
+
 // ── misc / fallback ──────────────────────────────────────────────────────────
 
 /// <summary>A standalone macro line <c>&amp;var.</c> (deferred; never expanded).</summary>

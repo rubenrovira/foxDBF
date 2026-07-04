@@ -352,6 +352,13 @@ public sealed partial class VfpInterpreter
             "DATASESSION" => VfpValue.Number((decimal)Session.CurrentDataSessionId),   // NUMERIC (verified vs vfp9.exe) — the current data-session id (5.14).
             // SET("DATABASE") — the current DBC's NAME only (no drive/path/extension), "" when none current.
             "DATABASE" => VfpValue.Character(CurrentDbPath() is { Length: > 0 } p ? Path.GetFileNameWithoutExtension(p) : string.Empty),
+            // SET("FIELDS") → ON/OFF; SET("FIELDS",1) → the bare field list, ", "-separated, uppercase (no
+            // alias) — matches FLDLIST()'s list but without the alias qualifier — EXCEPT after SET FIELDS TO
+            // ALL, when it is the literal "ALL" while FLDLIST() still enumerates every field (oracle-pinned
+            // vs vfp9.exe, incl. that "ALL" survives SET FIELDS ON/OFF; hackfox s4g091).
+            "FIELDS" => a.Length > 1 && IsNumeric(a[1]) && (int)a[1].AsNumber == 1
+                ? VfpValue.Character(_setFieldsAll ? "ALL" : string.Join(", ", _setFields.Select(f => f.ToUpperInvariant())))
+                : VfpValue.Character(_setFieldsOn ? "ON" : "OFF"),
             "TALK" => VfpValue.Character("OFF"),
             "COMPATIBLE" => VfpValue.Character("OFF"),
             _ => VfpValue.Character(string.Empty),
@@ -450,6 +457,13 @@ public sealed partial class VfpInterpreter
             case 2021: return VfpValue.Character(a.Length < 2 ? string.Empty : (ResolveSlot(a.Skip(1).ToArray())?.ForExpr.ToUpperInvariant() ?? string.Empty));
             case 2007: return VfpValue.Character(Crc16Ccitt(a.Length > 1 ? a[1].AsString : string.Empty).ToString(CultureInfo.InvariantCulture));
             case 2015: return VfpValue.Character("_" + Guid.NewGuid().ToString("N")[..9].ToUpperInvariant());
+            // SYS(2029 [, area]) — the DBF header's first (version/type) byte as a decimal string; "0" when
+            // no table is open in the addressed area. A VFP table is "48" (0x30) — oracle-pinned vs vfp9.exe.
+            case 2029:
+            {
+                var wa = AreaArg(a.Skip(1).ToArray(), 0);
+                return VfpValue.Character(((int)(wa?.Table.Version.Code ?? 0)).ToString(CultureInfo.InvariantCulture));
+            }
             default: return VfpValue.Character(string.Empty);
         }
     }
