@@ -206,6 +206,8 @@ public sealed partial class VfpInterpreter
     /// <summary>The loaded program, or <see langword="null"/> before <see cref="Load(PrgProgram)"/>.</summary>
     public PrgProgram? Program { get; private set; }
 
+    internal VfpInsertProfile? InsertProfile { get; set; }
+
     /// <summary>
     /// P3b (point 4) — load the session DBC's <c>StoredProceduresSource</c> (the RI procs + business
     /// functions) straight from the container, so the caller need not <see cref="LoadFile(string)"/> an
@@ -241,11 +243,20 @@ public sealed partial class VfpInterpreter
     /// the global frame; state mutates the bound session/memory/runtime.</summary>
     public void Execute(string source)
     {
-        var prog = ParseProgramCached(source);
-        foreach (var p in prog.Procedures) { _procs[p.Name] = p; ScanDefines(p.Body); }
-        ScanDefines(prog.Main);
-        try { ExecBlock(prog.Main); }
-        catch (ReturnSignal) { /* RETURN at top level just ends the snippet */ }
+        var prevProfile = VfpInsertProfile.Current;
+        VfpInsertProfile.Current = InsertProfile;
+        try
+        {
+            var prog = ParseProgramCached(source);
+            foreach (var p in prog.Procedures) { _procs[p.Name] = p; ScanDefines(p.Body); }
+            ScanDefines(prog.Main);
+            try { ExecBlock(prog.Main); }
+            catch (ReturnSignal) { /* RETURN at top level just ends the snippet */ }
+        }
+        finally
+        {
+            VfpInsertProfile.Current = prevProfile;
+        }
     }
 
     /// <summary>Evaluates a single VFP expression string (e.g. a DBC field DEFAULT / RULE, or an ad-hoc
@@ -462,6 +473,7 @@ public sealed partial class VfpInterpreter
 
     private void Exec(PrgStatement s)
     {
+        long dispatchStart = VfpInsertProfile.Start();
         switch (s)
         {
             case Assignment a: AssignTo(a.Target, Eval(a.Value)); break;
@@ -506,7 +518,7 @@ public sealed partial class VfpInterpreter
             case EndTxnStmt: EndTransaction(); break;
             case RollbackStmt: RollbackTransaction(); break;
             case DirectiveStmt d: ProcessDefine(d.Text); break;
-            case InsertStmt ins: ExecInsert(ins); break;
+            case InsertStmt ins: VfpInsertProfile.Stop(VfpInsertProfileBucket.StatementFetchDispatch, dispatchStart); ExecInsert(ins); break;
             case GatherStmt g: ExecGather(g); break;
             case ScatterStmt sc2: ExecScatter(sc2); break;
             case AppendFromStmt af: ExecAppendFrom(af); break;
@@ -1267,8 +1279,16 @@ public sealed partial class VfpInterpreter
 
     private VfpValue Eval(PrgExpr e)
     {
-        if (e.IsParsed) return e.Parsed!.Evaluate(_row, _ctx);
-        return EvalText(e.Text);
+        long start = VfpInsertProfile.Start();
+        try
+        {
+            if (e.IsParsed) return e.Parsed!.Evaluate(_row, _ctx);
+            return EvalText(e.Text);
+        }
+        finally
+        {
+            VfpInsertProfile.Stop(VfpInsertProfileBucket.ExpressionEval, start);
+        }
     }
 
     private VfpValue EvalText(string text)

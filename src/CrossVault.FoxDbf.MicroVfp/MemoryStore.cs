@@ -263,9 +263,17 @@ internal sealed class MemoryStore
     /// binding, else create it as an implicit-PRIVATE in the current frame.</summary>
     public void Set(string name, VfpValue value)
     {
-        var cell = Find(name);
-        if (cell is not null) { cell.Value = value; cell.Defined = true; return; }
-        Current.Vars[name] = new Cell { Value = value, Defined = true, Kind = VarKind.ImplicitPrivate };
+        long profileStart = VfpInsertProfile.Start();
+        try
+        {
+            var cell = Find(name);
+            if (cell is not null) { cell.Value = value; cell.Defined = true; return; }
+            Current.Vars[name] = new Cell { Value = value, Defined = true, Kind = VarKind.ImplicitPrivate };
+        }
+        finally
+        {
+            VfpInsertProfile.Stop(VfpInsertProfileBucket.MemoryStoreAccess, profileStart);
+        }
     }
 
     /// <summary>Read <paramref name="name"/> following VFP visibility, or <see cref="VfpValue.Null"/>
@@ -273,9 +281,17 @@ internal sealed class MemoryStore
     /// ARRAY binding in this scalar accessor yields element <c>(1,1)</c>/<c>(1)</c>, per VFP.</summary>
     public VfpValue Get(string name)
     {
-        var cell = Find(name);
-        if (cell is not { Defined: true }) return VfpValue.Null;
-        return cell.Array is { } arr ? arr.First : cell.Value;
+        long profileStart = VfpInsertProfile.Start();
+        try
+        {
+            var cell = Find(name);
+            if (cell is not { Defined: true }) return VfpValue.Null;
+            return cell.Array is { } arr ? arr.First : cell.Value;
+        }
+        finally
+        {
+            VfpInsertProfile.Stop(VfpInsertProfileBucket.MemoryStoreAccess, profileStart);
+        }
     }
 
     /// <summary>True when <paramref name="name"/> resolves to a visible DEFINED binding.</summary>

@@ -17,6 +17,7 @@ public sealed partial class VfpInterpreter
 {
     private void ExecInsert(InsertStmt ins)
     {
+        long checkStart = VfpInsertProfile.Start();
         // P3b: an INSERT on a DBC member with a bound insert trigger (the RI insert RESTRICT rule) is
         // ENFORCED atomically — the row lands, the bound __RI_INSERT_<table> trigger fires positioned ON
         // the new record, and a .F. return (a missing parent key) ROLLS THE INSERTED ROW BACK, exactly as
@@ -32,10 +33,13 @@ public sealed partial class VfpInterpreter
             && Session.FindAreaByAlias(bufStmt.Table) is { } bufWa
             && _meta.TryGetValue(bufWa.Area, out var bufMeta) && bufMeta.Buffering > 1)
         {
+            VfpInsertProfile.Stop(VfpInsertProfileBucket.BufferingRiChecks, checkStart);
             BufferAppend(bufWa, bufMeta, ins, bufStmt);
             return;
         }
+        VfpInsertProfile.Stop(VfpInsertProfileBucket.BufferingRiChecks, checkStart);
 
+        long targetStart = VfpInsertProfile.Start();
         string? table = (ins.Parsed as InsertStatement)?.Table
                      ?? (SafeParseSql(ins.Sql) as InsertStatement)?.Table;
 
@@ -52,13 +56,21 @@ public sealed partial class VfpInterpreter
             && Session.FindAreaByAlias(table)?.Table.SourcePath is string candPath
             && CandidateTagsFor(candPath) is not null)
         {
-            EnforceCandidateInsert(ins, candPath);
+            VfpInsertProfile.Stop(VfpInsertProfileBucket.InsertTargetColumnResolution, targetStart);
+            long indexStart = VfpInsertProfile.Start();
+            try { EnforceCandidateInsert(ins, candPath); }
+            finally { VfpInsertProfile.Stop(VfpInsertProfileBucket.IndexMaintenanceCall, indexStart); }
             return;
         }
+        VfpInsertProfile.Stop(VfpInsertProfileBucket.InsertTargetColumnResolution, targetStart);
 
+        checkStart = VfpInsertProfile.Start();
         if (!EnforceReferentialIntegrity || table is null)
         {
+            VfpInsertProfile.Stop(VfpInsertProfileBucket.BufferingRiChecks, checkStart);
+            long sqlStart = VfpInsertProfile.Start();
             try { Session.Execute(ins.Sql); } catch { /* best-effort; INSERT is not a target path */ }
+            finally { VfpInsertProfile.Stop(VfpInsertProfileBucket.SqlDmlFallback, sqlStart); }
             return;
         }
 
@@ -76,20 +88,28 @@ public sealed partial class VfpInterpreter
         if (wa is null || ResolveTriggerProc(RiEvent.Insert, wa) is null)
         {
             if (openedHere && wa is not null) { Session.CloseArea(wa.Area); _meta.Remove(wa.Area); }
+            VfpInsertProfile.Stop(VfpInsertProfileBucket.BufferingRiChecks, checkStart);
+            long sqlStart = VfpInsertProfile.Start();
             try { Session.Execute(ins.Sql); } catch { }
+            finally { VfpInsertProfile.Stop(VfpInsertProfileBucket.SqlDmlFallback, sqlStart); }
             return;
         }
+        VfpInsertProfile.Stop(VfpInsertProfileBucket.BufferingRiChecks, checkStart);
 
         int area = wa.Area;
         // COPY-ON-WRITE seam (ADO.NET transaction): take the table's private copy BEFORE snapshotting so the
         // pre-image, the row append (Session.Execute re-enters the SAME seam via the table name), the trigger's
         // read-your-writes and a trigger-abort RestoreSnapshot all operate on the copy — isolated + rollback-
         // able. No-op in autocommit (the live path is returned unchanged).
+        long leaseStart = VfpInsertProfile.Start();
         string? path = wa.Table.SourcePath is { } sp ? BeginTxWrite(sp) : null;
+        VfpInsertProfile.Stop(VfpInsertProfileBucket.BeginTxWriteLease, leaseStart);
         FileSnapshot? snap = path is not null ? CaptureSnapshot(path) : null;   // pre-image for the rollback.
 
+        long riSqlStart = VfpInsertProfile.Start();
         try { Session.Execute(ins.Sql); }
         catch { if (openedHere) { Session.CloseArea(area); _meta.Remove(area); } return; }
+        finally { VfpInsertProfile.Stop(VfpInsertProfileBucket.SqlDmlFallback, riSqlStart); }
 
         if (path is not null) ReopenFileAreas(path);   // every open handle must see the appended row.
 
