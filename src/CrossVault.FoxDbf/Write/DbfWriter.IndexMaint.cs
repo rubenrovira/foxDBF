@@ -61,6 +61,17 @@ public sealed partial class DbfWriter
     private FileStream? _cdxMaintStream;
     private CdxTreeEditor? _cdxMaintEditor;
     private List<(CdxTreeEditor.TagHandle Tag, CdxIndexBuilder.TagKeyComputer Computer)>? _cdxMaintPlans;
+    private CdxMaintMode _cdxMaintMode;
+
+    private enum CdxMaintMode
+    {
+        None,
+        Append,
+        Update,
+    }
+
+    internal int CdxAppendPageCachePageCountForTests
+        => _cdxMaintEditor?.AppendPageCachePageCountForTests ?? 0;
 
     /// <summary>True when a structural <c>.cdx</c> exists and should be incrementally maintained on writes.
     /// False for a table with no structural index (must stay 100% untouched) or once maintenance has already
@@ -84,7 +95,7 @@ public sealed partial class DbfWriter
         try
         {
             ThrowIfInjectedFault();
-            if (!EnsureCdxMaint())
+            if (!EnsureCdxMaint(CdxMaintMode.Append))
             {
                 // An un-derivable tag → invalidate (which first tears down any handle EnsureCdxMaint left).
                 InvalidateStructuralCdxForMaintenance();
@@ -119,13 +130,18 @@ public sealed partial class DbfWriter
     /// header offset are stable; only the on-disk root moves, and that is re-read live on every
     /// <see cref="CdxTreeEditor.Insert"/> / <see cref="CdxTreeEditor.Delete"/>).
     /// </summary>
-    private bool EnsureCdxMaint()
+    private bool EnsureCdxMaint(CdxMaintMode mode)
     {
         if (_cdxMaintEditor is not null && _cdxMaintPlans is not null)
+        {
+            PrepareCdxMaintMode(mode);
             return true;
+        }
 
         FileStream rw = OpenCdxReadWrite();
         var editor = new CdxTreeEditor(rw);
+        if (mode == CdxMaintMode.Append)
+            editor.BeginAppendRun();
         if (!TryResolveComputers(editor, out var plans))
         {
             editor.Dispose();
@@ -135,7 +151,28 @@ public sealed partial class DbfWriter
         _cdxMaintStream = rw;
         _cdxMaintEditor = editor;
         _cdxMaintPlans = plans;
+        _cdxMaintMode = mode;
         return true;
+    }
+
+    private void PrepareCdxMaintMode(CdxMaintMode mode)
+    {
+        if (_cdxMaintEditor is null)
+        {
+            _cdxMaintMode = CdxMaintMode.None;
+            return;
+        }
+
+        if (_cdxMaintMode == mode)
+            return;
+
+        _cdxMaintEditor.Flush();
+        _cdxMaintEditor.ClearAppendRunCache();
+
+        if (mode == CdxMaintMode.Append)
+            _cdxMaintEditor.BeginAppendRun();
+
+        _cdxMaintMode = mode;
     }
 
     /// <summary>
@@ -154,6 +191,7 @@ public sealed partial class DbfWriter
         _cdxMaintEditor = null;
         _cdxMaintStream = null;
         _cdxMaintPlans = null;
+        _cdxMaintMode = CdxMaintMode.None;
     }
 
     /// <summary>
@@ -220,7 +258,7 @@ public sealed partial class DbfWriter
         try
         {
             ThrowIfInjectedFault();
-            if (!EnsureCdxMaint())
+            if (!EnsureCdxMaint(CdxMaintMode.Update))
             {
                 // An un-derivable tag → invalidate (which first tears down any handle EnsureCdxMaint left).
                 InvalidateStructuralCdxForMaintenance();

@@ -29,6 +29,7 @@ internal sealed class CdxTreeEditor : IDisposable
     private readonly FileStream _rw;
     private readonly IndexFile _reader;   // page reads over the SAME stream (leaveOpen)
     private long _end;                     // next free byte offset (== file length); new pages land here
+    private Dictionary<long, byte[]>? _appendPageCache;
 
     public CdxTreeEditor(FileStream rw)
     {
@@ -46,15 +47,15 @@ internal sealed class CdxTreeEditor : IDisposable
     public List<TagHandle> ReadTags()
     {
         var result = new List<TagHandle>();
-        var fileHeader = _reader.ReadCdxHeader(0);
+        var fileHeader = ReadCdxHeader(0);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (headerOffset, nameBytes) in
-                 IndexTraversal.EnumerateCompact(_reader, fileHeader.Root, fileHeader.KeyLength, isCharacter: true))
+                 EnumerateCompact(fileHeader.Root, fileHeader.KeyLength, isCharacter: true))
         {
             string name = TrimName(nameBytes);
             if (name.Length == 0 || !seen.Add(name))
                 continue;
-            var hdr = _reader.ReadCdxHeader(headerOffset);
+            var hdr = ReadCdxHeader(headerOffset);
             result.Add(new TagHandle(name, headerOffset, hdr));
         }
         return result;
@@ -118,14 +119,29 @@ internal sealed class CdxTreeEditor : IDisposable
                 if (c == 0) return true;
                 if (c > 0) return false;   // passed where the key would sort
             }
-            var hdr = _reader.ReadNodeHeader(cur);
+            var hdr = ReadNodeHeader(cur);
             cur = hdr?.RightSibling is uint r ? r : -1;
         }
         return false;
     }
 
+    public void BeginAppendRun()
+        => _appendPageCache ??= new Dictionary<long, byte[]>();
+
+    public void ClearAppendRunCache()
+    {
+        _appendPageCache?.Clear();
+        _appendPageCache = null;
+    }
+
+    internal int AppendPageCachePageCountForTests => _appendPageCache?.Count ?? 0;
+
     public void Flush() => _rw.Flush();
-    public void Dispose() => _reader.Dispose();   // leaveOpen: does not close _rw (owned by the caller)
+    public void Dispose()
+    {
+        ClearAppendRunCache();
+        _reader.Dispose();   // leaveOpen: does not close _rw (owned by the caller)
+    }
 
     // ---- recursive insert ------------------------------------------------------
 
@@ -139,7 +155,7 @@ internal sealed class CdxTreeEditor : IDisposable
 
     private InsertResult InsertNode(long nodeOff, byte[] key, uint recno, int keyLen, byte pad, long recnoBasis)
     {
-        var hdr = _reader.ReadNodeHeader(nodeOff)
+        var hdr = ReadNodeHeader(nodeOff)
             ?? throw new InvalidDataException($"CDX node at {nodeOff} is unreadable.");
         uint? left = hdr.LeftSibling, right = hdr.RightSibling;
         bool isRoot = hdr.IsRoot;
@@ -268,7 +284,7 @@ internal sealed class CdxTreeEditor : IDisposable
 
     private DeleteResult DeleteNode(long nodeOff, byte[] key, uint recno, int keyLen, byte pad, long recnoBasis)
     {
-        var hdr = _reader.ReadNodeHeader(nodeOff)
+        var hdr = ReadNodeHeader(nodeOff)
             ?? throw new InvalidDataException($"CDX node at {nodeOff} is unreadable.");
         uint? left = hdr.LeftSibling, right = hdr.RightSibling;
         bool isRoot = hdr.IsRoot;
@@ -346,7 +362,7 @@ internal sealed class CdxTreeEditor : IDisposable
         var seen = new HashSet<long>();
         while (seen.Add(cur))
         {
-            var hdr = _reader.ReadNodeHeader(cur);
+            var hdr = ReadNodeHeader(cur);
             if (hdr is null) return -1;
             if (hdr.Value.IsLeaf) return cur;
             var kids = ReadBranchList(cur, keyLen);
@@ -395,7 +411,7 @@ internal sealed class CdxTreeEditor : IDisposable
     private List<(byte[] Key, uint Recno)> ReadLeafList(long off, int keyLen, byte pad)
     {
         bool isChar = pad == 0x20;
-        var raw = _reader.ReadLeafEntries(off, keyLen, isChar);
+        var raw = ReadLeafEntries(off, keyLen, isChar);
         var list = new List<(byte[], uint)>(raw.Count);
         foreach (var e in raw)
             list.Add((e.Key, e.RecordNumber));
@@ -404,7 +420,7 @@ internal sealed class CdxTreeEditor : IDisposable
 
     private List<CdxIndexBuilder.BranchChild> ReadBranchList(long off, int keyLen)
     {
-        var raw = _reader.ReadBranchEntries(off, keyLen);
+        var raw = ReadBranchEntries(off, keyLen);
         var list = new List<CdxIndexBuilder.BranchChild>(raw.Count);
         foreach (var e in raw)
             list.Add(new CdxIndexBuilder.BranchChild(e.Key, e.RecordNumber, e.ChildPointer));
@@ -438,13 +454,169 @@ internal sealed class CdxTreeEditor : IDisposable
         BinaryPrimitives.WriteUInt16LittleEndian(page.AsSpan(0), attr);
     }
 
+    private CdxHeader ReadCdxHeader(long byteOffset = 0)
+    {
+        if (_appendPageCache is null)
+            return _reader.ReadCdxHeader(byteOffset);
+
+        if (byteOffset < 0 || byteOffset + PageSize > _rw.Length)
+            return default;
+
+        var header = TryReadPage(byteOffset);
+        if (header is null)
+            return default;
+
+        ushort forExprLength = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(506));
+        ushort keyExprLength = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(510));
+
+        int wanted = PageSize + keyExprLength + forExprLength;
+        var buf = new byte[wanted];
+        Buffer.BlockCopy(header, 0, buf, 0, PageSize);
+
+        int available = (int)Math.Min(wanted, _rw.Length - byteOffset);
+        int tail = available - PageSize;
+        if (tail > 0 && !ReadExact(byteOffset + PageSize, buf.AsSpan(PageSize, tail)))
+            return default;
+
+        return CdxHeader.Parse(buf);
+    }
+
+    private IndexNodeHeader? ReadNodeHeader(long byteOffset)
+    {
+        if (_appendPageCache is null)
+            return _reader.ReadNodeHeader(byteOffset);
+
+        var page = TryReadPage(byteOffset);
+        return page is null ? null : IndexNodeHeader.Parse(page);
+    }
+
+    private IReadOnlyList<BranchEntry> ReadBranchEntries(long byteOffset, int keyLength)
+    {
+        if (_appendPageCache is null)
+            return _reader.ReadBranchEntries(byteOffset, keyLength);
+
+        var page = TryReadPage(byteOffset);
+        if (page is null || keyLength <= 0)
+            return Array.Empty<BranchEntry>();
+
+        var header = IndexNodeHeader.Parse(page);
+        if (header.IsLeaf)
+            return Array.Empty<BranchEntry>();
+
+        int entrySize = keyLength + 8;
+        int maxEntries = (PageSize - 12) / entrySize;
+        var entries = new List<BranchEntry>(Math.Min(header.KeyCount, maxEntries));
+
+        int offset = 12;
+        for (int i = 0; i < header.KeyCount; i++)
+        {
+            if (offset + entrySize > PageSize)
+                break;
+
+            var key = page.AsSpan(offset, keyLength).ToArray();
+            uint recno = BinaryPrimitives.ReadUInt32BigEndian(page.AsSpan(offset + keyLength, 4));
+            uint child = BinaryPrimitives.ReadUInt32BigEndian(page.AsSpan(offset + keyLength + 4, 4));
+
+            entries.Add(new BranchEntry(key, recno, child));
+            offset += entrySize;
+        }
+
+        return entries;
+    }
+
+    private IReadOnlyList<LeafEntry> ReadLeafEntries(long byteOffset, int keyLength, bool isCharacter)
+    {
+        if (_appendPageCache is null)
+            return _reader.ReadLeafEntries(byteOffset, keyLength, isCharacter);
+
+        var page = TryReadPage(byteOffset);
+        if (page is null || keyLength <= 0)
+            return Array.Empty<LeafEntry>();
+
+        var header = IndexNodeHeader.Parse(page);
+        if (!header.IsLeaf)
+            return Array.Empty<LeafEntry>();
+
+        return CompactLeaf.Decode(page, keyLength, isCharacter);
+    }
+
+    private IEnumerable<(uint Recno, byte[] Key)> EnumerateCompact(uint root, int keyLength, bool isCharacter)
+    {
+        if (_appendPageCache is null)
+            return IndexTraversal.EnumerateCompact(_reader, root, keyLength, isCharacter);
+        return EnumerateCompactCached(root, keyLength, isCharacter);
+    }
+
+    private IEnumerable<(uint Recno, byte[] Key)> EnumerateCompactCached(uint root, int keyLength, bool isCharacter)
+    {
+        if (keyLength <= 0)
+            yield break;
+
+        long cur = root;
+        var descended = new HashSet<long>();
+        while (true)
+        {
+            if (!descended.Add(cur))
+                yield break;
+
+            var header = ReadNodeHeader(cur);
+            if (header is null)
+                yield break;
+            if (header.Value.IsLeaf)
+                break;
+
+            var branch = ReadBranchEntries(cur, keyLength);
+            if (branch.Count == 0)
+                yield break;
+
+            cur = branch[0].ChildPointer;
+        }
+
+        var visited = new HashSet<long>();
+        while (true)
+        {
+            if (!visited.Add(cur))
+                yield break;
+
+            foreach (var e in ReadLeafEntries(cur, keyLength, isCharacter))
+                yield return (e.RecordNumber, e.Key);
+
+            var header = ReadNodeHeader(cur);
+            if (header is null)
+                break;
+            var right = header.Value.RightSibling;
+            if (right is null)
+                break;
+            cur = right.Value;
+        }
+    }
+
     private byte[] ReadPage(long off)
-        => _reader.ReadPage(off) ?? throw new InvalidDataException($"CDX page at {off} is unreadable.");
+        => TryReadPage(off) ?? throw new InvalidDataException($"CDX page at {off} is unreadable.");
+
+    private byte[]? TryReadPage(long off)
+    {
+        if (_appendPageCache is null)
+            return _reader.ReadPage(off);
+
+        if (off < 0 || off + PageSize > _rw.Length)
+            return null;
+
+        if (_appendPageCache.TryGetValue(off, out var cached))
+            return (byte[])cached.Clone();
+
+        var page = _reader.ReadPage(off);
+        if (page is not null)
+            _appendPageCache[off] = (byte[])page.Clone();
+        return page;
+    }
 
     private void WritePage(long off, byte[] page)
     {
         _rw.Seek(off, SeekOrigin.Begin);
         _rw.Write(page, 0, PageSize);
+        if (_appendPageCache is not null)
+            _appendPageCache[off] = page.AsSpan(0, PageSize).ToArray();
         if (off + PageSize > _end)
             _end = off + PageSize;
     }
@@ -457,10 +629,33 @@ internal sealed class CdxTreeEditor : IDisposable
 
     private void WriteTagRoot(long headerOffset, uint root)
     {
+        byte[]? cachedPage = _appendPageCache is null ? null : TryReadPage(headerOffset);
         Span<byte> b = stackalloc byte[4];
         BinaryPrimitives.WriteUInt32LittleEndian(b, root);
         _rw.Seek(headerOffset, SeekOrigin.Begin);
         _rw.Write(b);
+        if (_appendPageCache is not null && cachedPage is not null)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(cachedPage.AsSpan(0), root);
+            _appendPageCache[headerOffset] = cachedPage;
+        }
+    }
+
+    private bool ReadExact(long offset, Span<byte> destination)
+    {
+        if (destination.Length == 0)
+            return true;
+
+        _rw.Seek(offset, SeekOrigin.Begin);
+        int total = 0;
+        while (total < destination.Length)
+        {
+            int n = _rw.Read(destination[total..]);
+            if (n == 0)
+                return false;
+            total += n;
+        }
+        return true;
     }
 
     private static string TrimName(byte[] raw)
