@@ -135,15 +135,17 @@ public sealed partial class VfpInterpreter
     // ─────────────────────────── §C.16 ZAP ───────────────────────────
 
     /// <summary>ZAP [IN area|alias] — remove ALL records (structure + indexes kept). Requires the target
-    /// table opened EXCLUSIVE (else VFP error 1705). The DBC delete-trigger is intentionally NOT fired
-    /// (VFP bug-compatible — hackfox s4g096). Wires to the fully-built <c>DbfWriter.Zap()</c>.</summary>
+    /// table opened EXCLUSIVE (else VFP error 110 "File must be opened exclusively." — oracle-verified against
+    /// vfp9.exe 2026-07-05; the earlier 1705 was the FOREIGN-holder "File access is denied" number, a
+    /// different class). The DBC delete-trigger is intentionally NOT fired (VFP bug-compatible — hackfox
+    /// s4g096). Wires to the fully-built <c>DbfWriter.Zap()</c>.</summary>
     private void ExecZap(ZapStmt s)
     {
         int area = s.In is not null ? ResolveAreaRef(s.In) : Session.CurrentArea;
         var wa = Session.AreaAt(area);
         if (wa is null) return;
         if (!wa.Exclusive && !Session.DefaultExclusive)
-            throw new MicroVfpRuntimeException("File must be opened exclusively.", 1705);
+            throw new MicroVfpRuntimeException("File must be opened exclusively.", 110);
         RewriteTableInPlace(area, w => w.Zap());
     }
 
@@ -162,7 +164,9 @@ public sealed partial class VfpInterpreter
         var reopen = Session.CloseAreasForPath(full);
         try
         {
-            using var writer = DbfWriter.Open(path);
+            // Exclusive open: every read handle for this path was released above, and the Core Pack/Zap
+            // guard requires LockMode.Exclusive. A foreign SHARED holder makes this open throw cleanly.
+            using var writer = DbfWriter.Open(path, new DbfOptions { LockMode = LockMode.Exclusive });
             op(writer);
         }
         finally { Session.ReopenAreas(reopen); }
@@ -402,7 +406,9 @@ public sealed partial class VfpInterpreter
             string full = Path.GetFullPath(path);
             InvalidateCachedWriter(full);
             var reopen = Session.CloseAreasForPath(full);
-            try { using var w = DbfWriter.Open(path); w.Pack(); }
+            // Exclusive open (read handles released above; Core Pack requires it). A member another
+            // process holds SHARED throws a sharing IOException → skipped (best-effort), others proceed.
+            try { using var w = DbfWriter.Open(path, new DbfOptions { LockMode = LockMode.Exclusive }); w.Pack(); }
             catch { /* a member that cannot be packed (locked/absent) is skipped, others proceed. */ }
             finally { Session.ReopenAreas(reopen); }
         }

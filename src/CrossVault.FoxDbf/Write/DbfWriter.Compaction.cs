@@ -40,6 +40,9 @@ public sealed partial class DbfWriter
     public void Pack()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        RequireExclusiveForCompaction();
+        // Exclusive is now guaranteed → the whole-file lock is a no-op (WithLock passes straight
+        // through in LockMode.Exclusive); kept for symmetry with the historical §D3 bracket.
         var (fileStart, fileLength) = VfpLock.FileLockRange();
         WithLock(fileStart, fileLength, PackCore);
     }
@@ -51,11 +54,27 @@ public sealed partial class DbfWriter
     public void Zap()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        RequireExclusiveForCompaction();
         var (fileStart, fileLength) = VfpLock.FileLockRange();
         WithLock(fileStart, fileLength, ZapCore);
     }
 
 #pragma warning restore CA1416
+
+    /// <summary>
+    /// §D2 exclusivity gate — VFP-faithful (oracle-verified against vfp9.exe, 2026-07-05): PACK and ZAP
+    /// require the table to be opened EXCLUSIVELY. A <see cref="LockMode.Shared"/> writer refuses with the
+    /// typed VFP error <b>110</b> ("File must be opened exclusively.") — the EXACT number the VFP9 runtime
+    /// raises for <c>USE … SHARED</c> followed by <c>PACK</c>/<c>ZAP</c>. The refusal is thrown BEFORE any
+    /// byte is read or written, so the file stays byte-identical to before the attempt (no partial
+    /// compaction, no corruption). Carried through <see cref="IVfpErrorCode"/> so the microVFP interpreter's
+    /// error trap surfaces 110 without message-text sniffing.
+    /// </summary>
+    private void RequireExclusiveForCompaction()
+    {
+        if (_lockMode != LockMode.Exclusive)
+            throw new DbfWriteException("File must be opened exclusively.", 110);
+    }
 
     private void PackCore()
     {

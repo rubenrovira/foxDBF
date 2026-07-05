@@ -127,7 +127,8 @@ public sealed class InsertOnlyCacheTests
         using var dir = new IndexMaintTestSupport.TempDir();
         string dbf = CopyTable(CreateSeed(dir.Path, "seed.dbf"), dir.Path, "t.dbf");
 
-        using var w = DbfWriter.Open(dbf);
+        // §D2: PACK requires an EXCLUSIVE open (VFP err 110 otherwise).
+        using var w = DbfWriter.Open(dbf, new DbfOptions { LockMode = LockMode.Exclusive });
         w.AppendRecord(Row(1000));
         Assert.True(w.CdxAppendPageCachePageCountForTests > 0);
 

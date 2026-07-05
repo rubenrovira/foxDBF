@@ -326,7 +326,7 @@ public sealed class FoxDbfEnforceTxBufferedWriteTests
         {
             var interp = conn.Interpreter;
             var tx = conn.BeginTransaction();
-            interp.Execute("USE setup\nPACK");   // physical delete-compaction via a direct DbfWriter on the copy.
+            interp.Execute("USE setup EXCLUSIVE\nPACK");   // physical delete-compaction via a direct DbfWriter on the copy.
             tx.Rollback();
         }
 
@@ -354,7 +354,7 @@ public sealed class FoxDbfEnforceTxBufferedWriteTests
         {
             var interp = conn.Interpreter;
             var tx = conn.BeginTransaction();
-            interp.Execute("USE setup\nPACK");
+            interp.Execute("USE setup EXCLUSIVE\nPACK");
             tx.Commit();
         }
 
@@ -379,7 +379,7 @@ public sealed class FoxDbfEnforceTxBufferedWriteTests
         using (var conn = OpenEnforced(copy))
         {
             // Autocommit: byte-identical to the pre-fix PACK.
-            conn.Interpreter.Execute("USE setup\nPACK");
+            conn.Interpreter.Execute("USE setup EXCLUSIVE\nPACK");
         }
 
         Assert.Equal(physBefore - delBefore, PhysicalCount(copy, "setup"));

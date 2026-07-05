@@ -650,7 +650,8 @@ public sealed class CdxWriterTests
             string dbf = Path.Combine(dir, "t.dbf");
             string cdx = Path.ChangeExtension(dbf, ".cdx");
             var cols = new[] { new DbfColumnDef("NAME", 'C', 10) };
-            using (var w = DbfWriter.Create(dbf, cols))
+            // §D2: PACK requires an EXCLUSIVE open (VFP err 110 otherwise) — create the writer exclusive.
+            using (var w = DbfWriter.Create(dbf, cols, new DbfCreateOptions { LockMode = LockMode.Exclusive }))
             {
                 w.AppendRecord(new object?[] { "ALPHA" });
                 w.AppendRecord(new object?[] { "BETA" });   // recno 2 → deleted below

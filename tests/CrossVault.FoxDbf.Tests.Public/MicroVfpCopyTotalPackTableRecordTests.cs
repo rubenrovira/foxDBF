@@ -222,7 +222,7 @@ public sealed class MicroVfpCopyTotalPackTableRecordTests
         using var b = new Bench();
         b.MakeSales();
 
-        b.Run("USE sales\nGO 3\nDELETE\nPACK");   // delete rec 3 (grp B, amt 5) then compact
+        b.Run("USE sales EXCLUSIVE\nGO 3\nDELETE\nPACK");   // PACK needs EXCLUSIVE (VFP 110); delete rec 3 then compact
 
         Assert.Equal(4, b.DiskCount("sales"));                 // physical row removed
         // Records renumber: old rec 4 (C/100) slides into slot 3 (0-based index 2).

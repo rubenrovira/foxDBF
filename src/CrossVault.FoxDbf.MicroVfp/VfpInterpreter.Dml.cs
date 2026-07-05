@@ -753,6 +753,13 @@ public sealed partial class VfpInterpreter
         var wa = Session.AreaAt(area);
         string? path = wa?.Table.SourcePath;
         if (wa is null || path is null) return;
+        // §D2 VFP-faithful exclusivity gate — oracle-pinned to VFP9 err 110 ("File must be opened
+        // exclusively.", vfp9.exe 2026-07-05): PACK requires the table opened EXCLUSIVE. A SHARED open
+        // (SET EXCLUSIVE OFF / USE … SHARED) is refused with the SAME typed number the runtime raises —
+        // mirrors ExecZap and the Core DbfWriter.Pack guard. Thrown before any close/rewrite, so the file
+        // is untouched.
+        if (!wa.Exclusive && !Session.DefaultExclusive)
+            throw new MicroVfpRuntimeException("File must be opened exclusively.", 110);
         // COPY-ON-WRITE seam (ADO.NET transaction): PACK physically truncates/compacts the .dbf/.fpt/.cdx —
         // an irreversible destructive op. Redirect it onto the table's private working copy so a stored-proc
         // PACK inside a FoxDbfTransaction hits the copy (Rollback discards it, restoring the deleted rows)
@@ -765,7 +772,10 @@ public sealed partial class VfpInterpreter
         var reopen = Session.CloseAreasForPath(full);   // release read handles so Pack can truncate the file.
         try
         {
-            using var writer = DbfWriter.Open(path);
+            // Exclusive open (FileShare.None): we have already released every read handle above, and the
+            // Core Pack guard requires LockMode.Exclusive. A FOREIGN process holding the table SHARED makes
+            // this open throw a sharing IOException — PACK fails cleanly, the file untouched.
+            using var writer = DbfWriter.Open(path, new DbfOptions { LockMode = LockMode.Exclusive });
             writer.Pack();                              // physical delete-compaction (+ memo relocation).
         }
         finally
