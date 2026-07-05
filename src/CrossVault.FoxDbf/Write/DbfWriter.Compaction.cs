@@ -12,7 +12,7 @@ namespace CrossVault.FoxDbf.Write;
 /// survivors forward to <c>HeaderLength</c>, rewrites the FoxPro <c>.fpt</c> sidecar with full
 /// block-pointer fix-up (orphaned/garbage memo blocks are discarded), truncates the <c>.dbf</c>
 /// (and the <c>.fpt</c>) to the new length, resets <c>RecordCount</c> (bytes 4–7), re-stamps the
-/// last-update date and writes the trailing <c>0x1A</c> EOF byte for VFP <c>0x30/0x31/0x32</c>.
+/// last-update date. NO trailing <c>0x1A</c> is written — oracle-verified: VFP9's PACK drops the EOF byte (it reappears on the next append).
 /// </para>
 /// <para>
 /// <see cref="Zap"/> discards ALL rows: it truncates the <c>.dbf</c> to header-only, sets the
@@ -132,7 +132,11 @@ public sealed partial class DbfWriter
             }
 
             int newCount = survivors.Count;
-            bool writeEof = WritesEof && newCount > 0;
+            // ORACLE-VERIFIED (2026-07-05, vfp9.exe probe): VFP9's PACK does NOT write a trailing 0x1A —
+            // a packed 3x15-byte table is exactly header+45 bytes (the EOF byte VFP itself wrote at
+            // CREATE/APPEND time is DROPPED by PACK). Match that: no EOF byte on the pack rewrite.
+            // (Appends after PACK re-introduce it via AppendRecord, same as VFP.)
+            bool writeEof = false;
 
             // ---- commit phase: rewrite .dbf data region, then the .fpt ----------------------
             long writeOffset = _headerLength;
