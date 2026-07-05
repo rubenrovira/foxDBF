@@ -85,6 +85,82 @@ public sealed partial class VfpInterpreter
         return writer;
     }
 
+    // ── Batch 4: DEFERRED direct-append read-view refresh ─────────────────────────────────────────────
+    // Full .dbf paths whose fast-path INSERT appends have NOT yet been reflected in the open read views. A
+    // direct append lands the row through the cached writer (its live RecordCount grows) but a work area's
+    // DbfTable read view has a record count FIXED at open, so the new row is invisible until the area is
+    // reopened. Reopening per row would eat the win, so we DEFER: mark here, then Flush()+reopen lazily at the
+    // next READ (Exec statement boundary for a non-INSERT, RECCOUNT/RECNO/EOF/… via AreaArg, a field read via
+    // ResolveName, or GO/SKIP/SEEK nav). Null until the first fast append — the common no-append path pays a
+    // single null check.
+    private HashSet<string>? _pendingAppendPaths;
+
+    private void MarkAppendPending(string fullPath)
+        => (_pendingAppendPaths ??= new(StringComparer.OrdinalIgnoreCase)).Add(fullPath);
+
+    /// <summary>Flush EVERY deferred direct-append refresh (the statement-boundary sweep in <c>Exec</c> for a
+    /// non-INSERT statement, so a run of fast INSERTs reopens the view ONCE — here — not per row).</summary>
+    private void FlushPendingAppends()
+    {
+        if (_pendingAppendPaths is not { Count: > 0 } pend) return;
+        foreach (var p in new List<string>(pend)) RefreshDirectAppends(p);   // snapshot: RefreshDirectAppends mutates the set.
+    }
+
+    /// <summary>Flush the deferred refresh for the file backing work area <paramref name="area"/> only — used
+    /// by the function/field/nav read choke points that observe one specific area.</summary>
+    private void FlushPendingAppends(int area)
+    {
+        if (_pendingAppendPaths is not { Count: > 0 }) return;
+        if (Session.AreaAt(area)?.Table.SourcePath is { } sp) RefreshDirectAppends(Path.GetFullPath(sp));
+    }
+
+    /// <summary>Persist (<c>Flush</c>) the deferred fast-path appends for <paramref name="path"/> — EVEN WHEN
+    /// the cached writer holds an explicit RLOCK/FLOCK byte-range lock — and drop the pending mark, WITHOUT
+    /// reopening the read view. Called at the head of an INSERT that FALLS BACK to <see cref="VfpSession.Execute"/>
+    /// (FROM ARRAY/MEMVAR, an unknown column, RI, candidate, a read-only session): that route re-enters
+    /// <see cref="VfpSession.OpenWritableTarget"/>, which opens a SECOND writer that reads the on-disk record
+    /// count. A prior fast append buffered a row in the cached writer WITHOUT a per-row <c>Flush</c> (its
+    /// on-disk count lags), and <see cref="InvalidateCachedWriter"/> PINS (does not drop) that writer while it
+    /// holds a lock (finding 5.13) — so the second writer would read a STALE count and append OVER the
+    /// un-persisted row (record-count divergence / row clobbering). Flushing first makes the on-disk count
+    /// correct before the foreign writer opens; the foreign write's own reopen then refreshes the read view, so
+    /// this deliberately does NOT reopen here (and, unlike <see cref="InvalidateCachedWriter"/>, does NOT
+    /// dispose the writer — the held lock must outlive the flush). Mirrors the <c>ReopenFileAreas</c>
+    /// preamble. No-op when the path is not pending.</summary>
+    private void PersistPendingAppends(string? path)
+    {
+        if (path is null || _pendingAppendPaths is not { Count: > 0 }) return;
+        string full = Path.GetFullPath(path);
+        if (_pendingAppendPaths.Remove(full) && _cachedWriters.TryGetValue(full, out var w))
+        {
+            try { w.Flush(); } catch { /* best-effort — a flush failure surfaces on the next real write */ }
+        }
+    }
+
+    /// <summary>Make the deferred fast-path appends on <paramref name="fullPath"/> visible: persist them (the
+    /// cached writer buffered the rows without a per-row Flush so the <c>.dbf</c> stream + the incremental
+    /// <c>.cdx</c> accelerator stayed hot across the run), then reopen the read view of every area riding the
+    /// file so the new rows appear (DbfTable.RecordCount is fixed at open). Mirrors the OLD Session.Execute →
+    /// ReopenArea round-trip's observable state: the handle is refreshed and the current-record cache dropped,
+    /// while the record pointer + ordered-sequence caches are PRESERVED (the old plain-INSERT route never
+    /// touched interpreter <c>_meta</c>). Idempotent; a no-op when the path is not pending.</summary>
+    private void RefreshDirectAppends(string fullPath)
+    {
+        if (_pendingAppendPaths is null || !_pendingAppendPaths.Remove(fullPath)) return;
+        if (_cachedWriters.TryGetValue(fullPath, out var w))
+        {
+            try { w.Flush(); } catch { /* best-effort — a flush failure surfaces on the next real write */ }
+        }
+        var areas = new List<int>();
+        foreach (var a in Session.OpenAreas)
+            if (SamePath(a.Table.SourcePath, fullPath)) areas.Add(a.Area);
+        foreach (var a in areas)
+        {
+            Session.ReopenAreaTable(a);
+            if (_meta.TryGetValue(a, out var mm)) { mm.Cached = null; mm.CachedRec = -1; }
+        }
+    }
+
     /// <summary>Dispose + drop the cached writer for <paramref name="path"/> (if any). MUST run before any
     /// out-of-band rewrite/truncate of the file (whole-file <see cref="RestoreSnapshot"/>, PACK, an
     /// INDEX/REINDEX exclusive re-open) and after a foreign writer (SQL DML append) changed the record count

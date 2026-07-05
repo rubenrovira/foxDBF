@@ -15,6 +15,7 @@ internal enum VfpInsertProfileBucket
     BufferingRiChecks,
     MemoryStoreAccess,
     SqlDmlFallback,
+    DirectAppend,
 }
 
 internal sealed class VfpInsertProfile

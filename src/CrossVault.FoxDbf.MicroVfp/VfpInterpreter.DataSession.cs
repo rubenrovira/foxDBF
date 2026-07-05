@@ -100,6 +100,9 @@ public sealed partial class VfpInterpreter
     {
         int cur = Session.CurrentDataSessionId;
         if (id == cur) return;
+        // Batch 4: settle the OUTGOING session's deferred fast-append refreshes while its cached writers +
+        // work areas are still the live ones (the pending-paths set is not part of the per-session bundle).
+        if (_pendingAppendPaths is { Count: > 0 }) FlushPendingAppends();
         SaveActiveInterpState(cur);        // stash the outgoing session's scalars (maps are shared references).
         Session.SwitchDataSession(id);     // swap the work-area bundle + the session's EvaluationContext.
         LoadActiveInterpState(id);         // re-point the live runtime fields at the target session's state.

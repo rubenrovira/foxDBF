@@ -378,6 +378,17 @@ public sealed partial class VfpInterpreter
     /// always reopened, so a following SEEK / non-controlling-tag read still sees the maintained on-disk cdx.</summary>
     private void ReopenFileAreas(string path, IReadOnlyList<string>? replacedFields)
     {
+        // Batch 4: a full reopen SUPERSEDES a deferred fast-append refresh for this file. Persist any pending
+        // appends first (the cached writer buffered them) and drop the mark, so the reopen below sees the new
+        // rows and a later lazy refresh does not reopen redundantly (or, worse, read a stale count).
+        if (_pendingAppendPaths is { Count: > 0 })
+        {
+            string full = Path.GetFullPath(path);
+            if (_pendingAppendPaths.Remove(full) && _cachedWriters.TryGetValue(full, out var pw))
+            {
+                try { pw.Flush(); } catch { /* best-effort */ }
+            }
+        }
         var areas = new List<int>();
         foreach (var w in Session.OpenAreas)
             if (SamePath(w.Table.SourcePath, path)) areas.Add(w.Area);

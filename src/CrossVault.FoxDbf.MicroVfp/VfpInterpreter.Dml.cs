@@ -29,7 +29,7 @@ public sealed partial class VfpInterpreter
         // Gated on _anyBuffering so the default write-through INSERT path (and every Buffering=1 test) pays
         // only a bool check. Skipped while replaying at commit.
         if (_anyBuffering && !_inBufferCommit
-            && ((ins.Parsed as InsertStatement) ?? (SafeParseSql(ins.Sql) as InsertStatement)) is { } bufStmt
+            && ResolveInsertStatement(ins) is { } bufStmt
             && Session.FindAreaByAlias(bufStmt.Table) is { } bufWa
             && _meta.TryGetValue(bufWa.Area, out var bufMeta) && bufMeta.Buffering > 1)
         {
@@ -40,14 +40,42 @@ public sealed partial class VfpInterpreter
         VfpInsertProfile.Stop(VfpInsertProfileBucket.BufferingRiChecks, checkStart);
 
         long targetStart = VfpInsertProfile.Start();
-        string? table = (ins.Parsed as InsertStatement)?.Table
-                     ?? (SafeParseSql(ins.Sql) as InsertStatement)?.Table;
+        var parsed = ResolveInsertStatement(ins);   // reuse InsertStmt.Parsed; NEVER re-parse per row.
+        string? table = parsed?.Table;
+
+        // ── DIRECT-APPEND FAST PATH (Batch 4) ──────────────────────────────────────────────────────────
+        // A PLAIN autocommit INSERT … VALUES into an OPEN, unbuffered, non-candidate, no-RI-insert-trigger
+        // table appends straight through the interpreter's PERSISTENT cached writer — no per-row SQL re-parse
+        // (the parsed statement is reused) and no per-row work-area close+reopen (the old Session.Execute →
+        // OpenWritableTarget round-trip, measured at ~8–11 ms/row, IS entirely that open+reopen). The read-view
+        // refresh is DEFERRED and flushed lazily on the next read (RECCOUNT/GO/SEEK/SCAN/field), so a run of
+        // appends reopens ONCE, not per row. ANY anomaly (no open area, buffered, candidate, bound RI insert
+        // trigger, COW redirect, unknown column / count mismatch, a VALUES-eval error) FALLS THROUGH to the old
+        // route below, so error text/numbers, the RI enforcement and the COW isolation all stay byte-identical.
+        if (parsed is { SourceKind: InsertSourceKind.Values }
+            && table is not null
+            && Session.TxBeginWritePath is null
+            && TryDirectAppendInsert(parsed))
+        {
+            VfpInsertProfile.Stop(VfpInsertProfileBucket.InsertTargetColumnResolution, targetStart);
+            return;
+        }
 
         // A write-through INSERT appends through the SQL DML writer (OpenWritableTarget), NOT the cached
         // interpreter writer — that foreign append bumps the on-disk record count under any writer this
         // interpreter has cached on the same table, so drop it here (a stale cached _recordCount would
         // otherwise reject a later REPLACE of the appended row). Cheap; INSERT is not the hot gate path.
-        if (table is not null) InvalidateCachedWriter(Session.FindAreaByAlias(table)?.Table.SourcePath);
+        if (table is not null)
+        {
+            var targetPath = Session.FindAreaByAlias(table)?.Table.SourcePath;
+            // Batch 4: this INSERT is about to fall back to Session.Execute → OpenWritableTarget, a SECOND
+            // writer that reads the on-disk record count. Persist any DEFERRED fast appends on this file FIRST —
+            // unconditionally, even under a held RLOCK/FLOCK — so the foreign writer never reads a stale count
+            // and clobbers an un-persisted fast-appended row (InvalidateCachedWriter below PINS the lock-held
+            // writer and would leave the row un-flushed; the foreign write's own reopen refreshes the view).
+            PersistPendingAppends(targetPath);
+            InvalidateCachedWriter(targetPath);
+        }
 
         // CANDIDATE enforcement: if the target table has a tag created CANDIDATE, an INSERT that duplicates
         // one of its keys must RAISE (VFP). The row is written (funnelling the incremental maintenance),
@@ -124,6 +152,93 @@ public sealed partial class VfpInterpreter
         // the inserted row back here so VFP's "blocked INSERT" is matched and no orphan child survives.
         if (!ok && snap is not null) RestoreSnapshot(snap);
         if (openedHere && Session.AreaAt(area) is not null) { Session.CloseArea(area); _meta.Remove(area); }
+    }
+
+    /// <summary>The parsed <see cref="InsertStatement"/> for <paramref name="ins"/>, reusing the parse
+    /// captured at PRG-parse time (<see cref="InsertStmt.Parsed"/>) and, only when that is null, a lazy
+    /// once-parsed backfill cached on the node (<see cref="InsertStmt.ParsedCache"/>). NEVER re-parses the SQL
+    /// text per row — the whole point of Batch 4 (the AST node is reused across executions of the same source,
+    /// so a single backfill amortizes). Returns null when the SQL is not a well-formed INSERT.</summary>
+    private static InsertStatement? ResolveInsertStatement(InsertStmt ins)
+    {
+        if (ins.Parsed is InsertStatement p) return p;
+        if (ins.ParsedCache is InsertStatement c) return c;
+        var parsed = SafeParseSql(ins.Sql);
+        ins.ParsedCache = parsed;                       // backfill once (harmless when it stays a non-INSERT).
+        return parsed as InsertStatement;
+    }
+
+    /// <summary>
+    /// The Batch-4 DIRECT-APPEND fast path for a plain autocommit <c>INSERT … VALUES</c>: append the row
+    /// straight through the interpreter's persistent cached <see cref="DbfWriter"/> (the 5.5 write hot-path
+    /// handle — its incremental <c>.cdx</c> maintenance keeps the structural index current) and DEFER the
+    /// read-view refresh, instead of the per-row Session.Execute → <c>OpenWritableTarget</c> open+reopen
+    /// round-trip. Returns <see langword="true"/> when it handled the insert; <see langword="false"/> to FALL
+    /// BACK to the old route (so error numbers / RI / candidate / COW / buffering semantics are unchanged).
+    /// <para>
+    /// Falls back (returns false, appends nothing) when: the target is not open in a work area (the slow path
+    /// auto-opens it) or is read-only; the area is buffered (mode &gt; 1 → <see cref="BufferAppend"/>); the
+    /// table carries a CANDIDATE tag (needs a post-append duplicate re-check); RI enforcement is ON (the ADO.NET
+    /// EnforceRules=on model, which reads the row back through external handles that bypass the lazy refresh —
+    /// and which fires the bound insert trigger ON the new row); or a STRUCTURAL anomaly (column/value count
+    /// mismatch, an unknown column) that must surface EXACTLY as the ADO.NET/slow path raises it (err 12 etc.).
+    /// A COW (ADO.NET-transaction) write redirect is excluded by the caller.
+    /// </para>
+    /// </summary>
+    private bool TryDirectAppendInsert(InsertStatement st)
+    {
+        // A READ-ONLY session (VfpSession.ReadOnly — the connection-wide ReadOnly=true) rejects ALL DML at
+        // OpenWritableTarget (it throws). The fast path bypasses that seam entirely, so a table opened WRITABLE
+        // before ReadOnly was toggled on (wa.NoUpdate is still false) would otherwise be appended straight
+        // through the cached writer — a real write into a read-only session. Refuse here so every read-only
+        // INSERT takes the old Session.Execute route, whose throw is swallowed (no row lands), byte-identically.
+        if (Session.ReadOnly) return false;
+        var wa = Session.FindAreaByAlias(st.Table);
+        if (wa is null || wa.NoUpdate) return false;                 // not open / read-only area → slow path.
+        if (wa.Table.SourcePath is not { } sourcePath) return false;
+        if (_meta.TryGetValue(wa.Area, out var m) && m.Buffering > 1) return false;  // buffered → BufferAppend.
+
+        string fullPath = Path.GetFullPath(sourcePath);
+        if (CandidateTagsFor(fullPath) is not null) return false;    // needs post-append dup re-check.
+        // RI-ENFORCED writes (the ADO.NET EnforceRules=on model drives the interpreter with this flag set) read
+        // the appended row back through EXTERNAL handles — a follow-up SQL SELECT / ADO.NET reader that bypasses
+        // the interpreter's lazy refresh — so a DEFERRED append would be invisible to them. Keep the whole
+        // RI-enforced path on the durable per-row route (it already fires per-row DEFAULT/RULE/trigger, so the
+        // INSERT open was never its bottleneck). This also subsumes the bound-insert-trigger enforcement.
+        if (EnforceReferentialIntegrity) return false;
+
+        // STRUCTURAL pre-validation against the read view's columns (identical geometry to the writer's): an
+        // unknown column / count mismatch must raise through the ADO.NET path verbatim, so refuse here and let
+        // the old route handle it — never half-append a bad row via the fast path.
+        var columns = wa.Table.Columns;
+        if (st.Columns is { } cols)
+        {
+            if (cols.Count != st.Values.Count) return false;
+            foreach (var c in cols) if (ColumnIndex(wa.Table, c) < 0) return false;
+        }
+        else if (st.Values.Count != columns.Count) return false;
+
+        long start = VfpInsertProfile.Start();
+        try
+        {
+            // Append through the SAME Sql VALUES-eval + column-map the ADO.NET DmlExecutor uses (byte-identical
+            // values + incremental .cdx maintenance via the cached writer). NO per-row Flush(): the writer
+            // buffers the row (its live RecordCount grows) and keeps the .cdx accelerator HOT across the run;
+            // the deferred refresh Flush()es once, before it reopens the view.
+            var writer = GetOrOpenCachedWriter(sourcePath);
+            DmlExecutor.AppendInsertValuesRow(Session, writer, st);
+            MarkAppendPending(fullPath);
+        }
+        catch
+        {
+            // The plain no-RI INSERT route is best-effort (it SWALLOWS — INSERT is not a target path there).
+            // Match that: drop the possibly-half-touched cached writer so no inconsistent handle survives, mark
+            // the view stale so the next read reopens to whatever actually landed, and swallow.
+            InvalidateCachedWriter(sourcePath);
+            MarkAppendPending(fullPath);
+        }
+        finally { VfpInsertProfile.Stop(VfpInsertProfileBucket.DirectAppend, start); }
+        return true;
     }
 
     // ─────────────────────────── REPLACE / DELETE / RECALL / SUM ───────────────────────────

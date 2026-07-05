@@ -296,8 +296,16 @@ internal sealed record ReplaceStmt(
 internal sealed record DeleteStmt(string? Scope, PrgExpr? For, NameRef? In) : PrgStatement;
 internal sealed record RecallStmt(string? Scope, PrgExpr? For) : PrgStatement;
 
-/// <summary><c>INSERT INTO …</c>; routed to the existing SQL parser when possible.</summary>
-internal sealed record InsertStmt(string Sql, SqlStatement? Parsed) : PrgStatement;
+/// <summary><c>INSERT INTO …</c>; routed to the existing SQL parser when possible. <see cref="Parsed"/> is
+/// the parse captured at PRG-parse time (non-null for a well-formed INSERT); <see cref="ParsedCache"/> is a
+/// MUTABLE lazy backfill for the rare case <see cref="Parsed"/> is null — the fast path parses ONCE and
+/// caches here so it never re-parses per row (the AST node is reused across executions of the same source).</summary>
+internal sealed record InsertStmt(string Sql, SqlStatement? Parsed) : PrgStatement
+{
+    /// <summary>Lazily-parsed fallback for <see cref="Parsed"/> when the PRG parser could not parse the SQL
+    /// eagerly. Backfilled once by the interpreter (never per row). Mutable by design.</summary>
+    internal SqlStatement? ParsedCache;
+}
 
 internal sealed record SumStmt(
     IReadOnlyList<PrgExpr> Expressions,

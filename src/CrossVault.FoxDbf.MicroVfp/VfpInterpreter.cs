@@ -52,13 +52,17 @@ public sealed partial class VfpInterpreter
     /// Each interpreter call spans MANY native frames (tree-walk → compiled-expression invoke →
     /// HostInvoke → back to CallProc), so one logical level costs far more stack than the tiny margin
     /// <see cref="System.Runtime.CompilerServices.RuntimeHelpers.EnsureSufficientExecutionStack"/>
-    /// guarantees — measured: the native stack overflows at ~110 nested levels in a Debug build BEFORE
-    /// that probe trips. So the numeric cap (not the probe) is the real backstop and must sit safely
-    /// below that native limit. 64 is well under ~110 yet far above any real VFP nesting (RI cascades
-    /// and SP chains in the corpus are single-digit deep).
-    /// ponytail: 64 is a fixed ceiling; raise it if a legitimate corpus case ever nests deeper AND the
-    /// native stack can take it (else run the interpreter on a large-stack thread).</summary>
-    private const int MaxCallDepth = 64;
+    /// guarantees — so the numeric cap (not the probe) is the real backstop and must sit safely below the
+    /// native limit. RE-MEASURED (Batch 4): in a Debug build the native stack overflows at ≈64 nested UDF
+    /// levels — MUCH tighter than an earlier ~110 estimate (that figure did not survive later per-frame
+    /// growth: every partial-class addition that widens the hot Exec/ExecBlock/HostInvoke frames lowers the
+    /// cliff, and it now sits right around the old 64 cap). 48 restores a real margin under that ≈64 cliff
+    /// while still dwarfing any legitimate VFP nesting (RI cascades and SP chains in the corpus are
+    /// single-digit deep). No test pins a specific SUCCESSFUL depth — only that unbounded recursion throws a
+    /// catchable <see cref="MaxCallDepthErrorNumber"/> — so a lower cap is a pure robustness win.
+    /// ponytail: 48 is a fixed ceiling; the only sound way to raise it is to move deep interpretation onto a
+    /// large-stack thread (a bigger cap alone just re-arms the StackOverflow it exists to prevent).</summary>
+    private const int MaxCallDepth = 48;
 
     /// <summary>The stable VFP-style error number microVFP raises when <see cref="MaxCallDepth"/> is hit
     /// (project-review 5.3). VFP itself faults UNCATCHABLY on unbounded recursion (verified against the
@@ -474,6 +478,10 @@ public sealed partial class VfpInterpreter
     private void Exec(PrgStatement s)
     {
         long dispatchStart = VfpInsertProfile.Start();
+        // Batch 4: flush any DEFERRED direct-append read-view refresh before the next NON-INSERT statement, so
+        // a run of fast INSERTs reopens the view ONCE (here, at the first following statement) rather than per
+        // row. INSERT itself is exempt — it appends through the cached writer and never reads the stale view.
+        if (_pendingAppendPaths is { Count: > 0 } && s is not InsertStmt) FlushPendingAppends();
         switch (s)
         {
             case Assignment a: AssignTo(a.Target, Eval(a.Value)); break;
@@ -1090,12 +1098,23 @@ public sealed partial class VfpInterpreter
             if (head.Equals("m", StringComparison.OrdinalIgnoreCase))
                 return Memory.Get(rest).ToClr();
             var wa = Session.FindAreaByAlias(head);
-            if (wa is not null) return ReadField(wa, rest);
+            if (wa is not null)
+            {
+                // Batch 4: an alias.field read observes this area — flush any deferred fast-append refresh
+                // first (and re-fetch, since the reopen replaces the WorkArea). No-op when nothing pending.
+                if (_pendingAppendPaths is { Count: > 0 }) { FlushPendingAppends(wa.Area); wa = Session.FindAreaByAlias(head); }
+                return wa is not null ? ReadField(wa, rest) : null;
+            }
             return null;                                  // object property / DBC!table.field → undefined.
         }
 
         var cur = Session.AreaAt(Session.CurrentArea);
-        if (cur is not null && ColumnIndex(cur.Table, name) >= 0) return ReadField(cur, name);
+        if (cur is not null && ColumnIndex(cur.Table, name) >= 0)
+        {
+            // Batch 4: a bare field read of the current area — flush any deferred fast-append refresh first.
+            if (_pendingAppendPaths is { Count: > 0 }) { FlushPendingAppends(cur.Area); cur = Session.AreaAt(Session.CurrentArea); }
+            return cur is not null ? ReadField(cur, name) : null;
+        }
         // A bare ARRAY name in scalar context = element (1,1)/(1), per VFP.
         if (Memory.FindArray(name) is { } arr) return arr.First.ToClr();
         if (Memory.IsDefined(name)) return Memory.Get(name).ToClr();
@@ -1225,7 +1244,13 @@ public sealed partial class VfpInterpreter
     // ─────────────────────────── helpers ───────────────────────────
 
     private VfpSession.WorkArea? AreaArg(VfpValue[] a, int i)
-        => a.Length > i ? Session.AreaAt(AreaNumber(a[i])) : Session.AreaAt(Session.CurrentArea);
+    {
+        int area = a.Length > i ? AreaNumber(a[i]) : Session.CurrentArea;
+        // Batch 4: a record-state function (RECCOUNT/RECNO/EOF/BOF/FOUND/DELETED/DBF/…) observes this area —
+        // flush any deferred fast-append refresh so it sees the just-appended rows (no-op when nothing pending).
+        if (_pendingAppendPaths is { Count: > 0 }) FlushPendingAppends(area);
+        return Session.AreaAt(area);
+    }
 
     private AreaMeta? MetaArg(VfpValue[] a, int i)
     {

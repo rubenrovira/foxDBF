@@ -52,9 +52,24 @@ internal sealed class DmlExecutor
         if (st.SourceKind == InsertSourceKind.Array) return InsertFromArray(st);
         if (st.SourceKind == InsertSourceKind.Memvar) return InsertFromMemvar(st);
 
-        var ctx = _session.SqlContext();
         using var target = _session.OpenWritableTarget(st.Table);
-        var writer = target.Writer;
+        AppendInsertValuesRow(_session, target.Writer, st);
+        return SqlResult.Dml(1);
+    }
+
+    /// <summary>
+    /// Evaluate an <c>INSERT … VALUES</c> row and append it through <paramref name="writer"/> — the shared
+    /// core of the single-row VALUES insert, extracted so the microVFP interpreter's direct-append fast path
+    /// (Batch 4) appends through its OWN cached writer with byte-identical value semantics AND identical error
+    /// numbers/text (err 12 for an unknown column, the column/value count mismatch) as this ADO.NET path. The
+    /// caller owns the writer's lifetime (this neither opens nor disposes it); the ADO.NET path passes the
+    /// <see cref="VfpSession.OpenWritableTarget"/> writer, the interpreter passes its persistent cached writer.
+    /// Values are evaluated against <see cref="ConstantRow.Instance"/> (a bare field reference throws — VALUES
+    /// are constant) through <paramref name="session"/>'s SQL evaluation context, exactly as before.
+    /// </summary>
+    internal static void AppendInsertValuesRow(VfpSession session, DbfWriter writer, InsertStatement st)
+    {
+        var ctx = session.SqlContext();
         var columns = writer.Schema.Columns;
 
         // Evaluate every VALUES expression to a CONSTANT: ConstantRow has no row, so a bare field
@@ -93,7 +108,6 @@ internal sealed class DmlExecutor
                     $"INSERT value count {values.Length} does not match the table's {columns.Count} column(s) (no column list given).");
             writer.AppendRecord(values);
         }
-        return SqlResult.Dml(1);
     }
 
     // ---- INSERT ... FROM ARRAY | FROM MEMVAR ----------------------------------------------

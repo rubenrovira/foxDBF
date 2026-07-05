@@ -691,12 +691,16 @@ public sealed partial class VfpInterpreter
     // NON-move calls (lazy Meta creation, a mid-SKIP BOF snap, the reposition itself) so those never
     // re-fire the hook. RepositionChildren early-returns when the area has no relations, so the ~2100
     // relation-free tests pay only a dictionary lookup. ─────────────────────────────────────────────
-    private void GoTop(int area) { MaybeAutoCommitRow(area); GoTopCore(area); RepositionChildren(area); }
-    private void GoBottom(int area) { MaybeAutoCommitRow(area); GoBottomCore(area); RepositionChildren(area); }
-    private void GoRecord(int area, int rec) { MaybeAutoCommitRow(area); GoRecordCore(area, rec); RepositionChildren(area); }
+    // Batch 4: every USER nav move first flushes any DEFERRED fast-append refresh for the area, so GO
+    // BOTTOM/TOP/n, SKIP and SEEK see the just-appended rows (and a loop-internal SKIP after a scan-body
+    // INSERT into the scanned table stays correct). No-op when nothing is pending.
+    private void GoTop(int area) { if (_pendingAppendPaths is { Count: > 0 }) FlushPendingAppends(area); MaybeAutoCommitRow(area); GoTopCore(area); RepositionChildren(area); }
+    private void GoBottom(int area) { if (_pendingAppendPaths is { Count: > 0 }) FlushPendingAppends(area); MaybeAutoCommitRow(area); GoBottomCore(area); RepositionChildren(area); }
+    private void GoRecord(int area, int rec) { if (_pendingAppendPaths is { Count: > 0 }) FlushPendingAppends(area); MaybeAutoCommitRow(area); GoRecordCore(area, rec); RepositionChildren(area); }
 
     private void Skip(int area, int count)
     {
+        if (_pendingAppendPaths is { Count: > 0 }) FlushPendingAppends(area);
         MaybeAutoCommitRow(area);
         SkipCore(area, count);
         ApplyOneToManyBound(area);   // SET SKIP: clamp a one-to-many child to its parent-key group.
@@ -705,6 +709,7 @@ public sealed partial class VfpInterpreter
 
     private bool DoSeek(VfpValue key, int area, string? tag)
     {
+        if (_pendingAppendPaths is { Count: > 0 }) FlushPendingAppends(area);
         MaybeAutoCommitRow(area);
         bool ok = DoSeekCore(key, area, tag);
         RepositionChildren(area);
