@@ -192,7 +192,9 @@ public sealed partial class DbfWriter
         string bakDbf = path + ".bak_" + token;
         string bakFpt = fptPath + ".bak_" + token;
 
+        bool hadStructuralCdx = _hasStructuralCdx;
         bool handlesClosed = false;
+        bool dbfCommitted = false;
         bool fptMoved = false;
         bool dbfBacked = false, fptBacked = false;
         try
@@ -251,6 +253,7 @@ public sealed partial class DbfWriter
 
                 FaultBeforeDbfCommit?.Invoke();
                 File.Move(tmpDbf, path); // last committing step → the .dbf is authoritative.
+                dbfCommitted = true;
             }
             catch
             {
@@ -290,7 +293,14 @@ public sealed partial class DbfWriter
             // restored) original. If we faulted BEFORE closing, the original handles are still live
             // and valid — leave the writer exactly as it was.
             if (handlesClosed)
+            {
                 ApplyState(OpenComponentsFor(path, reopenOptions));
+                if (dbfCommitted && hadStructuralCdx)
+                {
+                    _hasStructuralCdx = true;
+                    InvalidateStructuralCdx();
+                }
+            }
         }
     }
 

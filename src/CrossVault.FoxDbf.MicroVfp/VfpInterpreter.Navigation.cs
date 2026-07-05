@@ -936,6 +936,21 @@ public sealed partial class VfpInterpreter
         if (recno is uint r && r >= 1 && r <= (uint)wa.Table.RecordCount)
         {
             int hit = (int)r;
+            bool cdxSeekNeedsOrderedLanding = src.CdxTag is not null && (src.CdxTag.Descending != m.OrderReversed);
+            if (!relationSeek && cdxSeekNeedsOrderedLanding)
+            {
+                // CdxTag.Seek walks stored ascending bytes. For a descending controlling order it is only an
+                // existence probe; duplicate-key positioning must land on the first matching visible entry in
+                // that order.
+                int vis = FirstVisibleSeekMatch(src, key, wa);
+                if (vis >= 1)
+                    hit = vis;
+                else
+                {
+                    m.RecNo = wa.Table.RecordCount + 1; m.Eof = true; m.Bof = false; m.Found = false; m.Cached = null;
+                    return false;
+                }
+            }
             // A direct index hit is NOT exempt from the central Visible() gate (SET DELETED / SET KEY /
             // SET FILTER): when the hit record is hidden VFP does not stop on it — the SEEK command / SEEK()
             // advance through the remaining index entries that STILL match the seek key to the first visible
@@ -985,7 +1000,11 @@ public sealed partial class VfpInterpreter
     /// pointer at EOF with FOUND()=.F.). Works over a CDX tag OR a standalone <c>.idx</c> source.</summary>
     private int FirstVisibleSeekMatch(OrderSource src, VfpValue key, VfpSession.WorkArea wa)
     {
-        foreach (var (keyBytes, recno) in OrderedEntries(src))
+        var entries = OrderedEntries(src);
+        if (_meta.TryGetValue(wa.Area, out var m) && m.OrderReversed)
+            entries = entries.Reverse();
+
+        foreach (var (keyBytes, recno) in entries)
         {
             if (recno < 1 || recno > wa.Table.RecordCount) continue;
             if (!SeekEntryMatches(keyBytes, key, src)) continue;

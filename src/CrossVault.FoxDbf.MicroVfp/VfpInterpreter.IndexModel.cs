@@ -473,6 +473,7 @@ public sealed partial class VfpInterpreter
     private void BuildTagOnDisk(string path, Action<DbfWriter> action)
     {
         string full = Path.GetFullPath(path);
+        SnapshotForTxn(full);
         // 5.5: drop any cached writer first — this opens an EXCLUSIVE writer (FileShare.None), which a
         // lingering Shared cached-writer handle would deny, and the index rewrite invalidates its state.
         // 5.13: force-close even a lock-pinned writer (else the EXCLUSIVE open throws) and re-take the lock

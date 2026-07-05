@@ -518,7 +518,6 @@ public sealed partial class DbfWriter : IDisposable
         // (D4APPEND.C); we mirror that, including the 2 GB guard against the fresh value.
         long appendPos = VfpLock.AppendLockPosition(_usesStructuralScheme);
         int resultIndex = 0;
-        byte[]? appendedRecord = null;   // captured for incremental index maintenance (after the lock)
         WithLock(appendPos, 1, () =>
         {
             int diskCount = (int)ReadOnDiskRecordCount();
@@ -553,7 +552,6 @@ public sealed partial class DbfWriter : IDisposable
 
             byte[] record = RecordEncoder.Encode(_schema, positional, deleted: false);
             PatchMemoPointers(record, positional);
-            appendedRecord = record;   // the exact bytes just written — reused for index maintenance
 
             // Write the row (overwriting any pre-existing EOF byte), the fresh EOF, and pin the
             // exact file length so no stale trailing bytes survive.
@@ -575,13 +573,11 @@ public sealed partial class DbfWriter : IDisposable
 
             _recordCount = newCount;
             resultIndex = newCount - 1;
-        });
 
-        // §5.1 incremental maintenance: the row is durably written above; now insert its key into every open
-        // structural tag. Runs OUTSIDE the append lock (the row is already committed); a failure here sets
-        // ReindexNeeded + rethrows so the tag can never be left silently stale.
-        if (appendedRecord is not null)
-            MaintainIndexesAfterAppend(resultIndex + 1, new DbfRecord(_schema, appendedRecord));
+            // §5.1 incremental maintenance: keep the append byte-range lock through the structural-CDX
+            // read/modify/write so a second Shared writer cannot interleave page edits.
+            MaintainIndexesAfterAppend(newCount, new DbfRecord(_schema, record));
+        });
 
         return resultIndex;
     }
@@ -608,7 +604,8 @@ public sealed partial class DbfWriter : IDisposable
         byte[]? oldRecordBytes = null;
         byte[]? writtenRecord = null;
 
-        // §D3: hold the RECORD lock for this row (1-based recNo) across the rewrite.
+        // §D3: hold the RECORD lock for this row (1-based recNo) across the rewrite and any structural-CDX
+        // maintenance produced by the key change.
         long recPos = VfpLock.RecordLockPosition(index + 1, _usesStructuralScheme, _headerLength, _recordLength);
         WithLock(recPos, 1, () =>
         {
@@ -671,13 +668,12 @@ public sealed partial class DbfWriter : IDisposable
 
             _stream.Flush();
             _fpt?.Flush();
-        });
 
-        // §5.1 incremental maintenance: the row is durably written; now update every open structural tag
-        // (delete the old key, insert the new one where they differ). A failure sets ReindexNeeded + rethrows.
-        if (maintain && oldRecordBytes is not null && writtenRecord is not null)
-            MaintainIndexesAfterUpdate(index + 1,
-                new DbfRecord(_schema, oldRecordBytes), new DbfRecord(_schema, writtenRecord));
+            // §5.1 incremental maintenance: keep the row lock through the structural-CDX page edits.
+            if (maintain && oldRecordBytes is not null && writtenRecord is not null)
+                MaintainIndexesAfterUpdate(index + 1,
+                    new DbfRecord(_schema, oldRecordBytes), new DbfRecord(_schema, writtenRecord));
+        });
     }
 
     /// <summary>Copy a single column's <c>_NullFlags</c> bit from <paramref name="from"/> to

@@ -72,15 +72,45 @@ w.Recall(recNo1);     // un-flags it
 w.Flush();            // ensure everything is on disk
 ```
 
-## Reclaim space: `PACK`
+## Reclaim space: `PACK` / `ZAP`
 
 ```csharp
-w.Pack();   // physically removes all flagged records, rebuilds the memo file, keeps indexes valid
+using CrossVault.FoxDbf;
+using CrossVault.FoxDbf.Write;
+
+using var w = DbfWriter.Open(
+    "people.dbf",
+    new DbfOptions { LockMode = LockMode.Exclusive });
+
+w.Pack();   // physically removes all flagged records and rebuilds the memo file
+// w.Zap(); // removes all records while keeping the table structure
 ```
 
-`PACK` is a real structural rewrite (like Visual FoxPro's own `PACK`) — record numbers of surviving
-records can shift. Only call it when you actually want that; most workloads just leave deleted
-records flagged and `PACK` occasionally (or never), exactly like a real VFP application would.
+If you create the table in the same session, create the writer with exclusive locking before
+compaction:
+
+```csharp
+using var w = DbfWriter.Create("scratch.dbf", new[]
+{
+    new DbfColumnDef("NAME", 'C', 30),
+}, new DbfCreateOptions
+{
+    Overwrite = true,
+    LockMode = LockMode.Exclusive,
+});
+
+w.Zap();
+```
+
+`PACK` and `ZAP` are real structural rewrites (like Visual FoxPro's own commands) and require
+`LockMode.Exclusive`. A default/shared writer refuses before touching the file and throws
+`DbfWriteException` with VFP error number `110` ("File must be opened exclusively.").
+
+With `PACK`, record numbers of surviving records can shift. `PACK`/`ZAP` also invalidate the
+structural `.cdx` sidecar because record-number keys can become stale; rebuild indexes afterward
+with VFP `REINDEX`, `DbfWriter.Reindex`, or tag creation as appropriate. Most workloads just leave
+deleted records flagged and `PACK` occasionally (or never), exactly like a real VFP application
+would.
 
 ## Alter an existing table's structure
 

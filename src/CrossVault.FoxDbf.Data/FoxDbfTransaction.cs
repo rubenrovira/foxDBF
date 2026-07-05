@@ -23,9 +23,9 @@ namespace CrossVault.FoxDbf.Data;
 /// <see cref="Commit"/> verifies each touched table's live change-token still matches what was recorded
 /// at copy time; a mismatch means a FOREIGN writer mutated the live file, so the commit FAILS with a
 /// <see cref="FoxDbfTransactionConflictException"/> (no lost update) and the transaction stays
-/// rollback-able. Otherwise it closes every open handle and atomically swaps each private copy over its
-/// live file. <see cref="Rollback"/> (and dispose-without-commit) simply DISCARDS the private copies —
-/// the live files were never touched.
+/// rollback-able. Otherwise it closes every open handle and promotes each private copy over its live file
+/// under commit-scoped backups. <see cref="Rollback"/> (and dispose-without-commit) simply DISCARDS the
+/// private copies — the live files were never touched.
 /// </para>
 /// <para>
 /// DDL (CREATE / ALTER / DROP) cannot be redirected to a private copy without breaking its in-transaction
@@ -239,12 +239,11 @@ public sealed class FoxDbfTransaction : DbTransaction
                     "change. The transaction was not committed and can be rolled back.");
         }
 
-        _completed = true;
-
         // No conflict — persist. Close every open handle first so the live files are unlocked for the
-        // swap, then atomically replace each live file with its private copy. DDL changes are already on
-        // the live files, so commit just drops their snapshots. Cleanup runs in a finally so the
-        // connection always returns to autocommit and no temp dir leaks even on an I/O hiccup.
+        // swap, then promote each live file under commit-scoped backups. DDL changes are already on
+        // the live files, so commit just drops their snapshots. A promotion fault restores every file
+        // this commit already touched and leaves this transaction rollback-able.
+        var promotion = new PromotionBatch();
         try
         {
             if (_copies.Count > 0)
@@ -257,15 +256,20 @@ public sealed class FoxDbfTransaction : DbTransaction
                     // Commit keeps the live change"). Swapping the pre-DDL DML copy back in would resurrect a
                     // DROPped table or revert an ALTER's schema, so the copy is just discarded afterwards.
                     if (_ddlSnapshots.ContainsKey(wc.LiveDbfPath)) continue;
-                    wc.SwapIntoLive();
+                    wc.SwapIntoLive(promotion);
                 }
             }
-        }
-        finally
-        {
+
+            _completed = true;
+            promotion.DiscardBackups();
             DiscardCopies();
             DiscardDdlSnapshots();
             _connection.ClearTransaction(this);
+        }
+        catch
+        {
+            promotion.RollbackBestEffort();
+            throw;
         }
     }
 
@@ -470,10 +474,10 @@ public sealed class FoxDbfTransaction : DbTransaction
             };
         }
 
-        /// <summary>Atomically promote the private copy over the live files: each companion present in the
-        /// copy replaces the live one; each companion the copy no longer has (a sidecar removed during the
-        /// transaction) is deleted from the live location. Callers must close all handles first.</summary>
-        public void SwapIntoLive()
+        /// <summary>Promote the private copy over the live files: each companion present in the copy replaces
+        /// the live one under the caller's backup batch; each companion the copy no longer has is deleted from
+        /// the live location under the same backup batch. Callers must close all handles first.</summary>
+        public void SwapIntoLive(PromotionBatch promotion)
         {
             string? liveDir = Path.GetDirectoryName(LiveDbfPath);
             if (liveDir is null) return;
@@ -490,14 +494,14 @@ public sealed class FoxDbfTransaction : DbTransaction
             {
                 string fileName = Path.GetFileName(copyFile);
                 string liveFile = Path.Combine(liveDir, fileName);
-                PromoteFile(copyFile, liveFile);
+                promotion.PromoteFile(copyFile, liveFile);
                 promoted.Add(fileName);
             }
 
             foreach (string companion in CompanionFiles(LiveDbfPath))
             {
                 if (!promoted.Contains(Path.GetFileName(companion)) && File.Exists(companion))
-                    File.Delete(companion);
+                    promotion.DeleteLiveFile(companion);
             }
         }
 
@@ -515,34 +519,118 @@ public sealed class FoxDbfTransaction : DbTransaction
             };
         }
 
-        /// <summary>Replace the live file with the copy as atomically as the platform allows: an in-place
-        /// <see cref="File.Replace(string, string, string?)"/> when both live on the same volume (atomic),
-        /// falling back to a copy-overwrite when the temp copy is on a different volume (File.Replace /
-        /// File.Move across volumes throw). Either way the live file ends up with the copy's bytes.</summary>
-        private static void PromoteFile(string copyFile, string liveFile)
-        {
-            if (File.Exists(liveFile))
-            {
-                try
-                {
-                    File.Replace(copyFile, liveFile, destinationBackupFileName: null, ignoreMetadataErrors: true);
-                    return;
-                }
-                catch (IOException) { /* cross-volume / replace unsupported — fall back to copy. */ }
-                File.Copy(copyFile, liveFile, overwrite: true);
-            }
-            else
-            {
-                try { File.Move(copyFile, liveFile); return; }
-                catch (IOException) { /* cross-volume — fall back to copy. */ }
-                File.Copy(copyFile, liveFile, overwrite: true);
-            }
-        }
-
         public void Dispose()
         {
             try { if (Directory.Exists(CopyDir)) Directory.Delete(CopyDir, recursive: true); }
             catch { /* best-effort temp cleanup */ }
+        }
+    }
+
+    /// <summary>Commit-scoped file backups for DML copy promotion. Backups are kept until every touched
+    /// table promotes, so a later table's failure can restore earlier tables to their pre-commit bytes.</summary>
+    private sealed class PromotionBatch
+    {
+        private readonly string _token = Guid.NewGuid().ToString("N");
+        private readonly List<PromotionStep> _steps = new();
+
+        public void PromoteFile(string copyFile, string liveFile)
+        {
+            string? liveDir = Path.GetDirectoryName(liveFile);
+            if (liveDir is null) return;
+
+            string tmp = Path.Combine(liveDir, Path.GetFileName(liveFile) + ".tmp_" + _token);
+            var step = new PromotionStep
+            {
+                LiveFile = liveFile,
+                BackupFile = liveFile + ".bak_" + _token,
+                TempFile = tmp,
+                LiveExisted = File.Exists(liveFile),
+            };
+            _steps.Add(step);
+
+            if (step.LiveExisted)
+            {
+                File.Move(liveFile, step.BackupFile);
+                step.BackupStaged = true;
+            }
+
+            File.Copy(copyFile, tmp, overwrite: false);
+            File.Move(tmp, liveFile);
+            step.Published = true;
+        }
+
+        public void DeleteLiveFile(string liveFile)
+        {
+            if (!File.Exists(liveFile)) return;
+
+            var step = new PromotionStep
+            {
+                LiveFile = liveFile,
+                BackupFile = liveFile + ".bak_" + _token,
+                LiveExisted = true,
+            };
+            _steps.Add(step);
+
+            File.Move(liveFile, step.BackupFile);
+            step.BackupStaged = true;
+            step.Published = true;
+        }
+
+        public void RollbackBestEffort()
+        {
+            foreach (var step in _steps.OrderBy(s => RestoreOrder(s.LiveFile)))
+            {
+                try
+                {
+                    if (step.TempFile is { } tmp && File.Exists(tmp))
+                        File.Delete(tmp);
+
+                    if (!step.LiveExisted && step.Published && File.Exists(step.LiveFile))
+                        File.Delete(step.LiveFile);
+
+                    if (step.BackupStaged && File.Exists(step.BackupFile))
+                        File.Move(step.BackupFile, step.LiveFile, overwrite: true);
+                }
+                catch { /* best-effort rollback; leave .bak files for manual recovery. */ }
+            }
+        }
+
+        public void DiscardBackups()
+        {
+            foreach (var step in _steps)
+            {
+                if (step.TempFile is { } tmp)
+                    TryDelete(tmp);
+                TryDelete(step.BackupFile);
+            }
+            _steps.Clear();
+        }
+
+        private static int RestoreOrder(string path)
+        {
+            string ext = Path.GetExtension(path).ToLowerInvariant();
+            return ext switch
+            {
+                ".fpt" or ".dbt" => 0,
+                ".dbf" => 2,
+                _ => 1,
+            };
+        }
+
+        private static void TryDelete(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); }
+            catch { /* best-effort cleanup */ }
+        }
+
+        private sealed class PromotionStep
+        {
+            public required string LiveFile { get; init; }
+            public required string BackupFile { get; init; }
+            public string? TempFile { get; init; }
+            public required bool LiveExisted { get; init; }
+            public bool BackupStaged { get; set; }
+            public bool Published { get; set; }
         }
     }
 

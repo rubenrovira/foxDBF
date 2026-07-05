@@ -140,10 +140,22 @@ public sealed class FoxDbfCommand : DbCommand
 
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
     {
-        var result = BuildResultSet(behavior);
-        var reader = new FoxDbfDataReader(result, _connection!, behavior);
-        _connection!.SetActiveReader(reader);
-        return reader;
+        if (_connection is null || _connection.State != ConnectionState.Open)
+            throw new InvalidOperationException("Connection is not open.");
+
+        _connection.ReserveActiveReaderSlot();
+        try
+        {
+            var result = BuildResultSet(behavior);
+            var reader = new FoxDbfDataReader(result, _connection, behavior);
+            _connection.CommitActiveReaderSlot(reader);
+            return reader;
+        }
+        catch
+        {
+            _connection.SetActiveReader(null);
+            throw;
+        }
     }
 
     /// <summary>Run this command and return its single <see cref="SqlResult"/> WITHOUT wrapping it in a

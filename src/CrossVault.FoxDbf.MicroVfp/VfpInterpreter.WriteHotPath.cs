@@ -142,8 +142,8 @@ public sealed partial class VfpInterpreter
     /// <c>.cdx</c> accelerator stayed hot across the run), then reopen the read view of every area riding the
     /// file so the new rows appear (DbfTable.RecordCount is fixed at open). Mirrors the OLD Session.Execute →
     /// ReopenArea round-trip's observable state: the handle is refreshed and the current-record cache dropped,
-    /// while the record pointer + ordered-sequence caches are PRESERVED (the old plain-INSERT route never
-    /// touched interpreter <c>_meta</c>). Idempotent; a no-op when the path is not pending.</summary>
+    /// while the record pointer is preserved and record/order/key-range caches are dropped so count-changing
+    /// appends rebuild ordered navigation lazily. Idempotent; a no-op when the path is not pending.</summary>
     private void RefreshDirectAppends(string fullPath)
     {
         if (_pendingAppendPaths is null || !_pendingAppendPaths.Remove(fullPath)) return;
@@ -157,7 +157,11 @@ public sealed partial class VfpInterpreter
         foreach (var a in areas)
         {
             Session.ReopenAreaTable(a);
-            if (_meta.TryGetValue(a, out var mm)) { mm.Cached = null; mm.CachedRec = -1; }
+            if (_meta.TryGetValue(a, out var mm))
+            {
+                mm.Cached = null; mm.CachedRec = -1;
+                mm.Ordered = null; mm.OrderedFor = null; mm.OrderPos = -1; mm.KeyVisible = null;
+            }
         }
     }
 

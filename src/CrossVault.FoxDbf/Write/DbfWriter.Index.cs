@@ -27,7 +27,8 @@ public sealed partial class DbfWriter
         // in with a single tag-directory INSERT — the SIBLING tags are neither re-read nor rewritten. Only the
         // new tag needs a table scan (unavoidable). REPLACING an existing name unlinks the old tag first.
         string cdx = ExistingCdxPath();
-        if (File.Exists(cdx) && TryFastAppendTag(cdx, definition, evalContext, includeDeleted))
+        List<CdxTagDefinition>? fastFallbackTags = null;
+        if (File.Exists(cdx) && TryFastAppendTag(cdx, definition, evalContext, includeDeleted, out fastFallbackTags))
         {
             EnsureStructuralCdxAdvertised();
             InvalidateTagComputerCache();
@@ -36,7 +37,7 @@ public sealed partial class DbfWriter
 
         // FALLBACK / FIRST tag: whole-file build (also the byte-exact single-tag golden path). Preserves the
         // corrupt-sidecar guard in ReadExistingTagDefinitions (never rebuild-from-nothing and wipe real tags).
-        var tags = ReadExistingTagDefinitions();
+        var tags = fastFallbackTags ?? ReadExistingTagDefinitions();
         tags.RemoveAll(t => string.Equals(t.Name, definition.Name, StringComparison.OrdinalIgnoreCase));
         tags.Add(definition);
         RebuildStructuralCdx(tags, evalContext, includeDeleted);
@@ -89,7 +90,8 @@ public sealed partial class DbfWriter
 
         // FAST PATH (project-review 5.6): append the new tag's pages + splice its directory entry, leaving
         // sibling tags untouched. Falls back to the whole-file rebuild for a legacy / unreadable sidecar.
-        if (File.Exists(cdxPath) && TryFastAppendTag(cdxPath, definition, evalContext, includeDeleted))
+        List<CdxTagDefinition>? fastFallbackTags = null;
+        if (File.Exists(cdxPath) && TryFastAppendTag(cdxPath, definition, evalContext, includeDeleted, out fastFallbackTags))
         {
             if (structural)
                 EnsureStructuralCdxAdvertised();
@@ -97,7 +99,7 @@ public sealed partial class DbfWriter
             return;
         }
 
-        var tags = ReadTagDefinitionsFrom(cdxPath);
+        var tags = fastFallbackTags ?? ReadTagDefinitionsFrom(cdxPath);
         tags.RemoveAll(t => string.Equals(t.Name, definition.Name, StringComparison.OrdinalIgnoreCase));
         tags.Add(definition);
 
@@ -328,6 +330,10 @@ public sealed partial class DbfWriter
     /// the fast path never materializes (while a whole-file rebuild — REINDEX / the fallback — would throw).</summary>
     internal bool FailMaterializeRowsForTests { get; set; }
 
+    /// <summary>Test seam: when set, the CREATE-TAG fast path throws after a REPLACE unlink but before the new
+    /// directory insert, exercising the whole-file fallback over a partially edited directory.</summary>
+    internal bool FailFastTagDirectoryInsertForTests { get; set; }
+
     /// <summary>Advertise the structural <c>.cdx</c> in the DBF header (byte 28 bit 0) and flip the writer's own
     /// tracking so a later Pack/Zap correctly invalidates it — the shared tail of every structural tag-build
     /// path. No-op when the sidecar is already advertised.</summary>
@@ -358,12 +364,17 @@ public sealed partial class DbfWriter
     /// only the new tag's keys, build just that tag's pages, append them at the file end and splice its directory
     /// entry in via <see cref="CdxTreeEditor"/>. When the name already exists it is UNLINKED first (its pages are
     /// abandoned — dead pages are acceptable; REINDEX compacts). Returns <see langword="true"/> on success;
-    /// <see langword="false"/> (caller falls back to a whole-file rebuild, which OVERWRITES the file and heals any
-    /// partial edit) when the sidecar is not a fast-editable standard compound index. A genuine truncated-table
-    /// throw from <see cref="MaterializeRows"/> propagates (as it does today) rather than silently falling back.
+    /// <see langword="false"/> (caller falls back to a whole-file rebuild) when the sidecar is not a fast-editable
+    /// standard compound index. If a splice fails after mutation begins, <paramref name="fallbackTagDefinitions"/>
+    /// receives the pre-mutation tag definitions so the rebuild does not re-read a partially edited directory. A
+    /// genuine truncated-table throw from <see cref="MaterializeRows"/> propagates (as it does today) rather than
+    /// silently falling back.
     /// </summary>
-    private bool TryFastAppendTag(string cdxPath, CdxTagDefinition def, EvaluationContext? evalContext, bool includeDeleted)
+    private bool TryFastAppendTag(string cdxPath, CdxTagDefinition def, EvaluationContext? evalContext,
+        bool includeDeleted, out List<CdxTagDefinition>? fallbackTagDefinitions)
     {
+        fallbackTagDefinitions = null;
+
         // Probe the directory read-only FIRST so a legacy / unreadable sidecar falls back before the table scan.
         List<(string Name, long HeaderOffset)>? dir;
         try
@@ -380,12 +391,15 @@ public sealed partial class DbfWriter
         Flush();
         var rows = MaterializeRows();
 
+        List<CdxTagDefinition>? preMutationDefinitions = null;
         try
         {
             using var rw = new FileStream(cdxPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
             long baseOffset = rw.Length;
             if (baseOffset <= 0 || baseOffset % IndexFile.PageSize != 0)
                 return false;   // not a page-aligned compound index → fall back
+
+            preMutationDefinitions = ReadTagDefinitionsFrom(cdxPath);
 
             var block = CdxIndexBuilder.BuildTagBlock(_schema, rows, def, baseOffset, evalContext, includeDeleted);
             rw.Seek(baseOffset, SeekOrigin.Begin);
@@ -406,6 +420,8 @@ public sealed partial class DbfWriter
                 var old = dir.FirstOrDefault(e => string.Equals(e.Name, def.Name, StringComparison.OrdinalIgnoreCase));
                 if (old.Name is not null)
                     editor.Delete(0, nameKey, (uint)old.HeaderOffset, DirKeyLen, DirPad, basis);  // REPLACE: unlink old
+                if (FailFastTagDirectoryInsertForTests)
+                    throw new IOException("Injected fast tag-directory insert fault (test seam).");
                 editor.Insert(0, nameKey, (uint)block.HeaderOffset, DirKeyLen, DirPad, basis);
                 editor.Flush();
             }
@@ -413,8 +429,10 @@ public sealed partial class DbfWriter
         }
         catch
         {
-            // A mid-splice failure leaves at most dead appended pages + a possibly half-edited directory; the
-            // caller's full rebuild OVERWRITES the whole file and heals it. Signal fallback.
+            // A mid-splice failure leaves at most dead appended pages + a possibly half-edited directory. Hand the
+            // caller the pre-mutation definitions so the full rebuild overwrites from a clean snapshot instead of
+            // re-reading the edited directory.
+            fallbackTagDefinitions = preMutationDefinitions;
             return false;
         }
     }

@@ -310,6 +310,45 @@ public sealed class FoxDbfTransactionTests
         Assert.True(ReadState(dbf2).Single(r => r.Id == 2).Deleted);
     }
 
+    [Fact]
+    public void Commit_PromotionFailure_RestoresAlreadyPromotedTables_And_RemainsRollbackable()
+    {
+        using var db = new EmpDb();
+        File.Copy(db.Dbf, Path.Combine(db.Path, "emp2.dbf"));
+        File.Copy(db.Fpt, Path.Combine(db.Path, "emp2.fpt"));
+        File.Copy(db.Cdx, Path.Combine(db.Path, "emp2.cdx"));
+        string dbf2 = Path.Combine(db.Path, "emp2.dbf");
+        string fpt2 = Path.ChangeExtension(dbf2, ".fpt");
+
+        var empBefore = ReadState(db.Dbf);
+        var emp2Before = ReadState(dbf2);
+        var empDbfBefore = Bytes(db.Dbf);
+        var empFptBefore = Bytes(db.Fpt);
+        var empCdxBefore = Bytes(db.Cdx);
+        var emp2DbfBefore = Bytes(dbf2);
+        var emp2FptBefore = Bytes(fpt2);
+
+        using var conn = db.Open();
+        var tx = conn.BeginTransaction();
+        Assert.Equal(1, ExecNonQuery(conn, "UPDATE emp SET amount = 111.11 WHERE id = 1"));
+        Assert.Equal(1, ExecNonQuery(conn, "UPDATE emp2 SET amount = 222.22 WHERE id = 2"));
+
+        using (new FileStream(fpt2, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            Assert.ThrowsAny<IOException>(() => tx.Commit());
+        }
+
+        tx.Rollback();
+
+        Assert.Equal(empBefore, ReadState(db.Dbf));
+        Assert.Equal(emp2Before, ReadState(dbf2));
+        Assert.Equal(empDbfBefore, Bytes(db.Dbf));
+        Assert.Equal(empFptBefore, Bytes(db.Fpt));
+        Assert.Equal(empCdxBefore, Bytes(db.Cdx));
+        Assert.Equal(emp2DbfBefore, Bytes(dbf2));
+        Assert.Equal(emp2FptBefore, Bytes(fpt2));
+    }
+
     // ---- (6) No handle leak / no corruption after rollback --------------------------------
 
     [Fact]

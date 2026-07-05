@@ -85,6 +85,22 @@ public sealed class FoxDbfSchemaTests
         Assert.Empty(none.Rows);
     }
 
+    [Fact]
+    public void GetSchema_Tables_EmptyRestrictionArray_TreatsMissingEntriesAsNoFilter()
+    {
+        using var db = new PersonDb();
+        using var conn = db.Open();
+
+        DataTable t = conn.GetSchema("Tables", Array.Empty<string?>());
+
+        var tableNames = t.Rows.Cast<DataRow>()
+            .Select(r => (string)r["TABLE_NAME"])
+            .ToList();
+
+        Assert.Single(tableNames);
+        Assert.Contains("person", tableNames, StringComparer.OrdinalIgnoreCase);
+    }
+
     // ---- (3) Tables: a .dbc container ------------------------------------------------------
 
     [Fact]
@@ -142,6 +158,23 @@ public sealed class FoxDbfSchemaTests
         // ORDINAL_POSITION is dense & 1-based across the whole set.
         var ordinals = t.Rows.Cast<DataRow>().Select(r => Convert.ToInt32(r["ORDINAL_POSITION"])).OrderBy(x => x);
         Assert.Equal(Enumerable.Range(1, dbf.Columns.Count), ordinals);
+    }
+
+    [Fact]
+    public void GetSchema_Columns_ShortRestrictionArrays_TreatMissingEntriesAsNoFilter()
+    {
+        using var db = new PersonDb();
+        using var conn = db.Open();
+
+        DataTable noTableFilter = conn.GetSchema("Columns", Array.Empty<string?>());
+        Assert.Empty(noTableFilter.Rows);
+
+        DataTable columns = conn.GetSchema("Columns", new string?[] { null, null, "person" });
+
+        using var dbf = DbfTable.Open(Path.Combine(db.Path, "person.dbf"));
+        Assert.Equal(dbf.Columns.Count, columns.Rows.Count);
+        Assert.Contains(columns.Rows.Cast<DataRow>(),
+            r => string.Equals((string)r["COLUMN_NAME"], "name", StringComparison.OrdinalIgnoreCase));
     }
 
     // ---- (5) DataTypes --------------------------------------------------------------------

@@ -111,16 +111,25 @@ public sealed class FoxDbfBatch : DbBatch
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
     {
         EnsureReady();
-        var results = new List<SqlResult>(_commands.Count);
-        foreach (var bc in EnumerateCommands())
+        _connection!.ReserveActiveReaderSlot();
+        try
         {
-            using var cmd = ToCommand(bc);
-            results.Add(cmd.BuildResultSet(behavior));
+            var results = new List<SqlResult>(_commands.Count);
+            foreach (var bc in EnumerateCommands())
+            {
+                using var cmd = ToCommand(bc);
+                results.Add(cmd.BuildResultSet(behavior));
+            }
+            // One reader over every command's result set: it exposes the first set and NextResult() walks on.
+            var reader = new FoxDbfDataReader(results, _connection, behavior);
+            _connection.CommitActiveReaderSlot(reader);
+            return reader;
         }
-        // One reader over every command's result set: it exposes the first set and NextResult() walks on.
-        var reader = new FoxDbfDataReader(results, _connection!, behavior);
-        _connection!.SetActiveReader(reader);
-        return reader;
+        catch
+        {
+            _connection!.SetActiveReader(null);
+            throw;
+        }
     }
 
     // ---- helpers ---------------------------------------------------------------------------

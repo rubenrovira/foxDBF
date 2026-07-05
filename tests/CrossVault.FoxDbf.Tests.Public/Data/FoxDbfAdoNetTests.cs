@@ -4,6 +4,7 @@ using System.Data;
 using System.Data.Common;
 using System.Linq;
 using CrossVault.FoxDbf.Data;
+using CrossVault.FoxDbf.Sql;
 using Xunit;
 
 namespace CrossVault.FoxDbf.Tests.Data;
@@ -82,6 +83,36 @@ public sealed class FoxDbfAdoNetTests
         Assert.NotNull(schema);
         Assert.Equal(2, schema!.Rows.Count);
         Assert.Equal("ID", ((string)schema.Rows[0]["ColumnName"]).ToUpperInvariant());
+    }
+
+    [Fact]
+    public void Reader_GetBytes_And_GetChars_ClampAtAndPastEndOffsets()
+    {
+        using var db = new PersonDb();
+        using var conn = db.Open();
+        var result = new SqlResult(
+            new[]
+            {
+                new SqlColumn("blob", 'Q', 3, 0, typeof(byte[])),
+                new SqlColumn("text", 'C', 3, 0, typeof(string)),
+            },
+            new[] { new object?[] { new byte[] { 1, 2, 3 }, "abc" } });
+        using var r = new FoxDbfDataReader(result, conn, CommandBehavior.Default);
+        Assert.True(r.Read());
+
+        var bytes = new byte[] { 9, 9 };
+        Assert.Equal(0, r.GetBytes(0, 3, bytes, 0, bytes.Length));
+        Assert.Equal(new byte[] { 9, 9 }, bytes);
+        Assert.Equal(0, r.GetBytes(0, 4, bytes, 0, bytes.Length));
+        Assert.Equal(new byte[] { 9, 9 }, bytes);
+
+        var chars = new[] { 'x', 'y' };
+        Assert.Equal(0, r.GetChars(1, 3, chars, 0, chars.Length));
+        Assert.Equal(new[] { 'x', 'y' }, chars);
+        Assert.Equal(0, r.GetChars(1, 4, chars, 0, chars.Length));
+        Assert.Equal(new[] { 'x', 'y' }, chars);
+        Assert.Equal(0, r.GetChars(1, (long)int.MaxValue + 1, chars, 0, chars.Length));
+        Assert.Equal(new[] { 'x', 'y' }, chars);
     }
 
     // ---- (2) ExecuteScalar + ExecuteNonQuery (DML) ----------------------------------------

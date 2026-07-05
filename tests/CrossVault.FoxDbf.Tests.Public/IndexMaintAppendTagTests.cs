@@ -1,5 +1,8 @@
 using System;
 using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using CrossVault.FoxDbf;
 using CrossVault.FoxDbf.MicroVfp;
 using CrossVault.FoxDbf.Write;
@@ -101,6 +104,43 @@ public sealed class IndexMaintAppendTagTests
     }
 
     [Fact]
+    public async Task TwoSharedWriters_ConcurrentAppends_WithStructuralTag_DoNotLoseIndexEntries()
+    {
+        using var dir = new IndexMaintTestSupport.TempDir();
+        var cols = new[] { new DbfColumnDef("ID", 'I'), new DbfColumnDef("NAME", 'C', 12) };
+        const int seedRows = 96;
+        const int perWriter = 160;
+        string dbf = IndexMaintTestSupport.CreateTable(dir.Path, "t.dbf", cols,
+            Enumerable.Range(1, seedRows).Select(Row),
+            new CdxTagDefinition("IDTAG", "ID"));
+
+        using (var left = DbfWriter.Open(dbf, new DbfOptions { LockMode = LockMode.Shared }))
+        using (var right = DbfWriter.Open(dbf, new DbfOptions { LockMode = LockMode.Shared }))
+        using (var start = new ManualResetEventSlim())
+        {
+            var a = Task.Run(() => AppendRangeWithRetry(left, start, 10_000, perWriter));
+            var b = Task.Run(() => AppendRangeWithRetry(right, start, 20_000, perWriter));
+            start.Set();
+            await Task.WhenAll(a, b);
+        }
+
+        using var table = DbfTable.Open(dbf, new DbfOptions { LockMode = LockMode.Shared });
+        int expectedCount = seedRows + perWriter * 2;
+        Assert.Equal(expectedCount, table.RecordCount);
+        Assert.Equal(expectedCount, IndexMaintTestSupport.EntryCount(dbf, "IDTAG"));
+
+        foreach (int id in Enumerable.Range(1, seedRows)
+                     .Concat(Enumerable.Range(10_000, perWriter))
+                     .Concat(Enumerable.Range(20_000, perWriter)))
+        {
+            uint? recNo = IndexMaintTestSupport.Seek(dbf, "IDTAG", id);
+            Assert.NotNull(recNo);
+            Assert.InRange((int)recNo.Value, 1, expectedCount);
+            Assert.Equal(id, table.GetRecord((int)recNo.Value - 1)!.Value.GetInt32("ID"));
+        }
+    }
+
+    [Fact]
     public void CandidateTag_DuplicateKeyOnInsert_Raises()
     {
         using var dir = new IndexMaintTestSupport.TempDir();
@@ -169,5 +209,31 @@ public sealed class IndexMaintAppendTagTests
         using (var w = DbfWriter.Open(dbf))
             w.Recall(1);
         Assert.Equal(new[] { 1, 2, 3 }, IndexMaintTestSupport.Recnos(dbf, "NAMETAG"));
+    }
+
+    private static object?[] Row(int id) => new object?[] { id, "N" + id.ToString("D8") };
+
+    private static void AppendRangeWithRetry(DbfWriter writer, ManualResetEventSlim start, int firstId, int count)
+    {
+        start.Wait();
+        for (int i = 0; i < count; i++)
+        {
+            int id = firstId + i;
+            for (int attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    writer.AppendRecord(Row(id));
+                    break;
+                }
+                catch (IOException) when (attempt < 200)
+                {
+                    Thread.Sleep(1);
+                }
+            }
+
+            if ((i & 7) == 0)
+                Thread.Yield();
+        }
     }
 }

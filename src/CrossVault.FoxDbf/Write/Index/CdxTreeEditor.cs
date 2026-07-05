@@ -134,6 +134,12 @@ internal sealed class CdxTreeEditor : IDisposable
         _appendPageCache = null;
     }
 
+    public void RefreshFromDisk()
+    {
+        ClearAppendRunCache();
+        _end = _rw.Length;
+    }
+
     internal int AppendPageCachePageCountForTests => _appendPageCache?.Count ?? 0;
 
     public void Flush() => _rw.Flush();

@@ -235,8 +235,8 @@ public sealed partial class VfpInterpreter
         try { if (snap.Dbf is not null) File.WriteAllBytes(snap.Path, snap.Dbf); } catch { }
         string cdx = Path.ChangeExtension(snap.Path, ".cdx");
         string fpt = Path.ChangeExtension(snap.Path, ".fpt");
-        try { if (snap.Cdx is not null) File.WriteAllBytes(cdx, snap.Cdx); } catch { }
-        try { if (snap.Fpt is not null) File.WriteAllBytes(fpt, snap.Fpt); } catch { }
+        RestoreSnapshotSidecar(cdx, snap.Cdx);
+        RestoreSnapshotSidecar(fpt, snap.Fpt);
 
         int savedCur = Session.CurrentArea;
         foreach (var r in reopen)
@@ -257,6 +257,16 @@ public sealed partial class VfpInterpreter
         // 5.13: re-take on the fresh cached writer the explicit RLOCK/FLOCK we force-closed above, so a lock
         // an SP holds while a transaction / RI / CANDIDATE abort rolls the file back stays held afterwards.
         ReacquireHeldLocks(snap.Path);
+    }
+
+    private static void RestoreSnapshotSidecar(string path, byte[]? preimage)
+    {
+        try
+        {
+            if (preimage is not null) File.WriteAllBytes(path, preimage);
+            else if (File.Exists(path)) File.Delete(path);
+        }
+        catch { }
     }
 
     // ── 5.5 RECORD-LEVEL pre-image (pathology 3): the per-statement RI atomicity snapshots for a REPLACE do

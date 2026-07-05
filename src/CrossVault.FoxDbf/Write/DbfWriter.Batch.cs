@@ -83,7 +83,7 @@ public sealed partial class DbfWriter
         var indices = new int[rows.Count];
         int existingRecordCount = 0;
         // §5.1: the exact written bytes + 1-based recno of every row, captured for a single batched
-        // index-maintenance pass AFTER the append lock is released (the rows are already committed).
+        // index-maintenance pass before the append lock is released.
         var appended = new List<(int RecNo, byte[] Record)>(rows.Count);
 
         // §D3: hold the APPEND lock for the WHOLE batch across the FRESH count re-read + every row
@@ -175,13 +175,11 @@ public sealed partial class DbfWriter
             AppendDataFlushCount++;
 
             _recordCount = finalCount;
-        });
 
-        // §5.1 structural-CDX maintenance: the whole batch is durably written above; now either maintain
-        // small batches incrementally or bulk-rebuild large APPEND-FROM-style batches once. Runs OUTSIDE the
-        // append lock (the rows are committed); a failure sets ReindexNeeded (via physical invalidation) +
-        // rethrows so no structural tag is ever left silently stale.
-        MaintainIndexesAfterAppendBatch(appended, existingRecordCount);
+            // §5.1 structural-CDX maintenance: the whole batch is durably written above; keep the append
+            // lock through either incremental page edits or the large-batch rebuild.
+            MaintainIndexesAfterAppendBatch(appended, existingRecordCount);
+        });
 
         return indices;
     }

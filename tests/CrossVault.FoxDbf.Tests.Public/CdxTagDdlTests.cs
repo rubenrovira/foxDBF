@@ -416,6 +416,41 @@ public sealed class CdxTagDdlTests
     }
 
     [Fact]
+    public void CreateTag_ReplaceOnlyTag_WhenFastInsertFails_RebuildsFromPreMutationSnapshot()
+    {
+        string dir = FreshTempDir();
+        try
+        {
+            string dbf = Path.Combine(dir, "one.dbf");
+            string cdx = Path.ChangeExtension(dbf, ".cdx");
+            using (var seed = DbfWriter.Create(dbf, ThreeCharCols))
+            {
+                foreach (var r in SixRows)
+                    seed.AppendRecord(r);
+                seed.CreateTag(new CdxTagDefinition("TONE", "C"));
+            }
+
+            using (var w = DbfWriter.Open(dbf))
+            {
+                w.FailFastTagDirectoryInsertForTests = true;
+                w.CreateTag(new CdxTagDefinition("TONE", "A"));
+            }
+
+            using var table = DbfTable.Open(dbf);
+            using var after = CdxFile.Open(cdx, table);
+            Assert.Equal(new[] { "TONE" }, TagNamesSorted(after));
+
+            var tone = after.Tag("TONE");
+            Assert.NotNull(tone);
+            Assert.Equal("A", tone!.KeyExpression.Trim());
+            Assert.Equal(new[] { 2, 4, 1, 6, 3, 5 }, Recnos(tone));
+            Assert.Equal((uint)4, tone.Seek((object)"A2"));
+            Assert.Null(tone.Seek((object)"C1"));
+        }
+        finally { Cleanup(dir); }
+    }
+
+    [Fact]
     public void IncrementalMaintenance_StillWorks_OnCdxWithDeadPages_FromAnUnlink()
     {
         string dir = FreshTempDir();

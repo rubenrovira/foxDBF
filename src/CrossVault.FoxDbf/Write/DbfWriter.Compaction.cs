@@ -245,6 +245,8 @@ public sealed partial class DbfWriter
 
         DeleteStructuralCdx(_stream.Name);
         ClearStructuralCdxFlag();
+        _hasStructuralCdx = false;
+        _usesStructuralScheme = VfpLock.UsesStructuralScheme(_version.Code, false);
         ReindexNeeded = true;
     }
 

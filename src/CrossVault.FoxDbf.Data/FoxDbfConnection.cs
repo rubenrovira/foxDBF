@@ -30,6 +30,8 @@ public sealed class FoxDbfConnection : DbConnection
     private bool _enforceRules;
     private CrossVault.FoxDbf.MicroVfp.VfpInterpreter? _interpreter;
     private FoxDbfDataReader? _activeReader;
+    private bool _activeReaderReserved;
+    private readonly object _activeReaderGate = new();
     private FoxDbfTransaction? _activeTransaction;
 
     public FoxDbfConnection() { }
@@ -133,7 +135,7 @@ public sealed class FoxDbfConnection : DbConnection
         }
         _activeTransaction = null;
         SetState(ConnectionState.Closed);
-        _activeReader = null;
+        SetActiveReader(null);
         _interpreter = null;
         // Symmetric with Open(): release the session's open DBF handles + the accelerator so a
         // Close -> Open -> Close cycle (or Close() on an IDbConnection handle) never leaks them.
@@ -154,7 +156,7 @@ public sealed class FoxDbfConnection : DbConnection
     public override DataTable GetSchema(string collectionName)
         => GetSchema(collectionName, null);
 
-    public override DataTable GetSchema(string collectionName, string?[] restrictionValues)
+    public override DataTable GetSchema(string collectionName, string?[]? restrictionValues)
     {
         if (string.IsNullOrEmpty(collectionName))
             throw new ArgumentException("Collection name cannot be null or empty.", nameof(collectionName));
@@ -535,10 +537,10 @@ public sealed class FoxDbfConnection : DbConnection
         t.Columns.Add("TABLE_TYPE", typeof(string));
 
         // Extract restrictions: [catalog, schema, table_name, table_type]
-        string? catalogFilter = restrictionValues?[0];
-        string? schemaFilter = restrictionValues?.Length > 1 ? restrictionValues[1] : null;
-        string? tableNameFilter = restrictionValues?.Length > 2 ? restrictionValues[2] : null;
-        string? tableTypeFilter = restrictionValues?.Length > 3 ? restrictionValues[3] : null;
+        string? catalogFilter = RestrictionValue(restrictionValues, 0);
+        string? schemaFilter = RestrictionValue(restrictionValues, 1);
+        string? tableNameFilter = RestrictionValue(restrictionValues, 2);
+        string? tableTypeFilter = RestrictionValue(restrictionValues, 3);
 
         if (_state != ConnectionState.Open)
             throw new InvalidOperationException("Connection is not open.");
@@ -604,10 +606,10 @@ public sealed class FoxDbfConnection : DbConnection
         t.Columns.Add("DATETIME_PRECISION", typeof(int));
 
         // Extract restrictions: [catalog, schema, table_name, column_name]
-        string? catalogFilter = restrictionValues?[0];
-        string? schemaFilter = restrictionValues?.Length > 1 ? restrictionValues[1] : null;
-        string? tableNameFilter = restrictionValues?.Length > 2 ? restrictionValues[2] : null;
-        string? columnNameFilter = restrictionValues?.Length > 3 ? restrictionValues[3] : null;
+        string? catalogFilter = RestrictionValue(restrictionValues, 0);
+        string? schemaFilter = RestrictionValue(restrictionValues, 1);
+        string? tableNameFilter = RestrictionValue(restrictionValues, 2);
+        string? columnNameFilter = RestrictionValue(restrictionValues, 3);
 
         if (_state != ConnectionState.Open)
             throw new InvalidOperationException("Connection is not open.");
@@ -668,6 +670,9 @@ public sealed class FoxDbfConnection : DbConnection
         return t;
     }
 
+    private static string? RestrictionValue(string?[]? restrictionValues, int index)
+        => restrictionValues is not null && index < restrictionValues.Length ? restrictionValues[index] : null;
+
     protected override DbCommand CreateDbCommand() => new FoxDbfCommand(null, this);
 
     /// <summary>Multi-command batches are supported (a local-file convenience — no round-trip saving).</summary>
@@ -727,7 +732,7 @@ public sealed class FoxDbfConnection : DbConnection
     /// re-open lazily on the next access.</summary>
     internal void QuiesceForRollback()
     {
-        _activeReader = null;
+        SetActiveReader(null);
         _session?.CloseAllHandles();
     }
 
@@ -791,11 +796,36 @@ public sealed class FoxDbfConnection : DbConnection
         }
     }
 
+    internal void ReserveActiveReaderSlot()
+    {
+        lock (_activeReaderGate)
+        {
+            if (_activeReader is not null || _activeReaderReserved)
+                throw new InvalidOperationException("A data reader is already open.");
+            _activeReaderReserved = true;
+        }
+    }
+
     internal void SetActiveReader(FoxDbfDataReader? reader)
     {
-        if (reader is not null && _activeReader is not null)
-            throw new InvalidOperationException("A data reader is already open.");
-        _activeReader = reader;
+        lock (_activeReaderGate)
+        {
+            if (reader is not null && (_activeReader is not null || _activeReaderReserved))
+                throw new InvalidOperationException("A data reader is already open.");
+            _activeReader = reader;
+            _activeReaderReserved = false;
+        }
+    }
+
+    internal void CommitActiveReaderSlot(FoxDbfDataReader reader)
+    {
+        lock (_activeReaderGate)
+        {
+            if (_activeReader is not null || !_activeReaderReserved)
+                throw new InvalidOperationException("A data reader is already open.");
+            _activeReader = reader;
+            _activeReaderReserved = false;
+        }
     }
 
     private void SetState(ConnectionState newState)

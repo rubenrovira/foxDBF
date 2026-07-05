@@ -50,10 +50,9 @@ public sealed partial class DbfWriter
     // per-row open/parse dominated the cost (the bulk AppendRecords path already amortizes all of it under
     // ONE editor session, and was ~87x faster for the identical inserts). We now keep the read/write .cdx
     // stream + its CdxTreeEditor + the resolved per-tag plans open ACROSS a run of incremental edits (appends
-    // AND in-place updates share ONE editor), reusing them, and STILL flush after every row — so on-disk
-    // visibility and the resulting .cdx bytes are IDENTICAL to the per-row open/edit/flush/close path (a fresh
-    // editor re-reads rw.Length for its _end; the cached editor tracks the same value in memory; every tag
-    // root is re-read live on each Insert/Delete, so a split/shrink mid-loop is honoured).
+    // AND in-place updates share ONE editor), reusing them, and STILL flush after every row. In Shared mode a
+    // cached editor is refreshed from disk before each mutation while the DBF append/record lock is held, so a
+    // second writer's prior serialized CDX edit cannot leave stale pages or a stale allocation pointer behind.
     //   The cache is a PURE incremental accelerator: any operation that opens its OWN .cdx handle or replaces
     // the file (a BATCH append's one-shot session, PACK/ZAP/tag-DDL invalidation, a §D5 Alter reopen) or a
     // public Flush/Dispose tears it down first (CloseCdxMaint), so two editors never coexist on the file and
@@ -160,6 +159,15 @@ public sealed partial class DbfWriter
         if (_cdxMaintEditor is null)
         {
             _cdxMaintMode = CdxMaintMode.None;
+            return;
+        }
+
+        if (_lockMode == LockMode.Shared)
+        {
+            _cdxMaintEditor.RefreshFromDisk();
+            if (mode == CdxMaintMode.Append)
+                _cdxMaintEditor.BeginAppendRun();
+            _cdxMaintMode = mode;
             return;
         }
 

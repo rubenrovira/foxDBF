@@ -100,10 +100,11 @@ public sealed class CdxTag
         => IndexKey.Decode(keyBytes, KeyType);
 
     /// <summary>
-    /// Seeks the first record whose key matches <paramref name="keyBytes"/> by
+    /// Seeks a record whose key matches <paramref name="keyBytes"/> by
     /// descending the B-tree with UNSIGNED byte comparison (prefix seek allowed);
-    /// returns the record number, or <see cref="NotFound"/> (<see langword="null"/>)
-    /// when no key shares the prefix. Never throws.
+    /// returns the first matching record in stored ascending byte order, or
+    /// <see cref="NotFound"/> (<see langword="null"/>) when no key shares the prefix.
+    /// This is not order-aware for <see cref="Descending"/> positioning. Never throws.
     /// </summary>
     public uint? Seek(ReadOnlySpan<byte> keyBytes) => Seek(keyBytes, exact: false);
 
@@ -131,7 +132,8 @@ public sealed class CdxTag
         // the same entries the old scan would have — it merely SKIPS the O(n) leading run instead of
         // decoding every entry from key 1. DescendToLeaf errs left (never past a match), so the walk
         // is complete. SEEK matches ascending key BYTES regardless of the tag's logical order, so a
-        // DESCENDING tag is handled identically to the old ascending scan. Strictly defensive:
+        // DESCENDING tag returns some ascending-first matching recno and is NOT order-aware for
+        // controlling-order positioning. Strictly defensive:
         // EnumerateFrom terminates (never throws) on a malformed node or a corrupt sibling cycle.
         var needle = keyBytes.ToArray();
         foreach (var entry in EnumerateFrom(needle))

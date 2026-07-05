@@ -249,9 +249,12 @@ public sealed class FoxDbfDataReader : DbDataReader
         if (val is byte[] ba)
         {
             if (buffer == null) return ba.LongLength;
-            long toCopy = Math.Min(length, ba.LongLength - dataOffset);
-            if (toCopy > 0)
-                Array.Copy(ba, dataOffset, buffer, bufferOffset, toCopy);
+            if (dataOffset < 0) throw new ArgumentOutOfRangeException(nameof(dataOffset));
+            long available = ba.LongLength - dataOffset;
+            if (available <= 0) return 0;
+            long toCopy = Math.Min((long)length, available);
+            if (toCopy <= 0) return 0;
+            Array.Copy(ba, dataOffset, buffer, bufferOffset, toCopy);
             return toCopy;
         }
         throw new InvalidCastException($"Cannot cast {val?.GetType()?.Name ?? "null"} to byte[].");
@@ -267,9 +270,12 @@ public sealed class FoxDbfDataReader : DbDataReader
     {
         var s = GetString(ordinal);
         if (buffer == null) return s.Length;
-        long toCopy = Math.Min(length, s.Length - (int)dataOffset);
-        if (toCopy > 0)
-            s.CopyTo((int)dataOffset, buffer, bufferOffset, (int)toCopy);
+        if (dataOffset < 0) throw new ArgumentOutOfRangeException(nameof(dataOffset));
+        long available = (long)s.Length - dataOffset;
+        if (available <= 0) return 0;
+        long toCopy = Math.Min((long)length, available);
+        if (toCopy <= 0) return 0;
+        s.CopyTo((int)dataOffset, buffer, bufferOffset, (int)toCopy);
         return toCopy;
     }
 
