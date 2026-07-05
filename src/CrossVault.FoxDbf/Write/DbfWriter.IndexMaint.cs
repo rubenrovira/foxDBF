@@ -195,22 +195,25 @@ public sealed partial class DbfWriter
     }
 
     /// <summary>
-    /// Maintain every structural tag after a BATCH append (<see cref="AppendCoreBatch"/>): insert every new
-    /// record's key into every derivable tag under ONE editor session (far cheaper than re-opening per row),
-    /// honouring each tag's FOR filter and UNIQUE bit (a UNIQUE tag's ContainsKey sees earlier same-batch
-    /// inserts because they land in the live tree first). Same durability contract as the per-row path — an
-    /// un-derivable tag or a throw physically invalidates the sidecar rather than leaving it silently stale.
-    /// This closes the batch-path backstop gap (finding 5.1 review item 4): the public
-    /// <see cref="AppendRecords(System.Collections.Generic.IEnumerable{object?[]})"/> API is now safe against
-    /// an already-indexed table, not only the brand-new tables its in-repo callers happen to target.
+    /// Maintain every structural tag after a BATCH append (<see cref="AppendCoreBatch"/>). Small batches keep
+    /// the incremental path: insert every new record's key into every derivable tag under ONE editor session,
+    /// honouring each tag's FOR filter and UNIQUE bit. Large APPEND-FROM-style batches (new rows at least the
+    /// old table size) instead rebuild the structural <c>.cdx</c> once through the same bulk builder as
+    /// REINDEX. Both paths keep the same durability contract as the per-row path — an un-derivable tag or a
+    /// throw physically invalidates the sidecar rather than leaving it silently stale.
     /// </summary>
-    private void MaintainIndexesAfterAppendBatch(IReadOnlyList<(int RecNo, byte[] Record)> appended)
+    private void MaintainIndexesAfterAppendBatch(IReadOnlyList<(int RecNo, byte[] Record)> appended, int existingRecordCount)
     {
         // A batch opens its OWN editor session below; never let a lingering per-row incremental editor (from
         // an earlier single-row append/update loop on this same writer) coexist with it on the file.
         CloseCdxMaint(flush: true);
         if (appended.Count == 0 || !ShouldMaintainIndexes())
             return;
+        if (ShouldBulkBuildIndexesAfterAppendBatch(appended.Count, existingRecordCount))
+        {
+            RebuildIndexesAfterBulkAppend(existingRecordCount);
+            return;
+        }
         bool deferred = false;
         try
         {
@@ -243,6 +246,62 @@ public sealed partial class DbfWriter
         }
         if (deferred)
             InvalidateStructuralCdxForMaintenance();
+    }
+
+    private static bool ShouldBulkBuildIndexesAfterAppendBatch(int appendedCount, int existingRecordCount)
+        => appendedCount > 0 && appendedCount >= existingRecordCount;
+
+    private void RebuildIndexesAfterBulkAppend(int existingRecordCount)
+    {
+        try
+        {
+            var tags = ReadExistingTagDefinitions();
+            if (tags.Count == 0)
+                return;
+            var appendUniqueState = CaptureAppendUniqueState(tags, existingRecordCount);
+            RebuildStructuralCdx(tags, includeDeleted: true, appendUniqueState: appendUniqueState);
+        }
+        catch
+        {
+            InvalidateStructuralCdxForMaintenance();
+            throw;
+        }
+    }
+
+    private CdxIndexBuilder.AppendUniqueState? CaptureAppendUniqueState(
+        IReadOnlyList<CdxTagDefinition> tags, int existingRecordCount)
+    {
+        var uniqueTags = tags.Where(t => t.Unique).ToList();
+        if (uniqueTags.Count == 0)
+            return null;
+
+        var entriesByTag = new Dictionary<string, IReadOnlyList<IndexEntry>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var tag in uniqueTags)
+            entriesByTag[tag.Name] = Array.Empty<IndexEntry>();
+
+        string cdx = ExistingCdxPath();
+        if (File.Exists(cdx))
+        {
+            using var file = CdxFile.Open(cdx, _schema);
+            uint oldMax = existingRecordCount <= 0 ? 0u : (uint)existingRecordCount;
+            foreach (var def in uniqueTags)
+            {
+                var tag = file.Tag(def.Name);
+                if (tag is null)
+                    continue;
+
+                var existing = new List<IndexEntry>();
+                foreach (var entry in tag.EnumerateEntries())
+                {
+                    if (entry.RecordNumber == 0 || entry.RecordNumber > oldMax)
+                        continue;
+                    existing.Add(new IndexEntry(entry.RecordNumber, (byte[])entry.Key.Clone()));
+                }
+                entriesByTag[def.Name] = existing;
+            }
+        }
+
+        return new CdxIndexBuilder.AppendUniqueState(existingRecordCount, entriesByTag);
     }
 
     /// <summary>Maintain every structural tag after an in-place UPDATE: for each tag compute the OLD key

@@ -37,6 +37,14 @@ internal static class CdxIndexBuilder
     public readonly record struct BuildRow(int RecNo, DbfRecord Record);
 
     /// <summary>
+    /// UNIQUE-tag state captured before a bulk append rebuild overwrites the current CDX. Existing entries are
+    /// the fixed pre-append winners; only rows beyond <see cref="ExistingRecordCount"/> may add new keys.
+    /// </summary>
+    internal readonly record struct AppendUniqueState(
+        int ExistingRecordCount,
+        IReadOnlyDictionary<string, IReadOnlyList<IndexEntry>> ExistingEntriesByTag);
+
+    /// <summary>
     /// Build a fresh compound <c>.cdx</c> at <paramref name="cdxPath"/> covering every
     /// definition in <paramref name="tags"/> over <paramref name="rows"/> (the live,
     /// non-deleted-aware record set of <paramref name="schema"/>). Overwrites any existing
@@ -51,7 +59,7 @@ internal static class CdxIndexBuilder
     /// </para>
     /// </summary>
     public static void Build(string cdxPath, DbfTable schema, IReadOnlyList<BuildRow> rows, IReadOnlyList<CdxTagDefinition> tags,
-        EvaluationContext? evalContext = null, bool includeDeleted = false)
+        EvaluationContext? evalContext = null, bool includeDeleted = false, AppendUniqueState? appendUniqueState = null)
     {
         var sink = new PageSink();
         sink.Reserve();           // page 0: file header (filled last)
@@ -60,7 +68,7 @@ internal static class CdxIndexBuilder
         // Plan every per-tag tree up front (keys, geometry, header metadata, page footprint).
         var plans = new List<TagPlan>(tags.Count);
         foreach (var def in tags)
-            plans.Add(PlanTag(schema, rows, def, evalContext, includeDeleted));
+            plans.Add(PlanTag(schema, rows, def, evalContext, includeDeleted, appendUniqueState));
 
         // VFP places the tag-DIRECTORY root EARLY — on page 2 (offset 1024), BEFORE the per-tag
         // trees — so the real VFP9 runtime can open a .dbc that uses this .dcx (error 1552 otherwise).
@@ -145,7 +153,7 @@ internal static class CdxIndexBuilder
         if (baseByteOffset < 0 || baseByteOffset % Page != 0)
             throw new ArgumentException($"CDX append base offset {baseByteOffset} is not page-aligned.", nameof(baseByteOffset));
 
-        var plan = PlanTag(schema, rows, def, evalContext, includeDeleted);
+        var plan = PlanTag(schema, rows, def, evalContext, includeDeleted, appendUniqueState: null);
         var sink = new PageSink((int)(baseByteOffset / Page));
 
         int headerIndex = sink.Reserve();   // tag header page (absolute page index == basePage)
@@ -188,7 +196,7 @@ internal static class CdxIndexBuilder
     }
 
     private static TagPlan PlanTag(DbfTable schema, IReadOnlyList<BuildRow> rows, CdxTagDefinition def,
-        EvaluationContext? evalContext, bool includeDeleted)
+        EvaluationContext? evalContext, bool includeDeleted, AppendUniqueState? appendUniqueState)
     {
         // The per-row KEY/FOR derivation (collation, key type/length, FOR filter, encoding) is factored
         // into a reusable TagKeyComputer — the SAME primitive the incremental write-path maintenance
@@ -196,21 +204,32 @@ internal static class CdxIndexBuilder
         var computer = CreateKeyComputer(schema, def, evalContext);
 
         int recCount = rows.Count;
-        var entries = new List<Entry>(rows.Count);
-        foreach (var row in rows)
+        List<Entry> entries;
+        if (def.Unique &&
+            appendUniqueState is { } uniqueState &&
+            uniqueState.ExistingEntriesByTag.TryGetValue(def.Name, out var existingUniqueEntries))
         {
-            // VFP keeps index entries for DELETED records in the CDX (only PACK removes them). With
-            // SET DELETED OFF (includeDeleted) we index them too; the default (SET DELETED ON) skips them.
-            if (!includeDeleted && row.Record.IsDeleted)
-                continue;
-            if (computer.TryComputeKey(row.Record, row.RecNo, recCount, out var keyBytes))
-                entries.Add(new Entry(keyBytes, (uint)row.RecNo));
+            entries = PlanAppendUniqueTag(rows, existingUniqueEntries, uniqueState.ExistingRecordCount,
+                computer, recCount, includeDeleted);
         }
+        else
+        {
+            entries = new List<Entry>(rows.Count);
+            foreach (var row in rows)
+            {
+                // VFP keeps index entries for DELETED records in the CDX (only PACK removes them). With
+                // SET DELETED OFF (includeDeleted) we index them too; the default (SET DELETED ON) skips them.
+                if (!includeDeleted && row.Record.IsDeleted)
+                    continue;
+                if (computer.TryComputeKey(row.Record, row.RecNo, recCount, out var keyBytes))
+                    entries.Add(new Entry(keyBytes, (uint)row.RecNo));
+            }
 
-        entries.Sort(EntryComparer.Instance);
+            entries.Sort(EntryComparer.Instance);
 
-        if (def.Unique)
-            entries = DropDuplicateKeys(entries);
+            if (def.Unique)
+                entries = DropDuplicateKeys(entries);
+        }
 
         long recnoBasis = Math.Max(1, recCount);
         var geom = LeafGeometry.For(computer.KeyLen, recnoBasis, entries);
@@ -240,6 +259,42 @@ internal static class CdxIndexBuilder
             KeyExpr = def.KeyExpression ?? string.Empty,
             ForExpr = hasFor ? def.ForExpression! : string.Empty,
         };
+    }
+
+    private static List<Entry> PlanAppendUniqueTag(IReadOnlyList<BuildRow> rows,
+        IReadOnlyList<IndexEntry> existingUniqueEntries, int existingRecordCount,
+        TagKeyComputer computer, int recCount, bool includeDeleted)
+    {
+        int newRowCapacity = Math.Max(0, rows.Count - Math.Max(0, existingRecordCount));
+        var entries = new List<Entry>(existingUniqueEntries.Count + newRowCapacity);
+        var seen = new HashSet<byte[]>(KeyBytesEqualityComparer.Instance);
+        uint oldMax = existingRecordCount <= 0 ? 0u : (uint)existingRecordCount;
+
+        foreach (var existing in existingUniqueEntries)
+        {
+            if (existing.RecordNumber == 0 || existing.RecordNumber > oldMax)
+                continue;
+            byte[] key = (byte[])existing.Key.Clone();
+            if (!seen.Add(key))
+                continue;
+            entries.Add(new Entry(key, existing.RecordNumber));
+        }
+
+        foreach (var row in rows)
+        {
+            if (row.RecNo <= existingRecordCount)
+                continue;
+            if (!includeDeleted && row.Record.IsDeleted)
+                continue;
+            if (!computer.TryComputeKey(row.Record, row.RecNo, recCount, out var keyBytes))
+                continue;
+            if (!seen.Add(keyBytes))
+                continue;
+            entries.Add(new Entry(keyBytes, (uint)row.RecNo));
+        }
+
+        entries.Sort(EntryComparer.Instance);
+        return entries;
     }
 
     // ---- reusable per-tag key derivation (shared by bulk build + incremental maintenance) ----------
@@ -811,6 +866,25 @@ internal static class CdxIndexBuilder
             prev = e.Key;
         }
         return result;
+    }
+
+    private sealed class KeyBytesEqualityComparer : IEqualityComparer<byte[]>
+    {
+        public static readonly KeyBytesEqualityComparer Instance = new();
+
+        public bool Equals(byte[]? x, byte[]? y)
+            => ReferenceEquals(x, y) || (x is not null && y is not null && x.AsSpan().SequenceEqual(y));
+
+        public int GetHashCode(byte[] obj)
+        {
+            unchecked
+            {
+                int hash = 17;
+                foreach (byte b in obj)
+                    hash = (hash * 31) + b;
+                return hash;
+            }
+        }
     }
 
     private static int CommonPrefix(byte[] a, byte[] b, int len)

@@ -81,6 +81,7 @@ public sealed partial class DbfWriter
             return Array.Empty<int>();
 
         var indices = new int[rows.Count];
+        int existingRecordCount = 0;
         // §5.1: the exact written bytes + 1-based recno of every row, captured for a single batched
         // index-maintenance pass AFTER the append lock is released (the rows are already committed).
         var appended = new List<(int RecNo, byte[] Record)>(rows.Count);
@@ -95,6 +96,7 @@ public sealed partial class DbfWriter
         {
             int diskCount = (int)ReadOnDiskRecordCount();
             _recordCount = diskCount;
+            existingRecordCount = diskCount;
 
             int n = rows.Count;
             int finalCount = diskCount + n;
@@ -175,11 +177,11 @@ public sealed partial class DbfWriter
             _recordCount = finalCount;
         });
 
-        // §5.1 incremental maintenance: the whole batch is durably written above; now insert every new row's
-        // key into every open structural tag under ONE editor session. Runs OUTSIDE the append lock (the rows
-        // are committed); a failure sets ReindexNeeded (via physical invalidation) + rethrows so no structural
-        // tag is ever left silently stale.
-        MaintainIndexesAfterAppendBatch(appended);
+        // §5.1 structural-CDX maintenance: the whole batch is durably written above; now either maintain
+        // small batches incrementally or bulk-rebuild large APPEND-FROM-style batches once. Runs OUTSIDE the
+        // append lock (the rows are committed); a failure sets ReindexNeeded (via physical invalidation) +
+        // rethrows so no structural tag is ever left silently stale.
+        MaintainIndexesAfterAppendBatch(appended, existingRecordCount);
 
         return indices;
     }

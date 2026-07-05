@@ -301,17 +301,19 @@ public sealed partial class DbfWriter
     }
 
     /// <summary>Bulk-build the structural <c>.cdx</c> for <paramref name="tags"/> over the live table.</summary>
-    private void RebuildStructuralCdx(IReadOnlyList<CdxTagDefinition> tags, EvaluationContext? evalContext = null, bool includeDeleted = false)
+    private void RebuildStructuralCdx(IReadOnlyList<CdxTagDefinition> tags, EvaluationContext? evalContext = null,
+        bool includeDeleted = false, CdxIndexBuilder.AppendUniqueState? appendUniqueState = null)
     {
         Flush();
         var rows = MaterializeRows();
-        CdxIndexBuilder.Build(StructuralCdxPath(), _schema, rows, tags, evalContext, includeDeleted);
+        CdxIndexBuilder.Build(StructuralCdxPath(), _schema, rows, tags, evalContext, includeDeleted, appendUniqueState);
 
         // The sidecar VFP just wrote is a STRUCTURAL compound .cdx (options 0xE0). Advertise it in the
         // DBF header (byte 28 bit 0) so a real VFP runtime auto-opens it on USE, and flip the writer's
         // own _hasStructuralCdx/_usesStructuralScheme so a subsequent Pack/Zap correctly invalidates
         // (deletes + ReindexNeeded) the now-owned sidecar instead of early-returning and leaving it stale.
         EnsureStructuralCdxAdvertised();
+        _tagComputers = null;
     }
 
     // ---- incremental tag-DDL fast paths (project-review 5.6) --------------------
