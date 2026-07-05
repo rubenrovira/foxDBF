@@ -55,6 +55,7 @@ public sealed partial class VfpInterpreter
             case "BOF": r = VfpValue.Logical(MetaArg(a, 0)?.Bof ?? true); return true;
             case "FOUND": r = VfpValue.Logical(MetaArg(a, 0)?.Found ?? false); return true;
             case "DELETED": r = VfpValue.Logical(FnDeleted(a)); return true;
+            case "FILTER": r = VfpValue.Character(FnFilter(a)); return true;
             case "SEEK": r = VfpValue.Logical(FnSeek(a)); return true;
             case "PCOUNT": case "PARAMETERS": r = VfpValue.Integer(CurrentCall.PassedCount); return true;
             case "PROGRAM": r = FnProgram(a); return true;
@@ -316,6 +317,15 @@ public sealed partial class VfpInterpreter
         return m.RecNo >= 1 && m.RecNo <= rcTable && wa.Table.IsRecordDeleted(m.RecNo - 1);
     }
 
+    // FILTER([nWorkArea | cAlias]) — the VFP-normalised text of the area's SET FILTER expression, or "" when
+    // no filter is set (or the area is not open). Defaults to the current work area; mirrors FnDeleted's
+    // area-argument resolution. SET("FILTER") returns the SAME text for the current area (see FnSet).
+    private string FnFilter(VfpValue[] a)
+    {
+        int area = a.Length == 0 ? Session.CurrentArea : AreaNumber(a[0]);
+        return _meta.TryGetValue(area, out var m) ? (m.FilterText ?? string.Empty) : string.Empty;
+    }
+
     private bool FnSeek(VfpValue[] a)
     {
         if (a.Length == 0) return false;
@@ -332,6 +342,8 @@ public sealed partial class VfpInterpreter
             "REPROCESS" => VfpValue.Character(Runtime.Reprocess == -2 ? "AUTOMATIC" : Runtime.Reprocess.ToString(CultureInfo.InvariantCulture)),
             "EXACT" => VfpValue.Character(_ctx.Exact ? "ON" : "OFF"),
             "DELETED" => VfpValue.Character(_ctx.Deleted ? "ON" : "OFF"),
+            // SET("FILTER") — the current area's SET FILTER text (VFP-normalised), "" when none. Same text FILTER() reports.
+            "FILTER" => VfpValue.Character(_meta.TryGetValue(Session.CurrentArea, out var fm) ? (fm.FilterText ?? string.Empty) : string.Empty),
             "ANSI" => VfpValue.Character(_ctx.Ansi ? "ON" : "OFF"),
             "COLLATE" => VfpValue.Character(_ctx.Collation?.Name ?? "MACHINE"),
             "UNIQUE" => VfpValue.Character(Runtime.Unique ? "ON" : "OFF"),

@@ -19,7 +19,7 @@ public sealed partial class VfpInterpreter
     //
     // LOCATE positions on the FIRST record — in the area's CURRENT order (the master index if one is set,
     // else physical) — that satisfies FOR within the scope/WHILE window, honouring SET DELETED /
-    // SET KEY visibility through the SAME Visible() gate GO/SKIP use (SET FILTER is not modelled). Found ⇒ pointer on the record,
+    // SET KEY / SET FILTER visibility through the SAME Visible() gate GO/SKIP use. Found ⇒ pointer on the record,
     // FOUND()=.T.; the search runs off the end ⇒ EOF(), FOUND()=.F. LOCATE with no FOR positions on the
     // first visible record. CONTINUE resumes the LAST LOCATE of the CURRENT work area from the record AFTER
     // the current one, reusing its remembered FOR/WHILE + scope window (per AreaMeta); CONTINUE with no
@@ -311,6 +311,132 @@ public sealed partial class VfpInterpreter
         m.KeyVisible = null;   // rebuilt lazily by Visible().
     }
 
+    /// <summary>SET FILTER TO [lExpr] — set the CURRENT work area's record-visibility predicate (fed into
+    /// the SAME <see cref="Visible"/> gate as SET DELETED / SET KEY). Bare <c>SET FILTER TO</c> clears it.
+    /// VFP validates/evaluates the expression at SET time: an unknown field/variable raises err 12
+    /// ("Variable 'X' is not found.") right here — oracle-pinned — leaving the prior filter state untouched.
+    /// The predicate lives in per-area <see cref="AreaMeta"/> so it follows USE/close and the data session in
+    /// lockstep (5.14). <see cref="FnFilter"/> / <c>SET("FILTER")</c> report the VFP-normalised text.</summary>
+    private void SetFilter(string arg)
+    {
+        int area = Session.CurrentArea;
+        var m = Meta(area);
+
+        string rest = arg;
+        if (PrgScan.FirstWord(rest).Equals("TO", StringComparison.OrdinalIgnoreCase))
+            rest = PrgScan.AfterFirstWord(rest);
+        rest = rest.Trim();
+
+        if (rest.Length == 0)   // SET FILTER TO → clear (FILTER()/SET("FILTER") return "").
+        {
+            m.FilterExpr = null; m.FilterText = null;
+            return;
+        }
+
+        // VFP evaluates the filter at SET time; an unknown name is err 12 AT THIS STATEMENT (not deferred to
+        // navigation). microVFP's engine coerces unknown names to .NULL. instead of throwing, so we validate
+        // the referenced names explicitly BEFORE mutating state (a throw leaves the prior filter in place).
+        ValidateFilterNames(rest, area);
+
+        m.FilterExpr = PrgExpr.Parse(rest);
+        m.FilterText = NormalizeFilterText(rest);
+    }
+
+    /// <summary>VFP raises err 12 ("Variable 'X' is not found.") at SET FILTER TO time for a name that is
+    /// neither a field of the current table nor a memvar/array/#define. microVFP's expression engine silently
+    /// coerces an unknown identifier to <c>.NULL.</c> (no throw), so we scan the filter text's BARE
+    /// identifiers — outside string literals, not a function call (not followed by '('), not a dotted operator
+    /// / logical constant — and raise the same typed error for the first unknown one. Only ever runs on the
+    /// SET FILTER path, so a conservative miss cannot affect any other command.</summary>
+    private void ValidateFilterNames(string exprText, int area)
+    {
+        var wa = Session.AreaAt(area);
+        foreach (var name in BareFilterIdentifiers(exprText))
+        {
+            if (wa is not null && ColumnIndex(wa.Table, name) >= 0) continue;   // a field of the current table.
+            if (Memory.IsDefined(name) || Memory.FindArray(name) is not null) continue;   // a memvar / array.
+            if (_defines.ContainsKey(name)) continue;                           // a #DEFINE constant.
+            if (name.Equals("_triggerlevel", StringComparison.OrdinalIgnoreCase)) continue;
+            throw new MicroVfpRuntimeException($"Variable '{name.ToUpperInvariant()}' is not found.", 12);
+        }
+    }
+
+    // The VFP logical/operator words that are NOT variable references (so an identifier scan must skip them);
+    // the dotted forms (.AND./.OR./.NOT./.T./.F./.NULL./.Y./.N.) are also skipped via the preceding-dot test.
+    private static readonly HashSet<string> FilterReservedWords = new(StringComparer.OrdinalIgnoreCase)
+    { "AND", "OR", "NOT", "T", "F", "Y", "N", "NULL" };
+
+    /// <summary>Enumerate the BARE identifiers of a filter expression eligible to be a field/variable
+    /// reference: a maximal <c>[A-Za-z_][A-Za-z0-9_]*</c> run that is OUTSIDE a string literal
+    /// (<c>"…"</c>/<c>'…'</c>/<c>[…]</c>), NOT immediately followed by <c>(</c> (a function call), NOT
+    /// immediately preceded by <c>.</c> or <c>-&gt;</c> (a dotted operator / an <c>alias-&gt;field</c> tail),
+    /// NOT the alias part of an <c>alias.field</c> qualifier, and not a reserved logical word.</summary>
+    private static IEnumerable<string> BareFilterIdentifiers(string expr)
+    {
+        for (int i = 0; i < expr.Length; i++)
+        {
+            char c = expr[i];
+            if (c == '"' || c == '\'' || c == '[')     // skip a string literal wholesale.
+            {
+                char close = c == '[' ? ']' : c;
+                i++;
+                while (i < expr.Length && expr[i] != close) i++;
+                continue;
+            }
+            if (char.IsAsciiLetter(c) || c == '_')
+            {
+                int start = i;
+                while (i < expr.Length && (char.IsAsciiLetterOrDigit(expr[i]) || expr[i] == '_')) i++;
+                string ident = expr.Substring(start, i - start);
+                // Look one char ahead (skipping spaces) for a call '(' or a member '.'/alias qualifier — those
+                // make the ident a function name or an alias, not a bare field/variable reference.
+                int j = i; while (j < expr.Length && expr[j] == ' ') j++;
+                char next = j < expr.Length ? expr[j] : '\0';
+                char prev = start > 0 ? expr[start - 1] : '\0';
+                i--;                                    // the for-loop's i++ re-consumes the terminator.
+                if (next == '(') continue;              // FUNC(… ) — a function call, not a variable.
+                if (next == '.') continue;              // alias.field / .AND.-style — the alias/keyword head.
+                if (next == '-' && j + 1 < expr.Length && expr[j + 1] == '>') continue;   // alias->field head.
+                if (prev == '.') continue;              // .field tail / .AND. keyword — not a bare name.
+                if (prev == '>' && start > 1 && expr[start - 2] == '-') continue;   // alias->field tail.
+                if (FilterReservedWords.Contains(ident)) continue;
+                yield return ident;
+            }
+        }
+    }
+
+    /// <summary>Re-render a filter expression the way VFP's <c>FILTER()</c>/<c>SET("FILTER")</c> reports it for
+    /// the simple predicates the pins use: identifiers/keywords UPPER-cased and ALL whitespace stripped
+    /// OUTSIDE string literals, with single-quoted literals re-emitted double-quoted (oracle-pinned:
+    /// <c>cat = "A"</c> → <c>CAT="A"</c>, <c>  cat  =  'A'</c> → <c>CAT="A"</c>). VFP's full decompiler also
+    /// canonicalises operators (<c>&gt;=</c>→<c>=&gt;</c>, <c>AND</c>→<c>.AND.</c>); those forms are avoided in
+    /// the pinned FILTER()-text expressions, so this focused normaliser reproduces them exactly.</summary>
+    private static string NormalizeFilterText(string expr)
+    {
+        var sb = new StringBuilder(expr.Length);
+        for (int i = 0; i < expr.Length; i++)
+        {
+            char c = expr[i];
+            if (c == '"' || c == '\'' || c == '[')     // copy a string literal verbatim; normalise the delimiter.
+            {
+                char close = c == '[' ? ']' : c;
+                int start = i + 1;
+                int end = start;
+                while (end < expr.Length && expr[end] != close) end++;
+                string body = expr.Substring(start, Math.Min(end, expr.Length) - start);
+                // VFP re-emits with double quotes when the body carries none (E6: 'A' → "A"); otherwise keep
+                // single quotes so a body containing " stays representable.
+                char delim = body.IndexOf('"') < 0 ? '"' : '\'';
+                sb.Append(delim).Append(body).Append(delim);
+                i = end;                               // skip past the closing delimiter.
+                continue;
+            }
+            if (char.IsWhiteSpace(c)) continue;        // strip whitespace OUTSIDE literals.
+            sb.Append(char.ToUpperInvariant(c));
+        }
+        return sb.ToString();
+    }
+
     /// <summary>Open the controlling (master) ORDER of <paramref name="area"/> across the FULL open index
     /// set (structural <c>.cdx</c>, extra <c>.cdx</c>, standalone <c>.idx</c>), or null when none is active.
     /// The caller MUST dispose the result (it may own a temp file handle).</summary>
@@ -493,6 +619,15 @@ public sealed partial class VfpInterpreter
         public VfpValue? SourceType;     // CURSORGETPROP/SETPROP("SourceType").
         public string? DatabaseProp;     // CURSORGETPROP/SETPROP("Database").
 
+        // ── SET FILTER (per-area record-visibility predicate; feeds Visible()) ──
+        // The filter lives HERE, in per-area state, so it follows USE (fresh AreaMeta) / close (Meta removed)
+        // in lockstep and swaps with the data session (the whole _meta map swaps — 5.14). Bare SET FILTER TO
+        // clears both fields. FilterExpr is the parsed predicate evaluated against each record as navigation
+        // touches it; FilterText is the VFP-normalised text FILTER()/SET("FILTER") report (upper-cased,
+        // whitespace-stripped — e.g. `cat = "A"` → `CAT="A"`, oracle-pinned).
+        public PrgExpr? FilterExpr;     // the parsed filter predicate (null ⇒ no filter on this area).
+        public string? FilterText;      // FILTER()/SET("FILTER") text (VFP-normalised); null ⇒ no filter.
+
         // ── SET KEY (master-index key-range scope; microVFP P1 gap #1) ──
         public bool KeySet;             // a SET KEY range is active on this area's master index.
         public bool KeyRange;           // true ⇒ [KeyLow, KeyHigh] range; false ⇒ single-value match.
@@ -552,17 +687,68 @@ public sealed partial class VfpInterpreter
         }
         if (_ctx.Deleted && wa.Table.IsRecordDeleted(rec - 1))
             return false;
-        // SET KEY: only records whose MASTER-index key falls in the active key range are visible.
-        // The visible set is derived from the controlling tag's entries once, then cached (invalidated
-        // on a data change / order change / SET KEY change). Use TryGetValue — never Meta() — to avoid
-        // re-entering GoTop while a navigation loop is already inside Visible().
-        if (_meta.TryGetValue(wa.Area, out var m) && m.KeySet)
+        // SET KEY / SET FILTER: per-area visibility gates layered on top of SET DELETED, composing by AND
+        // (a record shows only when NOT deleted-hidden AND in the SET KEY range AND the filter passes). Use
+        // TryGetValue — never Meta() — to avoid re-entering GoTop while a navigation loop is already inside
+        // Visible(). Both gates apply to ON-DISK records only; buffered appended rows returned above.
+        if (_meta.TryGetValue(wa.Area, out var m))
         {
-            m.KeyVisible ??= BuildKeyVisible(wa, m);
-            if (!m.KeyVisible.Contains(rec))
+            // SET KEY: only records whose MASTER-index key falls in the active key range are visible. The
+            // visible set is derived from the controlling tag's entries once, then cached (invalidated on a
+            // data change / order change / SET KEY change).
+            if (m.KeySet)
+            {
+                m.KeyVisible ??= BuildKeyVisible(wa, m);
+                if (!m.KeyVisible.Contains(rec))
+                    return false;
+            }
+            // SET FILTER: the area's filter predicate is the FINAL visibility gate — evaluated against this
+            // record through the expression engine (PassesFilter). Kept last because it is the costliest
+            // check (a full expression evaluation) and the cheap deleted/key gates have already run. A direct
+            // GOTO <n> / RECNO() / RECCOUNT() bypass Visible() entirely, so they still land on / count a
+            // filtered-out row (VFP9-verified).
+            if (m.FilterExpr is not null && !PassesFilter(wa, m, rec))
                 return false;
         }
         return true;
+    }
+
+    // Re-entrancy guard for SET FILTER evaluation: while a filter predicate is being evaluated, any nested
+    // Visible() call (a filter UDF that itself navigates) treats records as visible so it can never recurse
+    // into the same filter. Single flag (not per-area) — a filter that navigates a DIFFERENT area during its
+    // own evaluation is a pathological edge; short-circuiting its filter there is acceptable and terminates.
+    private bool _inFilterEval;
+
+    /// <summary>Evaluate the area's <c>SET FILTER</c> predicate against record <paramref name="rec"/> WITHOUT
+    /// disturbing the user-visible pointer: temporarily re-base the pointer (and, only when the filter's area
+    /// is not current, select it) so the engine resolves the filter's bare field references against
+    /// <paramref name="rec"/> of <paramref name="wa"/>, evaluate, then restore everything. A non-logical /
+    /// <c>.NULL.</c> result (or any runtime eval failure) HIDES the record — VFP filter semantics; navigation
+    /// never throws out of Visible(). The pointer/cache save-restore mirrors <see cref="ExecCopyToArray"/>'s
+    /// scan probe.</summary>
+    private bool PassesFilter(VfpSession.WorkArea wa, AreaMeta m, int rec)
+    {
+        if (_inFilterEval) return true;                 // nested filter eval ⇒ treat as visible (never recurse).
+        int savArea = Session.CurrentArea;
+        int savRec = m.RecNo; bool savEof = m.Eof, savBof = m.Bof;
+        var savCached = m.Cached; int savCachedRec = m.CachedRec;
+        _inFilterEval = true;
+        try
+        {
+            if (wa.Area != savArea) Session.SelectArea(wa.Area);   // bare fields must resolve against wa's area.
+            m.RecNo = rec; m.Eof = false; m.Bof = false; m.Cached = null;
+            VfpValue v;
+            try { v = Eval(m.FilterExpr!); }
+            catch { return false; }                     // a runtime failure hides the row (never escapes navigation).
+            return Truth(v);
+        }
+        finally
+        {
+            _inFilterEval = false;
+            m.RecNo = savRec; m.Eof = savEof; m.Bof = savBof;
+            m.Cached = savCached; m.CachedRec = savCachedRec;
+            if (wa.Area != savArea) Session.SelectArea(savArea);
+        }
     }
 
     /// <summary>Resolve the active index tag for <paramref name="area"/> (from <see cref="AreaMeta.Order"/>),
@@ -749,9 +935,29 @@ public sealed partial class VfpInterpreter
         m.OldVals = null;                 // a record move re-bases the OLDVAL() buffer (per-record buffering).
         if (recno is uint r && r >= 1 && r <= (uint)wa.Table.RecordCount)
         {
-            m.RecNo = (int)r; m.Eof = false; m.Bof = false; m.Found = true; m.Cached = null;
+            int hit = (int)r;
+            // A direct index hit is NOT exempt from the central Visible() gate (SET DELETED / SET KEY /
+            // SET FILTER): when the hit record is hidden VFP does not stop on it — the SEEK command / SEEK()
+            // advance through the remaining index entries that STILL match the seek key to the first visible
+            // one, exactly like the deleted-record skip. When every matching entry is hidden the pointer parks
+            // at EOF with FOUND()=.F. and RECNO()=RECCOUNT()+1 (VFP9-verified). Relation repositioning
+            // (relationSeek) keeps its own established semantics and is deliberately left untouched.
+            if (!relationSeek && !Visible(wa, hit))
+            {
+                int vis = FirstVisibleSeekMatch(src, key, wa);
+                if (vis >= 1)
+                {
+                    m.RecNo = vis; m.Eof = false; m.Bof = false; m.Found = true; m.Cached = null;
+                    var ordv = ActiveOrder(area);
+                    if (ordv is not null) m.OrderPos = ordv.IndexOf(vis);
+                    return true;
+                }
+                m.RecNo = wa.Table.RecordCount + 1; m.Eof = true; m.Bof = false; m.Found = false; m.Cached = null;
+                return false;
+            }
+            m.RecNo = hit; m.Eof = false; m.Bof = false; m.Found = true; m.Cached = null;
             var ord = ActiveOrder(area);
-            if (ord is not null) m.OrderPos = ord.IndexOf((int)r);
+            if (ord is not null) m.OrderPos = ord.IndexOf(hit);
             return true;
         }
 
@@ -769,6 +975,44 @@ public sealed partial class VfpInterpreter
             }
         }
         m.RecNo = wa.Table.RecordCount + 1; m.Eof = true; m.Found = false; m.Cached = null;
+        return false;
+    }
+
+    /// <summary>After a SEEK index hit lands on a record HIDDEN by the central <see cref="Visible"/> gate
+    /// (SET DELETED / SET KEY / SET FILTER), find the first VISIBLE record among the index entries that still
+    /// MATCH the seek key — walking the controlling order. This extends VFP's deleted-record skip to every
+    /// visibility gate. Returns the recno, or −1 when every matching entry is hidden (⇒ the caller parks the
+    /// pointer at EOF with FOUND()=.F.). Works over a CDX tag OR a standalone <c>.idx</c> source.</summary>
+    private int FirstVisibleSeekMatch(OrderSource src, VfpValue key, VfpSession.WorkArea wa)
+    {
+        foreach (var (keyBytes, recno) in OrderedEntries(src))
+        {
+            if (recno < 1 || recno > wa.Table.RecordCount) continue;
+            if (!SeekEntryMatches(keyBytes, key, src)) continue;
+            if (Visible(wa, recno)) return recno;
+        }
+        return -1;
+    }
+
+    /// <summary>Does an index entry's stored key MATCH the SEEK needle the same way <see cref="DoSeekCore"/>'s
+    /// hit did? Character keys match by PREFIX (mirroring the raw-byte prefix seek DoSeekCore issues); every
+    /// other type matches by VALUE equality. Used to walk the equal-key run when the first hit is
+    /// filtered/deleted out.</summary>
+    private static bool SeekEntryMatches(byte[] keyBytes, VfpValue key, OrderSource src)
+    {
+        if (src.CdxTag is { } t)
+        {
+            if (t.IsCharacterKey && key.Type == VfpType.Character)
+            {
+                var needle = Encoding.Latin1.GetBytes(key.AsString);
+                if (keyBytes.Length < needle.Length) return false;
+                for (int i = 0; i < needle.Length; i++) if (keyBytes[i] != needle[i]) return false;
+                return true;
+            }
+            return CompareDecodedToValue(IndexKey.Decode(keyBytes, t.KeyType), t.KeyType, key) == 0;
+        }
+        if (src.Idx is not null)
+            return SeekValueMatches(IndexKey.Decode(keyBytes, src.IdxKeyType), src.IdxKeyType, key);
         return false;
     }
 

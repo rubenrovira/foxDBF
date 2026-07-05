@@ -77,8 +77,8 @@ public sealed partial class VfpInterpreter
     // excludes deleted rows; SET DELETED OFF indexes them too (VFP keeps their CDX entries until PACK).
     // The live SET EXACT / SET ANSI ride along into the KEY/FOR expression evaluation (via _ctx) so a
     // character `=` in a FOR/KEY filters exactly as a VFP run would. A FOR clause is honoured by the
-    // builder. SET FILTER is not modelled in microVFP, so it cannot narrow the build set — FLAG if a
-    // corpus case ever needs it.
+    // builder. SET FILTER (now modelled — see SetFilter/Visible) deliberately does NOT narrow the build set:
+    // VFP's INDEX ON builds over every record regardless of the active filter, so the builder ignores it too.
     private void ExecIndex(IndexStmt ix)
     {
         int area = Session.CurrentArea;

@@ -855,6 +855,7 @@ public sealed partial class VfpInterpreter
             case "UNIQUE": Runtime.Unique = OnOff(arg); break;  // session default for a clause-less INDEX; SET("UNIQUE").
             case "MULTILOCKS": Runtime.Multilocks = OnOff(arg); break; // OFF ⇒ a new RLOCK releases the prior record lock; SET("MULTILOCKS").
             case "KEY": SetKey(arg); break;                     // master-index visible key range; feeds Visible().
+            case "FILTER": SetFilter(arg); break;               // per-area record-visibility predicate; feeds Visible(); FILTER()/SET("FILTER").
             case "NEAR": _setNear = OnOff(arg); break;          // failed-SEEK pointer parking; SET("NEAR").
             case "NULL": _ctx.NullSetting = OnOff(arg); break;  // CREATE/ALTER TABLE default nullability; SET("NULL").
             case "AUTOSAVE": _setAutosave = OnOff(arg); break;  // header-buffer flush policy; SET("AUTOSAVE").

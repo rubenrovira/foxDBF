@@ -144,7 +144,10 @@ interp.ReleaseDataSession(s2);                 // ASESSIONS()/AUSED() enumerate 
   (`DO proc WITH args`) passing.
 - **Data access**: `USE`/`SELECT` work areas, `SEEK`/`GO`/`SKIP`,
   `LOCATE`/`CONTINUE` (full `FOR`/`WHILE` + scope, evaluated in the work area's current index order,
-  with per-area `CONTINUE` state), `REPLACE`/`DELETE`/`RECALL`/`INSERT`, `GATHER`/`SCATTER`,
+  with per-area `CONTINUE` state), `SET FILTER TO` (a per-work-area record-visibility predicate honoured
+  by every navigation and scan — `GO TOP`/`BOTTOM`, `SKIP`, `LOCATE`/`CONTINUE`, `SCAN`, `SUM` — composed
+  with `SET DELETED`/`SET KEY`; a direct `GOTO`/`RECNO()`/`RECCOUNT()` bypasses it, matching VFP; read back
+  with `FILTER()`/`SET("FILTER")`), `REPLACE`/`DELETE`/`RECALL`/`INSERT`, `GATHER`/`SCATTER`,
   `APPEND FROM`/`COPY TO` (`.dbf`), `PACK`, `SUM`/`TOTAL`, `BEGIN`/`END TRANSACTION`/`ROLLBACK`
   (copy-on-write), and an embedded VFP-SQL `SELECT` (routed through the same
   [SQL engine](03-sql-and-ado-net.md) as everything else).
@@ -266,6 +269,7 @@ not a context-free default), and take precedence over any same-named generic fun
 | `SETFLDSTATE()`, `GETNEXTMODIFIED()` | set a field/row edit state / walk the modified rows in a buffer |
 | `HEADER()`, `RECNO()`, `RECCOUNT()`, `LUPDATE()` | header size / record pointer / count / last-update date |
 | `EOF()`, `BOF()`, `FOUND()`, `DELETED()` | |
+| `FILTER()` | the current (or `FILTER(nArea)`) work area's `SET FILTER` expression text, VFP-normalised (`"CAT=\"A\""`) — `""` when none |
 | `SEEK()`, `LOOKUP()` | function-form seek / seek-and-return-a-field |
 | `RELATION()`, `TARGET()` | read back a work area's `SET RELATION` links |
 | `CURSORGETPROP()`, `CURSORSETPROP()`, `GETFLDSTATE()` | the buffering model (`Buffering` 1-5, field/row state) |
