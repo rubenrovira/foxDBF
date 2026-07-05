@@ -121,19 +121,26 @@ public sealed class CdxTag
         if (keyBytes.Length == 0)
             return NotFound;
 
-        // Descend to the left-most leaf, then walk the (ascending) leaf chain
-        // comparing with UNSIGNED byte order; the first key that carries the seek
-        // bytes as a prefix is the answer (prefix seek allowed). Reusing the shared,
-        // strictly-defensive ascending traversal keeps this from ever throwing.
+        // O(log n) SEEK: descend the B-tree to the leaf that holds the first key >= the needle
+        // (EnumerateFrom → DescendToLeaf), then walk the ascending leaf chain FORWARD from there
+        // comparing with UNSIGNED byte order; the first key that carries the seek bytes as a prefix
+        // is the answer (prefix seek allowed). This yields byte-for-byte the SAME match the earlier
+        // left-most-leaf full scan produced: every key BEFORE the descent leaf sorts strictly below
+        // the needle (DescendToLeaf lands on the first subtree whose MAX key >= the needle, so all
+        // earlier keys are < needle and could never match), and the forward walk decodes+compares
+        // the same entries the old scan would have — it merely SKIPS the O(n) leading run instead of
+        // decoding every entry from key 1. DescendToLeaf errs left (never past a match), so the walk
+        // is complete. SEEK matches ascending key BYTES regardless of the tag's logical order, so a
+        // DESCENDING tag is handled identically to the old ascending scan. Strictly defensive:
+        // EnumerateFrom terminates (never throws) on a malformed node or a corrupt sibling cycle.
         var needle = keyBytes.ToArray();
-        foreach (var (recno, key) in IndexTraversal.EnumerateCompact(
-                     _index, RootPageOffset, KeyLength, IsCharacterKey))
+        foreach (var entry in EnumerateFrom(needle))
         {
-            int cmp = ComparePrefix(needle, key, exact);
+            int cmp = ComparePrefix(needle, entry.Key, exact);
             if (cmp == 0)
-                return recno;     // (prefix) match → first matching record
+                return entry.RecordNumber;   // (prefix) match → first matching record
             if (cmp < 0)
-                break;            // passed where the key would sort: absent
+                break;                        // passed where the key would sort: absent
         }
 
         return NotFound;
