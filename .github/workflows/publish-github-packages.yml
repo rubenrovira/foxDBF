@@ -1,0 +1,51 @@
+name: Publish to GitHub Packages
+
+# Publishes the 3 public packages (CrossVault.FoxDbf, CrossVault.FoxDbf.Data, CrossVault.FoxDbf.MicroVfp)
+# to THIS repo's GitHub Packages registry (nuget.pkg.github.com/crossvault) — that is what populates the
+# "Packages" box on the repo page. Runs on every main push with --skip-duplicate, so a new <Version> in
+# the csprojs appears right after the sync lands and a re-run on an unchanged version is a no-op.
+#
+# This is deliberately SEPARATE from publish-nuget.yml (nuget.org via Trusted Publishing, tag-triggered):
+# GitHub Packages needs only the ephemeral per-run GITHUB_TOKEN (packages: write below) — no PAT, no
+# secret, no nuget.org policy — so the two release paths cannot interfere with each other. nuget.org
+# stays the canonical consumer registry; this one exists for repo-page visibility + GH-native consumers.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {} # first deliberate publish / manual re-run
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-github-packages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      # Paths are repo-root-relative (this runs in the public mirror, whose root IS public/'s content).
+      # Expressions is IsPackable=false (it ships inside the Core package) — pack the 3 real packages.
+      - name: Pack
+        run: |
+          dotnet pack src/CrossVault.FoxDbf/CrossVault.FoxDbf.csproj -c Release -o packed
+          dotnet pack src/CrossVault.FoxDbf.Data/CrossVault.FoxDbf.Data.csproj -c Release -o packed
+          dotnet pack src/CrossVault.FoxDbf.MicroVfp/CrossVault.FoxDbf.MicroVfp.csproj -c Release -o packed
+
+      - name: Push to GitHub Packages
+        run: |
+          dotnet nuget push "packed/*.nupkg" \
+            --source "https://nuget.pkg.github.com/crossvault/index.json" \
+            --api-key "${{ secrets.GITHUB_TOKEN }}" \
+            --skip-duplicate
