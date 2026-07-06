@@ -12,7 +12,9 @@ using var w = DbfWriter.Create("people.dbf", new[]
 {
     new DbfColumnDef("NAME", 'C', 30),
     new DbfColumnDef("AGE",  'I', 4),
-}, new DbfCreateOptions { Overwrite = true });
+    // LockMode.Shared so a separate DbfTable reader can coexist while this writer is still open
+    // (used by the "indexes stay current" query demo below). The default is Exclusive — see PACK/ZAP.
+}, new DbfCreateOptions { Overwrite = true, LockMode = LockMode.Shared });
 
 int recNo1 = w.AppendRecord(new Dictionary<string, object?> { ["NAME"] = "Ada", ["AGE"] = 36 });
 int recNo2 = w.AppendRecord("Grace", 38);   // positional overload, columns in declared order
@@ -20,7 +22,10 @@ int recNo2 = w.AppendRecord("Grace", 38);   // positional overload, columns in d
 
 `DbfWriter.Create` picks the on-disk version byte based on the features you use (Memo/Varchar
 columns bump it up automatically); `DbfCreateOptions.Overwrite` controls whether an existing file
-at that path is replaced.
+at that path is replaced. By default it opens the new table **`LockMode.Exclusive`** (VFP parity —
+`CREATE TABLE` opens the table `EXCLUSIVE`, which is what lets you `PACK`/`ZAP`/`INDEX` it right away;
+see below). This example opts into `LockMode.Shared` only because it keeps the writer open while a
+second `DbfTable` reader coexists in the query demo below.
 
 ## Build a `.cdx` index
 
@@ -86,25 +91,26 @@ w.Pack();   // physically removes all flagged records and rebuilds the memo file
 // w.Zap(); // removes all records while keeping the table structure
 ```
 
-If you create the table in the same session, create the writer with exclusive locking before
-compaction:
+If you create the table in the same session you can compact it straight away — `DbfWriter.Create`
+opens the new table `LockMode.Exclusive` **by default**, so `PACK`/`ZAP` work with no extra options:
 
 ```csharp
 using var w = DbfWriter.Create("scratch.dbf", new[]
 {
     new DbfColumnDef("NAME", 'C', 30),
-}, new DbfCreateOptions
-{
-    Overwrite = true,
-    LockMode = LockMode.Exclusive,
-});
+}, new DbfCreateOptions { Overwrite = true });   // LockMode defaults to Exclusive
 
-w.Zap();
+w.AppendRecord("Ada");
+w.Delete(0);
+w.Zap();   // no extra options needed — the freshly created writer is already exclusive
 ```
 
 `PACK` and `ZAP` are real structural rewrites (like Visual FoxPro's own commands) and require
-`LockMode.Exclusive`. A default/shared writer refuses before touching the file and throws
-`DbfWriteException` with VFP error number `110` ("File must be opened exclusively.").
+`LockMode.Exclusive`. `DbfWriter.Create` supplies that by default; `DbfWriter.Open` still defaults to
+`LockMode.Shared`, so open an **existing** table with `LockMode.Exclusive` when you intend to compact
+it (as in the `DbfWriter.Open` example above). A shared writer — one opened, or explicitly created,
+with `LockMode.Shared` — refuses before touching the file and throws `DbfWriteException` with VFP error
+number `110` ("File must be opened exclusively.").
 
 With `PACK`, record numbers of surviving records can shift. `PACK`/`ZAP` also invalidate the
 structural `.cdx` sidecar because record-number keys can become stale; rebuild indexes afterward

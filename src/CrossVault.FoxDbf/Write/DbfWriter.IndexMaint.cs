@@ -137,22 +137,47 @@ public sealed partial class DbfWriter
             return true;
         }
 
-        FileStream rw = OpenCdxReadWrite();
-        var editor = new CdxTreeEditor(rw);
-        if (mode == CdxMaintMode.Append)
-            editor.BeginAppendRun();
-        if (!TryResolveComputers(editor, out var plans))
+        // Ownership stays with these locals until the cache fields below take it. try/finally guarantees
+        // that ANY early exit before the hand-off — an un-derivable tag (return false), OR a throw from the
+        // CdxTreeEditor ctor / BeginAppendRun / TryResolveComputers — disposes the open .cdx stream + editor.
+        // A leaked read/write handle here is exactly what would block the invalidation DELETE the caller runs
+        // in its catch (the sidecar could not be removed, so it would linger valid-looking-but-stale).
+        FileStream? rw = null;
+        CdxTreeEditor? editor = null;
+        try
         {
-            editor.Dispose();
-            rw.Dispose();
-            return false;
+            rw = OpenCdxReadWrite();
+            FailCdxMaintEditorForTests?.Invoke();   // test seam: simulate a CdxTreeEditor ctor throw (else no-op).
+            editor = new CdxTreeEditor(rw);
+            if (mode == CdxMaintMode.Append)
+                editor.BeginAppendRun();
+            if (!TryResolveComputers(editor, out var plans))
+                return false;   // finally disposes editor + rw (ownership not handed off).
+
+            // Hand ownership to the cache, then null the locals so finally leaves the live handles open.
+            _cdxMaintStream = rw;
+            _cdxMaintEditor = editor;
+            _cdxMaintPlans = plans;
+            _cdxMaintMode = mode;
+            rw = null;
+            editor = null;
+            return true;
         }
-        _cdxMaintStream = rw;
-        _cdxMaintEditor = editor;
-        _cdxMaintPlans = plans;
-        _cdxMaintMode = mode;
-        return true;
+        finally
+        {
+            editor?.Dispose();
+            rw?.Dispose();
+        }
     }
+
+    /// <summary>Test-only fault-injection seam (§6.2b): when non-null it is invoked inside
+    /// <see cref="EnsureCdxMaint"/> immediately AFTER the read/write <c>.cdx</c> stream is opened but BEFORE
+    /// ownership is handed to the maintenance cache — letting a regression test simulate a
+    /// <see cref="CdxTreeEditor"/> ctor throw and prove the try/finally disposes the stream (no leaked handle
+    /// blocks the subsequent invalidation delete). <see cref="ThreadStaticAttribute"/> so a hook set by one
+    /// test thread never trips maintenance on another (xUnit parallelism). Always <c>null</c> in production.</summary>
+    [ThreadStatic]
+    internal static Action? FailCdxMaintEditorForTests;
 
     private void PrepareCdxMaintMode(CdxMaintMode mode)
     {

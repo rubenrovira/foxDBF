@@ -6,11 +6,13 @@ namespace CrossVault.FoxDbf.Write;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <see cref="Shared"/> is the default: the file is opened
-/// <see cref="System.IO.FileShare.ReadWrite"/> and every mutating operation brackets its
-/// write with the exact CodeBase/VFP byte-range lock (record / append / file), so a .NET
+/// <see cref="Shared"/> is the default when OPENING an existing table (<see cref="DbfOptions"/>):
+/// the file is opened <see cref="System.IO.FileShare.ReadWrite"/> and every mutating operation
+/// brackets its write with the exact CodeBase/VFP byte-range lock (record / append / file), so a .NET
 /// writer can coexist with a running VFP application on the same table. This is the safe
-/// choice for multi-process access.
+/// choice for multi-process access. (Note: <see cref="DbfCreateOptions"/> — i.e. <c>DbfWriter.Create</c>
+/// — instead defaults to <see cref="Exclusive"/>, matching VFP where <c>CREATE TABLE</c> opens the new
+/// table exclusively.)
 /// </para>
 /// <para>
 /// <see cref="Exclusive"/> opens the file <see cref="System.IO.FileShare.None"/> — no other
@@ -23,8 +25,9 @@ public enum LockMode
 {
     /// <summary>
     /// Open <see cref="System.IO.FileShare.ReadWrite"/> and acquire/release the VFP byte-range
-    /// locks around each mutation (record / append / file). The default — enables coexistence
-    /// with a running VFP runtime.
+    /// locks around each mutation (record / append / file). The default when opening an existing
+    /// table — enables coexistence with a running VFP runtime. (<c>DbfWriter.Create</c> defaults to
+    /// <see cref="Exclusive"/> instead — VFP parity.)
     /// </summary>
     Shared = 0,
 

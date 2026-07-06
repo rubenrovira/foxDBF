@@ -121,6 +121,16 @@ public sealed class CdxFile : IDisposable
                 continue;
 
             var hdr = _index.ReadCdxHeader(headerOffset);
+
+            // §6.6 fail-closed: a truncated / corrupt tag header returns default(CdxHeader), whose
+            // KeyExpression is null (its KEY/FOR pool ran past EOF — see IndexFile.ReadCdxHeader). Treat that
+            // ONE tag as genuinely ABSENT (Tag(name) → null) and keep parsing the HEALTHY sibling tags, rather
+            // than building a CdxTag from a null expression (which would NRE in ResolveIsCharacterKey and, via
+            // the ctor catch, rethrow — aborting the whole index open and violating this class's "never throws
+            // on a malformed index" contract).
+            if (hdr.KeyExpression is null)
+                continue;
+
             bool isChar = ResolveIsCharacterKey(hdr.KeyExpression);
             var keyType = IndexKey.ResolveType(hdr.KeyExpression, _table);
 
@@ -160,7 +170,9 @@ public sealed class CdxFile : IDisposable
     /// </summary>
     private bool ResolveIsCharacterKey(string keyExpression)
     {
-        if (_table is null)
+        // Null-guard the expression too (defense in depth, mirroring IndexKey.ResolveType): a fail-closed
+        // truncated tag carries a null KeyExpression, and Trim() on it would NRE.
+        if (_table is null || keyExpression is null)
             return false;
 
         string field = keyExpression.Trim();

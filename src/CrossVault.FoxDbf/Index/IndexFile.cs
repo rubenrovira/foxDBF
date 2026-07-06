@@ -86,14 +86,21 @@ public sealed class IndexFile : IDisposable
         ushort keyExprLength = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(510));
 
         int wanted = PageSize + keyExprLength + forExprLength;
+
+        // FAIL CLOSED (§6.6): a legit CDX always stores its FULL KEY/FOR expression pool inline right after
+        // the header page. If the declared pool extends past EOF the tag is truncated/corrupt — clamping and
+        // parsing the zero-filled remainder would mis-read it as a VALID but silently SHORTENED expression
+        // (a real risk on a partially-written / damaged sidecar). Treat the tag as unusable instead, matching
+        // this reader's own doctrine of never silently parsing zero-filled fields.
+        if (byteOffset + (long)wanted > Length)
+            return default;
+
         var buf = new byte[wanted];
 
-        // Reuse the already-validated 512-byte header; only read the trailing
-        // expression pool. A failed pool read is a real I/O fault (not EOF), so
-        // return default rather than silently parsing zero-filled fields.
+        // Reuse the already-validated 512-byte header; only read the trailing expression pool. A failed pool
+        // read is a real I/O fault (not EOF), so return default rather than silently parsing zero-filled fields.
         Buffer.BlockCopy(header, 0, buf, 0, PageSize);
-        int available = (int)Math.Min(wanted, Length - byteOffset);
-        int tail = available - PageSize;
+        int tail = wanted - PageSize;
         if (tail > 0 && !ReadExact(byteOffset + PageSize, buf.AsSpan(PageSize, tail)))
             return default;
 

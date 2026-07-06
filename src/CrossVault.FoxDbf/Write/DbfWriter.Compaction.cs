@@ -243,11 +243,17 @@ public sealed partial class DbfWriter
         if (!_hasStructuralCdx)
             return;
 
-        DeleteStructuralCdx(_stream.Name);
-        ClearStructuralCdxFlag();
+        // Flip the IN-MEMORY truth FIRST: from here on this writer must treat the structural .cdx as gone
+        // (ShouldMaintainIndexes → false via _hasStructuralCdx) and demand a REINDEX. Doing this BEFORE the
+        // best-effort disk steps means that even if the sidecar DELETE fails (a concurrent reader holds the
+        // .cdx) or ClearStructuralCdxFlag throws, maintenance never keeps editing an already-invalidated
+        // sidecar — the ShouldMaintainIndexes/ReindexNeeded semantics stay coherent regardless.
         _hasStructuralCdx = false;
         _usesStructuralScheme = VfpLock.UsesStructuralScheme(_version.Code, false);
         ReindexNeeded = true;
+
+        DeleteStructuralCdx(_stream.Name);
+        ClearStructuralCdxFlag();
     }
 
     /// <summary>

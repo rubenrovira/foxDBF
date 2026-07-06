@@ -112,8 +112,15 @@ public sealed record DbfCreateOptions
     /// </summary>
     public string? BacklinkPath { get; init; }
 
-    /// <summary>The concurrency strategy for the reopened writer (plan §D3). Default <see cref="Write.LockMode.Shared"/>.</summary>
-    public LockMode LockMode { get; init; } = LockMode.Shared;
+    /// <summary>
+    /// The concurrency strategy for the reopened writer (plan §D3). Default <see cref="Write.LockMode.Exclusive"/>
+    /// — VFP parity: <c>CREATE TABLE</c> opens the new table EXCLUSIVELY, so a freshly created table is
+    /// immediately PACK/ZAP/INDEX-able (the §D2 exclusivity gate is satisfied out of the box). Pass
+    /// <see cref="Write.LockMode.Shared"/> explicitly when a second handle must coexist with the writer while
+    /// it is still open (that stays fully supported); on <see cref="DbfWriter.Dispose"/> the file becomes a
+    /// normal on-disk table either way.
+    /// </summary>
+    public LockMode LockMode { get; init; } = LockMode.Exclusive;
 
     /// <summary>Optional explicit encoding override for the reopened writer (else resolved from the code page).</summary>
     public Encoding? Encoding { get; init; }
