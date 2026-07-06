@@ -33,7 +33,7 @@ namespace CrossVault.FoxDbf.MicroVfp;
 /// layer swaps on commit/rollback, so a persistent handle could straddle a file swap — there we fall back
 /// to the transient per-write writer (byte-identical to the pre-5.5 path). A PRG <c>BEGIN TRANSACTION</c>
 /// (the <c>_txn</c> snapshot stack) DOES cache: the cached writer is disposed before any whole-file
-/// <see cref="RestoreSnapshot"/> rewrite so <c>File.WriteAllBytes</c> is never blocked.
+/// <see cref="RestoreSnapshot"/> rewrite so the <c>File.Copy</c> from the temp pre-image is never blocked.
 /// </para>
 /// </summary>
 public sealed partial class VfpInterpreter
@@ -190,9 +190,10 @@ public sealed partial class VfpInterpreter
     /// Force-dispose the cached writer for <paramref name="path"/> EVEN WHEN it holds an explicit
     /// RLOCK/FLOCK byte-range lock — for an OUT-OF-BAND whole-file rewrite (a rollback
     /// <see cref="RestoreSnapshot"/> / CANDIDATE-index <c>RollbackFiles</c> / an EXCLUSIVE index rebuild)
-    /// that DEPENDS on the OS handle actually closing: a pinned handle would make
-    /// <see cref="File.WriteAllBytes(string, byte[])"/> (FileShare.Read) or an <see cref="LockMode.Exclusive"/>
-    /// reopen (FileShare.None) throw a sharing violation — which the rewrite's <c>catch{}</c> would then
+    /// that DEPENDS on the OS handle actually closing: a pinned handle would make the whole-file
+    /// <see cref="File.Copy(string, string, bool)"/> from the temp pre-image (its FileShare.None destination
+    /// open) or an <see cref="LockMode.Exclusive"/> reopen (FileShare.None) throw a sharing violation — which
+    /// the rewrite's <c>catch{}</c> would then
     /// SWALLOW, silently no-op'ing the revert (finding 5.13). Unlike <see cref="InvalidateCachedWriter"/>
     /// (whose <see cref="DbfWriter.HasHeldLocks"/> pin is correct ONLY for cached-writer churn), this closes
     /// the handle so the rewrite can proceed; <see cref="DbfWriter.Dispose"/> releases the OS locks. The
@@ -272,28 +273,63 @@ public sealed partial class VfpInterpreter
         _cachedWriters.Clear();
     }
 
-    /// <summary>Read a whole file into memory with <see cref="FileShare.ReadWrite"/> so a snapshot can be
-    /// taken WHILE a cached writer holds the file open (plain <c>File.ReadAllBytes</c> requests
-    /// FileShare.Read, which a live read/write handle denies). Returns null when the file is absent /
-    /// unreadable (same fail-soft contract as the old <c>try{ReadAllBytes}catch{}</c>).</summary>
-    private static byte[]? ReadAllBytesShared(string path)
+    // ── 6.3 rollback pre-images stream to TEMP FILES (not byte[] in RAM) ──────────────────────────────────
+    // The snapshot temp dir. ONE per interpreter (shared across data sessions — temp names are unique), created
+    // lazily on the first snapshot and deleted whole on session/interpreter dispose (a catch-all: each
+    // FileSnapshot.Cleanup already removes its own temps after commit/rollback, so the dir never grows across a
+    // long session). Null until the first CaptureSnapshot.
+    private string? _snapshotTempDir;
+
+    private string SnapshotTempDir => _snapshotTempDir ??= CreateSnapshotTempDir();
+
+    private static string CreateSnapshotTempDir()
     {
+        string dir = Path.Combine(Path.GetTempPath(), "cvfoxdbf-snap-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    /// <summary>Delete the whole snapshot temp dir — the session/interpreter-dispose catch-all (best-effort).</summary>
+    private void DeleteSnapshotTempDir()
+    {
+        if (_snapshotTempDir is null) return;
+        try { if (Directory.Exists(_snapshotTempDir)) Directory.Delete(_snapshotTempDir, recursive: true); }
+        catch { /* best-effort — a locked temp is dropped by the OS temp sweep */ }
+        _snapshotTempDir = null;
+    }
+
+    /// <summary>Test-only (6.3): the count of live rollback pre-image temp files in the snapshot temp dir
+    /// (0 before the first snapshot, or after the dir was deleted). A commit/rollback must leave this at 0 —
+    /// the guard that snapshots stream to files and are cleaned up (no orphan growth across a session).</summary>
+    internal int SnapshotTempFileCount()
+        => _snapshotTempDir is not null && Directory.Exists(_snapshotTempDir)
+            ? Directory.GetFiles(_snapshotTempDir).Length : 0;
+
+    /// <summary>Stream <paramref name="source"/> into a fresh temp file for a rollback pre-image and return the
+    /// temp path — or null when <paramref name="source"/> is ABSENT (fail-soft; a null on restore deletes any
+    /// companion that appeared, the <c>.dbf</c> is left untouched). Reads with <see cref="FileShare.ReadWrite"/>
+    /// so the copy can run WHILE a 5.5 cached writer holds the source open (a plain <c>File.Copy</c> requests
+    /// FileShare.Read, which a live read/write handle denies). 6.3: a copy failure on an EXISTING file THROWS —
+    /// a capture I/O failure must fail the write/txn honestly, never silently disable rollback (the old
+    /// <c>ReadAllBytesShared</c> swallowed it → a null pre-image → a no-op restore). A partial temp from a
+    /// mid-copy throw is deleted before rethrow so a failed capture leaks nothing.</summary>
+    private string? CopyToTempSnapshot(string source)
+    {
+        if (!File.Exists(source)) return null;
+        Directory.CreateDirectory(SnapshotTempDir);   // survive an external wipe of the dir mid-session.
+        string temp = Path.Combine(SnapshotTempDir, Guid.NewGuid().ToString("N") + Path.GetExtension(source));
         try
         {
-            if (!File.Exists(path)) return null;
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            long len = fs.Length;
-            var buf = new byte[len];
-            int off = 0;
-            while (off < buf.Length)
-            {
-                int n = fs.Read(buf, off, buf.Length - off);
-                if (n <= 0) break;
-                off += n;
-            }
-            return off == buf.Length ? buf : buf[..off];
+            using var src = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var dst = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            src.CopyTo(dst);
         }
-        catch { return null; }
+        catch
+        {
+            try { if (File.Exists(temp)) File.Delete(temp); } catch { /* best-effort partial cleanup */ }
+            throw;
+        }
+        return temp;
     }
 
     // ── parse / expression caches (pathology 4: re-lex per Execute, re-parse per row) ──

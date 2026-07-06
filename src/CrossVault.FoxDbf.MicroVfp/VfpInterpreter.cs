@@ -78,7 +78,28 @@ public sealed partial class VfpInterpreter
 
     // ── transactions (snapshot-and-restore over the live DBC tables; see §Transaktionen) ──
     private sealed class TxnFrame { public readonly Dictionary<string, FileSnapshot> Snaps = new(StringComparer.OrdinalIgnoreCase); }
-    private sealed class FileSnapshot { public string Path = ""; public byte[]? Dbf; public byte[]? Cdx; public byte[]? Fpt; }
+    // 6.3: a rollback pre-image streams the live .dbf/.cdx/.fpt to TEMP FILES (paths below) instead of holding
+    // them as byte[] in RAM — the old whole-file-into-memory capture cost up to ~3×2GB transient on a 2GB table.
+    // A field is null when that companion was ABSENT at capture (fail-soft); on restore a null path DELETES any
+    // companion that appeared (the .dbf itself is left untouched). Cleanup() deletes the temps and nulls the
+    // paths (idempotent) — run after every commit/rollback so the temp dir never grows across a long session.
+    private sealed class FileSnapshot
+    {
+        public string Path = "";
+        public string? DbfTemp;
+        public string? CdxTemp;
+        public string? FptTemp;
+        public void Cleanup()
+        {
+            TryDeleteTemp(DbfTemp); TryDeleteTemp(CdxTemp); TryDeleteTemp(FptTemp);
+            DbfTemp = CdxTemp = FptTemp = null;
+        }
+        private static void TryDeleteTemp(string? temp)
+        {
+            if (temp is null) return;
+            try { if (File.Exists(temp)) File.Delete(temp); } catch { /* best-effort temp cleanup */ }
+        }
+    }
     // Per-DATA-SESSION (5.14): a PRG transaction stack is scoped to its data session, so a BEGIN TRANSACTION
     // in one session never snapshots/rolls back another session's writes. Non-readonly so a switch re-points it.
     private List<TxnFrame> _txn = new();
@@ -158,6 +179,10 @@ public sealed partial class VfpInterpreter
         // low-level handles are interpreter-global (independent of work areas), so no OS handle outlives the
         // session. VfpInterpreter.Dispose() does the same for a caller that disposes the interpreter directly.
         Session.Disposing += CloseAllLowLevelHandles;
+        // 6.3: delete the snapshot temp dir (rollback pre-images stream to files there) when the session is
+        // disposed — a catch-all for any temp a crash/abort left behind (each FileSnapshot.Cleanup already
+        // removes its own temps after commit/rollback, so this only ever finds leftovers).
+        Session.Disposing += DeleteSnapshotTempDir;
         // 5.13: an ADO.NET copy-on-write transaction Commit/Rollback QUIESCES the session (CloseAllHandles)
         // right before it swaps each private copy over the live file. A byte-range lock (RLOCK/FLOCK) an SP
         // took inside the transaction rides a cached writer on the LIVE file (coordination happens there);

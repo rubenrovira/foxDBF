@@ -138,38 +138,50 @@ public sealed partial class VfpInterpreter
             else parentSnap = CaptureSnapshot(path);
         }
 
-        SnapshotForTxn(path);
-        using (var lease = LeaseWriter(path))
+        // 6.3: parentSnap (the whole-file RI pre-image when the record-level image could not represent the row)
+        // streams to a temp file — clean it on every exit. RestoreSnapshot already cleans a restored pre-image;
+        // Cleanup is idempotent.
+        // 6.3 LEAK-WINDOW FIX: SnapshotForTxn runs as the FIRST line INSIDE the try (not before it). It may
+        // CaptureSnapshot, which now THROWS on an existing-file copy I/O failure; a throw before the try would
+        // skip the finally and LEAK parentSnap's already-captured temp file. Ordering (txn pre-image before
+        // LeaseWriter) and semantics are unchanged; the txn snapshot is owned by _txn (cleaned at
+        // commit/rollback), so the finally only ever touches parentSnap.
+        try
         {
-            var writer = lease.Writer;
-            if (hasFields)
+            SnapshotForTxn(path);
+            using (var lease = LeaseWriter(path))
             {
-                var values = new object?[writer.Schema.Columns.Count];
-                for (int i = 0; i < values.Length; i++) values[i] = DbfWriter.KeepValue;
-                foreach (var kv in edit.Fields) if (kv.Key >= 0 && kv.Key < values.Length) values[kv.Key] = kv.Value;
-                writer.UpdateRecord(recIndex, values);
+                var writer = lease.Writer;
+                if (hasFields)
+                {
+                    var values = new object?[writer.Schema.Columns.Count];
+                    for (int i = 0; i < values.Length; i++) values[i] = DbfWriter.KeepValue;
+                    foreach (var kv in edit.Fields) if (kv.Key >= 0 && kv.Key < values.Length) values[kv.Key] = kv.Value;
+                    writer.UpdateRecord(recIndex, values);
+                }
+                if (edit.DeletedOverride is bool del) { if (del) writer.Delete(recIndex); else writer.Recall(recIndex); }
+                writer.Flush();
             }
-            if (edit.DeletedOverride is bool del) { if (del) writer.Delete(recIndex); else writer.Recall(recIndex); }
-            writer.Flush();
-        }
-        // 5.5 hot path (must-fix): the commit is IN-PLACE (record count unchanged) — drop the read buffers in
-        // place and PRESERVE the ordered cache unless a replaced field feeds a structural tag key (then the
-        // cdx moved ⇒ RefreshAfterInPlaceWrite reopens). Replaces the unconditional full ReopenFileAreas that
-        // re-opened every area (the ~8 ms Defender-scanned open) + dropped the whole Ordered cache per row.
-        RefreshAfterInPlaceWrite(path, wa, replacedFields);
+            // 5.5 hot path (must-fix): the commit is IN-PLACE (record count unchanged) — drop the read buffers in
+            // place and PRESERVE the ordered cache unless a replaced field feeds a structural tag key (then the
+            // cdx moved ⇒ RefreshAfterInPlaceWrite reopens). Replaces the unconditional full ReopenFileAreas that
+            // re-opened every area (the ~8 ms Defender-scanned open) + dropped the whole Ordered cache per row.
+            RefreshAfterInPlaceWrite(path, wa, replacedFields);
 
-        if (autoFireUpdate)
-        {
-            GoRecordCore(area, recno);
-            m.OldVals = new Dictionary<string, object?>(edit.Old, StringComparer.OrdinalIgnoreCase);
-            if (!FireDmlTrigger(RiEvent.Update, area))
+            if (autoFireUpdate)
             {
-                if (parentImg is { } pRev) RestoreRecordImage(pRev);
-                else if (parentSnap is not null) RestoreSnapshot(parentSnap);
-                return false;
+                GoRecordCore(area, recno);
+                m.OldVals = new Dictionary<string, object?>(edit.Old, StringComparer.OrdinalIgnoreCase);
+                if (!FireDmlTrigger(RiEvent.Update, area))
+                {
+                    if (parentImg is { } pRev) RestoreRecordImage(pRev);
+                    else if (parentSnap is not null) RestoreSnapshot(parentSnap);
+                    return false;
+                }
             }
+            return true;
         }
-        return true;
+        finally { parentSnap?.Cleanup(); }
     }
 
     /// <summary>TABLEUPDATE core — commit the current row (allRows=false) or every buffered row + append
@@ -293,49 +305,63 @@ public sealed partial class VfpInterpreter
         // frame's own once-per-table pre-image (SnapshotForTxn) still covers a batch rollback.
         bool candidateHere = CandidateTagsFor(path) is not null;
         bool autoFireInsert = EnforceReferentialIntegrity && ResolveTriggerProc(RiEvent.Insert, wa) is not null;
-        FileSnapshot? snap = (candidateHere || autoFireInsert) ? CaptureSnapshot(path) : null;
-        SnapshotForTxn(path);
-        using (var lease = LeaseWriter(path))
+        // snap lives OUTSIDE the try so the finally can Cleanup it; the CAPTURE runs INSIDE the try (below).
+        FileSnapshot? snap = null;
+        // 6.3: the whole-file append pre-image (snap) streams to a temp file — clean it on every exit
+        // (success, the candidate-violation throw, or the trigger-abort return). RestoreSnapshot already cleans
+        // a restored pre-image; Cleanup is idempotent.
+        // 6.3 LEAK-WINDOW FIX: the append + txn-frame captures run as the FIRST lines INSIDE the try (not before
+        // it). CaptureSnapshot now THROWS on an existing-file copy I/O failure; a throw in SnapshotForTxn after
+        // snap was captured would otherwise skip the finally and LEAK snap's temp file. Ordering (append + txn
+        // pre-image before LeaseWriter) and semantics are unchanged; the txn snapshot is owned by _txn (cleaned
+        // at commit/rollback), so the finally only ever touches snap.
+        try
         {
-            lease.Writer.AppendRecord(vals);
-            lease.Writer.Flush();
-        }
-        ReopenFileAreas(path);   // an append changed the record count/geometry ⇒ full re-open (RefreshView cannot).
-
-        // CANDIDATE: a buffered APPEND committed here (TABLEUPDATE) that duplicates a candidate key must
-        // RAISE — the same enforcement the write-through INSERT path applies. The maintained cdx now holds
-        // the duplicate; restore the pre-image and raise on a violation. (CommitBuffer's allRows transaction
-        // frame is rolled back by its catch so the raise leaves the buffer intact.)
-        if (candidateHere && FirstViolatedCandidate(path) is string badAppendTag)
-        {
-            if (snap is not null) RestoreSnapshot(snap);
-            throw new MicroVfpRuntimeException(
-                $"APPEND: CANDIDATE tag {badAppendTag} uniqueness violated — a duplicate key value exists.", 1884); // VFP err 1884 (oracle-pinned).
-        }
-
-        // Deferred insert trigger / RI: positioned ON the new (last physical) record; .F. ⇒ RESTRICT abort.
-        if (autoFireInsert)
-        {
-            int savedArea = Session.CurrentArea;
-            Session.SelectArea(area);
-            var fresh = Session.AreaAt(area);
-            if (fresh is not null) GoRecordCore(area, fresh.Table.RecordCount);
-            bool ok = FireDmlTrigger(RiEvent.Insert, area);
-            Session.SelectArea(savedArea);
-            if (!ok) { if (snap is not null) RestoreSnapshot(snap); return false; }
-        }
-
-        // A buffered DELETE on the appended row commits as a deleted physical record.
-        if (ae.Deleted && Session.AreaAt(area) is { } after && after.Table.RecordCount > 0)
-        {
-            using (var lease2 = LeaseWriter(path))
+            snap = (candidateHere || autoFireInsert) ? CaptureSnapshot(path) : null;
+            SnapshotForTxn(path);
+            using (var lease = LeaseWriter(path))
             {
-                lease2.Writer.Delete(after.Table.RecordCount - 1);
-                lease2.Writer.Flush();
+                lease.Writer.AppendRecord(vals);
+                lease.Writer.Flush();
             }
-            ReopenFileAreas(path);
+            ReopenFileAreas(path);   // an append changed the record count/geometry ⇒ full re-open (RefreshView cannot).
+
+            // CANDIDATE: a buffered APPEND committed here (TABLEUPDATE) that duplicates a candidate key must
+            // RAISE — the same enforcement the write-through INSERT path applies. The maintained cdx now holds
+            // the duplicate; restore the pre-image and raise on a violation. (CommitBuffer's allRows transaction
+            // frame is rolled back by its catch so the raise leaves the buffer intact.)
+            if (candidateHere && FirstViolatedCandidate(path) is string badAppendTag)
+            {
+                if (snap is not null) RestoreSnapshot(snap);
+                throw new MicroVfpRuntimeException(
+                    $"APPEND: CANDIDATE tag {badAppendTag} uniqueness violated — a duplicate key value exists.", 1884); // VFP err 1884 (oracle-pinned).
+            }
+
+            // Deferred insert trigger / RI: positioned ON the new (last physical) record; .F. ⇒ RESTRICT abort.
+            if (autoFireInsert)
+            {
+                int savedArea = Session.CurrentArea;
+                Session.SelectArea(area);
+                var fresh = Session.AreaAt(area);
+                if (fresh is not null) GoRecordCore(area, fresh.Table.RecordCount);
+                bool ok = FireDmlTrigger(RiEvent.Insert, area);
+                Session.SelectArea(savedArea);
+                if (!ok) { if (snap is not null) RestoreSnapshot(snap); return false; }
+            }
+
+            // A buffered DELETE on the appended row commits as a deleted physical record.
+            if (ae.Deleted && Session.AreaAt(area) is { } after && after.Table.RecordCount > 0)
+            {
+                using (var lease2 = LeaseWriter(path))
+                {
+                    lease2.Writer.Delete(after.Table.RecordCount - 1);
+                    lease2.Writer.Flush();
+                }
+                ReopenFileAreas(path);
+            }
+            return true;
         }
-        return true;
+        finally { snap?.Cleanup(); }
     }
 
     private int AreaOfClause(ReplaceClause c)

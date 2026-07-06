@@ -371,6 +371,54 @@ not detected). Most of what the data side of a real `.prg` business-logic stored
 implemented; the goal is correctly running real-world stored procedures, not 100% coverage of the
 IDE-facing language surface.
 
+## Performance and limits
+
+### `INSERT` fast path and deferred visibility
+
+A plain autocommit `INSERT … VALUES` into an open, unbuffered table takes a **direct-append fast
+path**: the row is appended straight through microVFP's cached writer (which keeps the structural
+`.cdx` current) instead of re-opening the table for every row. A tight `INSERT` loop therefore runs in
+roughly O(*rows*) rather than paying a per-row open + reopen.
+
+To keep the loop cheap, the **read-view refresh is deferred**. The appended rows are flushed and the
+work area's read view is reopened **lazily, at the first following statement that is not another
+`INSERT`** — the moment something actually reads the table. In practice you never see the seam: by the
+time a `RECCOUNT()`, `RECNO()`, `EOF()`, a field read, a `GO`/`SKIP`/`SEEK`, or a `SCAN` runs, the new
+rows are already visible and already seekable through the maintained `.cdx`. Read-your-writes holds
+within the session — the deferral is an internal optimization, not an observable delay.
+
+The fast path is taken **only** for that plain case. It transparently **falls back to the classic
+per-row path** — with byte-identical table state, index state and error numbers — whenever any of the
+following applies:
+
+| Condition | Why it falls back |
+|---|---|
+| the target work area is **buffered** (`CURSORSETPROP('Buffering', 2–5)`) | the row must land in the row/table buffer, not straight on disk |
+| the table carries a **`CANDIDATE`** tag | a post-append duplicate re-check is required |
+| **referential-integrity enforcement** is on for the target | the bound insert trigger has to fire on the new row |
+| an open **`BEGIN TRANSACTION`** copy-on-write redirect is active | the write must land on the transaction's private copy, never straddle the commit swap |
+| **`INSERT … FROM ARRAY` / `FROM MEMVAR`** (not a `VALUES` list) | not a direct-values source |
+| a structural anomaly — unknown column, or value/column count mismatch | the error must surface exactly as the classic path raises it |
+
+Because every one of these reproduces the pre-fast-path behaviour exactly, the fast path is a pure
+throughput win for the common `INSERT … VALUES` loop and changes nothing you can observe otherwise.
+
+### Recursion / call-nesting depth
+
+microVFP caps interpreter call nesting — `PROCEDURE`/`FUNCTION` calls and RI-cascade chains — at **48
+levels**, and raises a **catchable error 1809** ("Maximum call nesting depth exceeded — probable
+unbounded recursion") when the cap is passed. An accidental infinite recursion in a stored procedure
+therefore surfaces as an ordinary trappable VFP error that your `ON ERROR` handler or a `TRY…CATCH`
+can catch — not a process crash.
+
+This is deliberately **more robust than VFP9**, which permits deeper `DO` nesting (up to 128 levels)
+but faults **uncatchably** on runaway recursion: a native stack overflow that takes the whole runtime
+down before any trappable error can fire. A tree-walking interpreter spends many native stack frames
+per logical call and has no safe way to ride that stack cliff, so it stops short and throws a normal
+error instead. Real-world RI cascades and stored-procedure call chains are only single-digit deep, so
+the 48-level ceiling never interferes with legitimate code — it exists solely to turn a would-be crash
+into a catchable error.
+
 ## Next
 
 [5. The Highlike accelerator →](05-highlike-accelerator.md)

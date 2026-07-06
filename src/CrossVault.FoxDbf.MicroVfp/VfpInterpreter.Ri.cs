@@ -152,8 +152,13 @@ public sealed partial class VfpInterpreter
         {
             var parent = _txn[^1];
             foreach (var kv in done.Snaps)
-                if (!Snapshotted(kv.Key)) parent.Snaps[kv.Key] = kv.Value;
+                if (!Snapshotted(kv.Key)) parent.Snaps[kv.Key] = kv.Value;   // hand up — the parent keeps the temp pre-image.
+                else kv.Value.Cleanup();                                     // parent already owns this path — drop the inner temp.
         }
+        else
+            // 6.3: the OUTERMOST commit keeps the live files, so the pre-image temps are done — delete every one
+            // (temp dir empty after commit). A nested commit hands its temps up (above), so this only fires once.
+            foreach (var kv in done.Snaps) kv.Value.Cleanup();
     }
 
     private void RollbackTransaction()
@@ -187,17 +192,25 @@ public sealed partial class VfpInterpreter
     /// auto-fired update/insert trigger can read the NEW key via the current field), and if that trigger
     /// returns <c>.F.</c>/errors (a RESTRICT abort), <see cref="RestoreSnapshot"/> rolls the parent write back
     /// so the parent op + its triggered cascade are atomic.</summary>
-    private static FileSnapshot CaptureSnapshot(string path)
+    private FileSnapshot CaptureSnapshot(string path)
     {
         var snap = new FileSnapshot { Path = path };
-        // FileShare.ReadWrite reads (ReadAllBytesShared) so the pre-image can be taken WHILE the 5.5 cached
-        // writer holds the .dbf/.fpt open — a plain File.ReadAllBytes requests FileShare.Read, which a live
-        // read/write handle denies (it would silently swallow → a null pre-image → a broken rollback).
-        snap.Dbf = ReadAllBytesShared(path);
-        string cdx = Path.ChangeExtension(path, ".cdx");
-        string fpt = Path.ChangeExtension(path, ".fpt");
-        snap.Cdx = ReadAllBytesShared(cdx);
-        snap.Fpt = ReadAllBytesShared(fpt);
+        // 6.3: stream the pre-images to TEMP FILES (CopyToTempSnapshot) rather than whole files into byte[] —
+        // FileShare.ReadWrite so the copy runs WHILE the 5.5 cached writer holds the .dbf/.fpt open. A copy
+        // failure on an EXISTING file THROWS (a capture failure fails the write/txn honestly instead of a
+        // silent no-rollback); an ABSENT companion stays null (its restore deletes any file that appeared).
+        // If a later copy throws, clean up the temps already made so a failed capture leaks nothing.
+        try
+        {
+            snap.DbfTemp = CopyToTempSnapshot(path);
+            snap.CdxTemp = CopyToTempSnapshot(Path.ChangeExtension(path, ".cdx"));
+            snap.FptTemp = CopyToTempSnapshot(Path.ChangeExtension(path, ".fpt"));
+        }
+        catch
+        {
+            snap.Cleanup();
+            throw;
+        }
         return snap;
     }
 
@@ -205,10 +218,11 @@ public sealed partial class VfpInterpreter
     /// re-open the area(s) in place (same number / alias / order) so the reverted state is visible.</summary>
     private void RestoreSnapshot(FileSnapshot snap)
     {
-        // 5.5: a cached writer holding this .dbf/.fpt open would block the File.WriteAllBytes rewrite below
-        // (and its stale handle/count must not survive a rollback). Drop it first — the next write re-opens.
+        // 5.5: a cached writer holding this .dbf/.fpt open would block the File.Copy rewrite below (its
+        // FileShare.None destination open), and its stale handle/count must not survive a rollback. Drop it
+        // first — the next write re-opens.
         // 5.13: FORCE-close it even when an explicit RLOCK/FLOCK pins it — InvalidateCachedWriter would
-        // SKIP a pinned writer, leaving the handle open so File.WriteAllBytes below hits a sharing violation
+        // SKIP a pinned writer, leaving the handle open so the File.Copy below hits a sharing violation
         // that the surrounding catch{} silently swallows (⇒ the rollback no-ops, leaving the duplicate/invalid
         // rows on disk under the raised error). ReacquireHeldLocks at the end re-takes the tracked lock.
         ForceCloseCachedWriter(snap.Path);
@@ -232,11 +246,11 @@ public sealed partial class VfpInterpreter
 
         foreach (var r in reopen) Session.CloseArea(r.Area);
 
-        try { if (snap.Dbf is not null) File.WriteAllBytes(snap.Path, snap.Dbf); } catch { }
+        try { if (snap.DbfTemp is not null) File.Copy(snap.DbfTemp, snap.Path, overwrite: true); } catch { }
         string cdx = Path.ChangeExtension(snap.Path, ".cdx");
         string fpt = Path.ChangeExtension(snap.Path, ".fpt");
-        RestoreSnapshotSidecar(cdx, snap.Cdx);
-        RestoreSnapshotSidecar(fpt, snap.Fpt);
+        RestoreSnapshotSidecar(cdx, snap.CdxTemp);
+        RestoreSnapshotSidecar(fpt, snap.FptTemp);
 
         int savedCur = Session.CurrentArea;
         foreach (var r in reopen)
@@ -257,14 +271,16 @@ public sealed partial class VfpInterpreter
         // 5.13: re-take on the fresh cached writer the explicit RLOCK/FLOCK we force-closed above, so a lock
         // an SP holds while a transaction / RI / CANDIDATE abort rolls the file back stays held afterwards.
         ReacquireHeldLocks(snap.Path);
+        // 6.3: the pre-image temp files are consumed — delete them (so the temp dir is empty after a rollback).
+        snap.Cleanup();
     }
 
-    private static void RestoreSnapshotSidecar(string path, byte[]? preimage)
+    private static void RestoreSnapshotSidecar(string path, string? tempPreimage)
     {
         try
         {
-            if (preimage is not null) File.WriteAllBytes(path, preimage);
-            else if (File.Exists(path)) File.Delete(path);
+            if (tempPreimage is not null) File.Copy(tempPreimage, path, overwrite: true);
+            else if (File.Exists(path)) File.Delete(path);   // review fix 7: pre-image absent ⇒ delete the companion that appeared.
         }
         catch { }
     }

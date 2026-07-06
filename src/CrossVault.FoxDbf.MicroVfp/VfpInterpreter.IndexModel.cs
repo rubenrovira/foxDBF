@@ -136,28 +136,31 @@ public sealed partial class VfpInterpreter
         // CANDIDATE: capture the pre-image so a uniqueness violation rolls the .cdx/.dbf back (VFP does not
         // create the tag on a duplicate).
         FileSnapshot? pre = candidate ? CaptureSnapshot(path) : null;
-
-        BuildTagOnDisk(path, w => w.CreateTag(def, _ctx, includeDeleted: !_ctx.Deleted));
-
-        if (candidate)
+        try
         {
-            var built = Session.AreaAt(area)?.Cdx;
-            var tag = built?.Tag(tagName) ?? built?.Tag(tagName.ToUpperInvariant());
-            if (tag is not null && HasDuplicateKeys(tag))
-            {
-                RollbackFiles(pre!, path);
-                throw new MicroVfpRuntimeException(
-                    $"INDEX ON … TAG {tagName} CANDIDATE: uniqueness violated — a duplicate key value exists.", 1884); // VFP err 1884 (oracle-pinned).
-            }
-            // The tag is now valid + candidate: remember its candidacy so a later write that duplicates a
-            // key raises (the on-disk tag looks plain for a free table, so nothing else could tell).
-            RegisterCandidateTag(path, tagName);
-        }
+            BuildTagOnDisk(path, w => w.CreateTag(def, _ctx, includeDeleted: !_ctx.Deleted));
 
-        // The new tag becomes the controlling order (VFP behaviour) and the pointer goes to its top.
-        m.Order = tagName;
-        ResetOrderState(m);
-        GoTop(area);
+            if (candidate)
+            {
+                var built = Session.AreaAt(area)?.Cdx;
+                var tag = built?.Tag(tagName) ?? built?.Tag(tagName.ToUpperInvariant());
+                if (tag is not null && HasDuplicateKeys(tag))
+                {
+                    RollbackFiles(pre!, path);
+                    throw new MicroVfpRuntimeException(
+                        $"INDEX ON … TAG {tagName} CANDIDATE: uniqueness violated — a duplicate key value exists.", 1884); // VFP err 1884 (oracle-pinned).
+                }
+                // The tag is now valid + candidate: remember its candidacy so a later write that duplicates a
+                // key raises (the on-disk tag looks plain for a free table, so nothing else could tell).
+                RegisterCandidateTag(path, tagName);
+            }
+
+            // The new tag becomes the controlling order (VFP behaviour) and the pointer goes to its top.
+            m.Order = tagName;
+            ResetOrderState(m);
+            GoTop(area);
+        }
+        finally { pre?.Cleanup(); }   // 6.3: on the no-violation path the pre-image temps are unused — delete them (idempotent: RollbackFiles already cleaned on the abort path).
     }
 
     /// <summary>Reset the cached index sequence + any SET KEY range after the controlling order changes
@@ -524,17 +527,21 @@ public sealed partial class VfpInterpreter
     private void EnforceCandidateInsert(InsertStmt ins, string path)
     {
         var pre = CaptureSnapshot(path);
-        try { Session.Execute(ins.Sql); }
-        catch { RestoreSnapshot(pre); throw; }
-        ReopenFileAreas(path);
-
-        string? bad = FirstViolatedCandidate(path);
-        if (bad is not null)
+        try
         {
-            RestoreSnapshot(pre);
-            throw new MicroVfpRuntimeException(
-                $"INSERT INTO {NameOfTable(ins)}: CANDIDATE tag {bad} uniqueness violated — a duplicate key value exists.", 1884); // VFP err 1884 (oracle-pinned).
+            try { Session.Execute(ins.Sql); }
+            catch { RestoreSnapshot(pre); throw; }
+            ReopenFileAreas(path);
+
+            string? bad = FirstViolatedCandidate(path);
+            if (bad is not null)
+            {
+                RestoreSnapshot(pre);
+                throw new MicroVfpRuntimeException(
+                    $"INSERT INTO {NameOfTable(ins)}: CANDIDATE tag {bad} uniqueness violated — a duplicate key value exists.", 1884); // VFP err 1884 (oracle-pinned).
+            }
         }
+        finally { pre.Cleanup(); }   // 6.3: on the clean path the pre-image temps are unused — delete them (idempotent after a RestoreSnapshot).
     }
 
     /// <summary>The first registered CANDIDATE tag on <paramref name="path"/> that now holds a duplicate key,
@@ -585,9 +592,9 @@ public sealed partial class VfpInterpreter
         var reopen = Session.CloseAreasForPath(Path.GetFullPath(path));
         try
         {
-            try { if (pre.Dbf is not null) File.WriteAllBytes(pre.Path, pre.Dbf); } catch { }
+            try { if (pre.DbfTemp is not null) File.Copy(pre.DbfTemp, pre.Path, overwrite: true); } catch { }
             string cdx = Path.ChangeExtension(pre.Path, ".cdx");
-            if (pre.Cdx is not null) { try { File.WriteAllBytes(cdx, pre.Cdx); } catch { } }
+            if (pre.CdxTemp is not null) { try { File.Copy(pre.CdxTemp, cdx, overwrite: true); } catch { } }
             else { try { if (File.Exists(cdx)) File.Delete(cdx); } catch { } }
         }
         finally
@@ -596,6 +603,7 @@ public sealed partial class VfpInterpreter
         }
         ResetMetaCachesForPath(path);
         ReacquireHeldLocks(path);
+        pre.Cleanup();   // 6.3: the pre-image temps are consumed — delete them.
     }
 
     // ─────────────────────────── SET COLLATE / SET KEY (microVFP P1 gap #1) ───────────────────────────
