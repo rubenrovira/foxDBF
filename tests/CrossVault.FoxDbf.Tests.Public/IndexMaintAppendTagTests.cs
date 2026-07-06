@@ -103,7 +103,7 @@ public sealed class IndexMaintAppendTagTests
         Assert.Equal(new[] { 4, 1, 3, 2 }, IndexMaintTestSupport.Recnos(dbf, "DTAG"));
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public async Task TwoSharedWriters_ConcurrentAppends_WithStructuralTag_DoNotLoseIndexEntries()
     {
         using var dir = new IndexMaintTestSupport.TempDir();

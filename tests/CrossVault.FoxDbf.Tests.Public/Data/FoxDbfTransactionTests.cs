@@ -310,7 +310,7 @@ public sealed class FoxDbfTransactionTests
         Assert.True(ReadState(dbf2).Single(r => r.Id == 2).Deleted);
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public void Commit_PromotionFailure_RestoresAlreadyPromotedTables_And_RemainsRollbackable()
     {
         using var db = new EmpDb();

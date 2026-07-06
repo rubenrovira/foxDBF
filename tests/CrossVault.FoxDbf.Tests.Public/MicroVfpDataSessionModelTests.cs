@@ -209,7 +209,7 @@ public sealed class MicroVfpDataSessionModelTests
 
     // ═══════════════════════════ (2) lifecycle: release ═══════════════════════════
 
-    [Fact]
+    [WindowsOnlyFact]
     public void ReleaseDataSession_ClosesAreas_ReleasesLocks_RecordLockableFromSession1Afterwards()
     {
         using var f = new Fixture();
@@ -430,7 +430,7 @@ public sealed class MicroVfpDataSessionModelTests
     // handle / cached DbfWriter / byte-range lock on the target .dbf blocked PromoteFile's File.Replace and the
     // Commit threw. The fix releases EVERY session's handles + locks at the quiesce boundary.
 
-    [Fact]
+    [WindowsOnlyFact]
     public void AdoTransactionCommit_ReleasesNonActivePrivateSessionHandlesAndLocks_AreaReopensFresh()
     {
         using var f = new Fixture();

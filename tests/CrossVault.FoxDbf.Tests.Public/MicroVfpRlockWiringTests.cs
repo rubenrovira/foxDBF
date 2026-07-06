@@ -93,7 +93,7 @@ public sealed class MicroVfpRlockWiringTests
 
     // ─────────────────────────── (6) in-process contention matrix ───────────────────────────
 
-    [Fact]
+    [WindowsOnlyFact]
     public void RlockInA_BlocksRlockInB_ThenUnlockReleases()
     {
         using var s = new Shared();
@@ -116,7 +116,7 @@ public sealed class MicroVfpRlockWiringTests
         finally { sa.Dispose(); sb.Dispose(); }
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public void RlockInA_BlocksReplaceInB_NoLostUpdate()
     {
         using var s = new Shared();
@@ -138,7 +138,7 @@ public sealed class MicroVfpRlockWiringTests
         finally { sa.Dispose(); sb.Dispose(); }
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public void FlockInA_BlocksRlockAndFlockInB()
     {
         using var s = new Shared();
@@ -161,7 +161,7 @@ public sealed class MicroVfpRlockWiringTests
         finally { sa.Dispose(); sb.Dispose(); }
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public void IsRlockedAndIsFlocked_ReportOwnHeldLocks()
     {
         using var s = new Shared();
@@ -189,7 +189,7 @@ public sealed class MicroVfpRlockWiringTests
         finally { sa.Dispose(); }
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public void MultilocksOff_NewRlockReleasesPreviousRecordLock()
     {
         using var s = new Shared();
@@ -218,7 +218,7 @@ public sealed class MicroVfpRlockWiringTests
         finally { sa.Dispose(); sb.Dispose(); }
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public void MultilocksOn_RecordLocksAccumulate_AndUnlockRecordReleasesOne()
     {
         using var s = new Shared();
@@ -246,7 +246,7 @@ public sealed class MicroVfpRlockWiringTests
         finally { sa.Dispose(); }
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public void Reprocess0WithOnErrorFailsFast_And2SecondsCountAlsoDenies()
     {
         using var s = new Shared();
@@ -272,7 +272,7 @@ public sealed class MicroVfpRlockWiringTests
         finally { sa.Dispose(); sb.Dispose(); }
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public void LocksReleasedOnClose_And_OnSessionDispose()
     {
         using var s = new Shared();
@@ -309,7 +309,7 @@ public sealed class MicroVfpRlockWiringTests
 
     // ─────────────────────────── (5) cached-writer interplay pins ───────────────────────────
 
-    [Fact]
+    [WindowsOnlyFact]
     public void HeldRlock_SurvivesReplaceThroughCachedWriter_AndAPrune()
     {
         using var s = new Shared();
@@ -344,7 +344,7 @@ public sealed class MicroVfpRlockWiringTests
         finally { sa.Dispose(); sb.Dispose(); }
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public void CowTransaction_RlockLandsOnLiveFile_NotThePrivateCopy()
     {
         using var s = new Shared();
@@ -382,7 +382,7 @@ public sealed class MicroVfpRlockWiringTests
     // loop left the records it managed to grab (2) locked on a .F. return, silently pinning byte ranges the
     // SP believed it did not hold. These pin the atomic contract with in-process contention (session A ↔ B).
 
-    [Fact]
+    [WindowsOnlyFact]
     public void MultilocksOn_ListLock_Failure_IsAtomic_LeavesNoNewLocks()
     {
         using var s = new Shared();
@@ -409,7 +409,7 @@ public sealed class MicroVfpRlockWiringTests
         finally { sa.Dispose(); sb.Dispose(); }
     }
 
-    [Fact]
+    [WindowsOnlyFact]
     public void MultilocksOn_ListLock_Failure_PreOwnedRecordSurvives()
     {
         using var s = new Shared();
@@ -440,7 +440,7 @@ public sealed class MicroVfpRlockWiringTests
     // new lock releasing the previous one) and returns .T. holding ONLY the LAST record — the exact behaviour
     // the interpreter already produces. Forcing .F. would DIVERGE from VFP. This pins the verified VFP9 shape.
 
-    [Fact]
+    [WindowsOnlyFact]
     public void MultilocksOff_ListLock_ReturnsTrue_HoldingOnlyLastRecord_MatchesVfp9Oracle()
     {
         using var s = new Shared();
@@ -466,7 +466,7 @@ public sealed class MicroVfpRlockWiringTests
     // ROLLBACK silently no-op'd, leaving the written bytes on disk under a raised error (an RI/CANDIDATE-abort
     // bypass). The fix force-closes the writer, reverts, then re-acquires the tracked lock.
 
-    [Fact]
+    [WindowsOnlyFact]
     public void RollbackWhileLockHeld_ActuallyRevertsFile_AndLockSurvives()
     {
         using var s = new Shared();
@@ -498,7 +498,7 @@ public sealed class MicroVfpRlockWiringTests
     // fix releases the interpreter's held locks + cached writers at the transaction's quiesce point (before
     // writeback) — a DEFINED disposition: the lock is released at the transaction boundary and the write commits.
 
-    [Fact]
+    [WindowsOnlyFact]
     public void Rlock_InsideAdoCowTransaction_CommitSucceeds_LockReleasedAtBoundary()
     {
         using var s = new Shared();

@@ -240,7 +240,10 @@ public sealed class MicroVfpP3StringsTests
 
             // STRTOFILE to an unwritable target (here a NONEXISTENT sub-directory) returns 0 — VFP9's write-
             // failure return is 0, NOT a -1 sentinel.
-            h.Run("lcBad = '" + dir.Replace("\\", "\\\\") + "\\\\nodir\\\\out.txt'");
+            // Path.Combine, NOT a hard-coded backslash: on Unix '\' is a valid filename character, so a
+            // backslash-built "missing sub-directory" silently becomes a writable file in `dir` and
+            // STRTOFILE returns 2 instead of the pinned 0 (caught by the Linux CI leg).
+            h.Run("lcBad = '" + Path.Combine(dir, "nodir", "out.txt").Replace("\\", "\\\\") + "'");
             Assert.Equal(0m, h.Num("STRTOFILE('hi', lcBad)"));
 
             // A numeric flag outside {0,1,2,4} is NOT a bitmask — VFP9 raises err 11 (it does not overwrite).
