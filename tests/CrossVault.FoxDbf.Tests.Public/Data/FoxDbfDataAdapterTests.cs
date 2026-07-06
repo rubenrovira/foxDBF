@@ -45,7 +45,7 @@ public sealed class FoxDbfDataAdapterTests
             readerNames = Enumerable.Range(0, r.FieldCount).Select(r.GetName).ToArray();
             while (r.Read())
             {
-                var row = new object?[r.FieldCount];
+                var row = new object[r.FieldCount];
                 r.GetValues(row);
                 expected.Add(row);
             }

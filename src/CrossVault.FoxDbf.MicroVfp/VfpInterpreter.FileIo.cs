@@ -69,7 +69,7 @@ public sealed partial class VfpInterpreter : IDisposable
     }
 
     /// <summary>Releases the interpreter's low-level file handles. Callers usually dispose the bound
-    /// <see cref="VfpSession"/> (the codebase lifecycle owner, which also triggers this) — this makes the
+    /// <see cref="CrossVault.FoxDbf.Sql.VfpSession"/> (the codebase lifecycle owner, which also triggers this) — this makes the
     /// interpreter itself deterministically releasable too, so a held file is deletable right afterwards.</summary>
     public void Dispose() { CloseAllLowLevelHandles(); DeleteSnapshotTempDir(); }
 
