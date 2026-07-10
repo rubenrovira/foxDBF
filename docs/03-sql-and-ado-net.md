@@ -195,6 +195,9 @@ table's change-token still matches the live file (else it throws `FoxDbfTransact
 foreign write is lost) and atomically swaps each copy in; `Rollback()` (and dispose-without-commit) simply
 discards the copies — the live files, including the `.cdx`, are left byte-for-byte untouched.
 
+Within one transaction, DML followed by DDL on the same table is rejected with `FoxDbfException`;
+DDL followed by DML remains supported.
+
 ```csharp
 using var cn = new FoxDbfConnection(@"Data Source=C:\data");
 cn.Open();

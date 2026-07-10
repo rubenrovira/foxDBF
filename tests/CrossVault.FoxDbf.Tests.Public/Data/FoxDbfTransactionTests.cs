@@ -461,7 +461,7 @@ public sealed class FoxDbfTransactionTests
     // ---- (8) DML THEN DDL on the SAME table in one transaction ----------------------------
 
     [Fact]
-    public void Rollback_Of_Dml_Then_Ddl_Same_Table_Restores_PreTransaction_State()
+    public void Dml_Then_Alter_Same_Table_Is_Rejected_And_Rollback_Restores_PreTransaction_State()
     {
         using var db = new EmpDb();
         var beforeState = ReadState(db.Dbf);
@@ -470,16 +470,13 @@ public sealed class FoxDbfTransactionTests
         using (var conn = db.Open())
         {
             var tx = conn.BeginTransaction();
-            // DML FIRST (takes the private copy at token T1), then DDL on the SAME table (rewrites the
-            // LIVE file at token T2). Without a DDL snapshot taken even though a DML copy exists, the live
-            // ALTER would survive the rollback (the DML copy is discarded but nothing restores the live).
             ExecNonQuery(conn, "UPDATE emp SET amount = 111.11 WHERE id = 1");
-            ExecNonQuery(conn, "ALTER TABLE emp ADD COLUMN extra C(15)");
+            Assert.Throws<FoxDbfException>(
+                () => ExecNonQuery(conn, "ALTER TABLE emp ADD COLUMN extra C(15)"));
             tx.Rollback();
         }
 
-        // Rollback restored the live file byte-for-byte: the ALTER's schema change is gone and the DML
-        // update was never on the live file.
+        // ALTER was rejected before touching the live table, and rollback discarded the pending DML.
         Assert.Equal(beforeDbf, Bytes(db.Dbf));
         Assert.Equal(beforeState, ReadState(db.Dbf));
         using var t = DbfTable.Open(db.Dbf);
@@ -487,29 +484,27 @@ public sealed class FoxDbfTransactionTests
     }
 
     [Fact]
-    public void Commit_Of_Dml_Then_Ddl_Same_Table_NoSpuriousConflict_KeepsLiveDdl()
+    public void Dml_Then_Alter_Same_Table_Is_Rejected_And_Commit_Persists_Dml_Only()
     {
         using var db = new EmpDb();
 
         using (var conn = db.Open())
         {
             var tx = conn.BeginTransaction();
-            ExecNonQuery(conn, "UPDATE emp SET amount = 111.11 WHERE id = 1"); // DML copy at token T1
-            ExecNonQuery(conn, "ALTER TABLE emp ADD COLUMN extra C(15)");      // DDL rewrites live to T2
-
-            // The same-transaction DDL changed the live token after the DML copy recorded T1; commit MUST
-            // NOT raise a spurious conflict — the live post-DDL state is authoritative and is kept.
+            ExecNonQuery(conn, "UPDATE emp SET amount = 111.11 WHERE id = 1");
+            Assert.Throws<FoxDbfException>(
+                () => ExecNonQuery(conn, "ALTER TABLE emp ADD COLUMN extra C(15)"));
             tx.Commit();
         }
 
-        // The DDL change is durable (the live file owns the committed state for a DML+DDL table).
+        Assert.Equal(111.11m, ReadState(db.Dbf).Single(r => r.Id == 1).Amount);
         using var t = DbfTable.Open(db.Dbf);
-        Assert.Contains(t.Columns, c => string.Equals(c.Name, "extra", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(t.Columns, c => string.Equals(c.Name, "extra", StringComparison.OrdinalIgnoreCase));
         Assert.Equal(5, RecordCount(db.Dbf));
     }
 
     [Fact]
-    public void Rollback_Of_Dml_Then_DropTable_Same_Table_Restores_The_Table()
+    public void Dml_Then_Drop_Same_Table_Is_Rejected_And_Rollback_Restores_PreTransaction_State()
     {
         using var db = new EmpDb();
         var beforeDbf = Bytes(db.Dbf);
@@ -518,13 +513,13 @@ public sealed class FoxDbfTransactionTests
         using (var conn = db.Open())
         {
             var tx = conn.BeginTransaction();
-            ExecNonQuery(conn, "UPDATE emp SET amount = 111.11 WHERE id = 1"); // DML copy first
-            ExecNonQuery(conn, "DROP TABLE emp");                              // then DROP the live file
-            Assert.False(File.Exists(db.Dbf));                                // gone within the tx
+            ExecNonQuery(conn, "UPDATE emp SET amount = 111.11 WHERE id = 1");
+            Assert.Throws<FoxDbfException>(() => ExecNonQuery(conn, "DROP TABLE emp"));
+            Assert.True(File.Exists(db.Dbf));
             tx.Rollback();
         }
 
-        // The DROP's live deletion was undone AND the discarded DML copy left no trace: pre-tx state.
+        // DROP was rejected before deleting the live table, and rollback discarded the pending DML.
         Assert.True(File.Exists(db.Dbf));
         Assert.Equal(beforeDbf, Bytes(db.Dbf));
         Assert.Equal(beforeState, ReadState(db.Dbf));

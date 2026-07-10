@@ -176,11 +176,12 @@ public sealed class FoxDbfTransaction : DbTransaction
         ArgumentException.ThrowIfNullOrEmpty(liveDbfPath);
 
         string full = Path.GetFullPath(liveDbfPath);
-        // Once per table — but take the DDL snapshot EVEN WHEN a DML private copy already exists for this
-        // table. The DDL executors (ALTER rewrite / DROP delete) operate on the LIVE file regardless of any
-        // DML copy, so without a DDL snapshot a DML-then-DDL sequence would leave the live file permanently
-        // in its DDL-modified state after a Rollback (the DML copy is discarded but nothing restores the
-        // live DDL change). The DDL snapshot captures the live file's pre-DDL bytes so Rollback restores it.
+        if (_copies.ContainsKey(full))
+            throw new FoxDbfException(
+                $"DDL cannot follow DML on table '{Path.GetFileName(full)}' within the same transaction; " +
+                "commit or roll back the transaction before executing DDL.");
+
+        // Once per table.
         if (_ddlSnapshots.ContainsKey(full)) return;
 
         string snapDir = Path.Combine(
