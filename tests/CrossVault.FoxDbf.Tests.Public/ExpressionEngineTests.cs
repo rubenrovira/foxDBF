@@ -214,6 +214,7 @@ public sealed class ExpressionEngineTests
     [InlineData("STUFF('ABCDEF',2,3,'xy')", "AxyEF")]
     [InlineData("CHRTRAN('ABCDEF','ACE','xyz')", "xByDzF")]
     [InlineData("CHRTRAN('ABC','AB','x')", "xC")] // shorter replacement deletes
+    [InlineData("STRTRAN('before'+CHR(0)+'after'+CHR(0),CHR(0),'')", "beforeafter")]
     [InlineData("REPLICATE('ab',3)", "ababab")]
     [InlineData("SPACE(3)", "   ")]
     [InlineData("PADL('7',3,'0')", "007")]

@@ -349,6 +349,7 @@ internal static class VfpRuntime
             case "RAT": return VfpValue.Integer(At(args, fromEnd: true));
             case "STUFF": return Stuff(args);
             case "CHRTRAN": return Chrtran(args);
+            case "STRTRAN": return Strtran(args);
             case "REPLICATE": return Replicate(args);
             case "SPACE": return VfpValue.Character(new string(' ', Math.Max(0, IntArg(args, 0))));
             case "LEN": return VfpValue.Integer(Arg(args, 0).AsString.Length);
@@ -633,6 +634,16 @@ internal static class VfpRuntime
             // else: char is deleted (replacement shorter than search).
         }
         return VfpValue.Character(sb.ToString());
+    }
+
+    private static VfpValue Strtran(VfpValue[] a)
+    {
+        string source = Arg(a, 0).AsString;
+        string sought = Arg(a, 1).AsString;
+        string replacement = a.Length >= 3 ? Arg(a, 2).AsString : string.Empty;
+        return VfpValue.Character(sought.Length == 0
+            ? source
+            : source.Replace(sought, replacement, StringComparison.Ordinal));
     }
 
     /// <summary>VFP <c>LIKE()</c> wildcard match: <c>*</c> matches any run (including empty), <c>?</c>
