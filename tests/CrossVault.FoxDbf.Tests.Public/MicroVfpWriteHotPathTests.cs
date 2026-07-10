@@ -80,6 +80,12 @@ public sealed class MicroVfpWriteHotPathTests
             return v is null ? 0m : Convert.ToDecimal(v, System.Globalization.CultureInfo.InvariantCulture);
         }
 
+        public int DiskRecordCount()
+        {
+            using var t = DbfTable.Open(DbfPath, new DbfOptions { LockMode = LockMode.Shared });
+            return t.RecordCount;
+        }
+
         /// <summary>True when the .dbf can be opened with FileShare.None — i.e. NO handle (read view OR a
         /// cached writer) lingers on it. Fails if any interpreter-held handle is still open.</summary>
         public bool DbfIsUnlocked() => IsUnlocked(DbfPath);
@@ -187,6 +193,73 @@ public sealed class MicroVfpWriteHotPathTests
         b.Run("GO 1");
         Assert.Equal(orig, b.Num("val"));            // live pointer reflects the restored value.
         Assert.Equal(orig, b.DiskNum(0, "val"));     // and the on-disk record is restored.
+    }
+
+    [Fact]
+    public void PrgTransactionRollback_PlainInsert_RestoresDbfAndCdx()
+    {
+        using var b = new Bench(rows: 1);
+        b.Run("USE bench\nSET ORDER TO tid");
+
+        b.Run("BEGIN TRANSACTION\nINSERT INTO bench (id, name, val, city) VALUES (99, 'new', 99, 'x')\nROLLBACK");
+
+        Assert.Equal(1m, b.Num("RECCOUNT()"));
+        Assert.Equal(1, b.DiskRecordCount());
+        b.Run("=SEEK(99, 'bench', 'tid')");
+        Assert.False(b.Bool("FOUND()"));
+        Assert.Null(IndexMaintTestSupport.Seek(b.DbfPath, "tid", 99));
+        Assert.Equal((uint)1, IndexMaintTestSupport.Seek(b.DbfPath, "tid", 1));
+    }
+
+    [Fact]
+    public void PrgTransactionRollback_RiEnabledWithoutTriggerInsert_RestoresDbfAndCdx()
+    {
+        using var b = new Bench(rows: 1);
+        b.Interp.EnforceReferentialIntegrity = true;
+        b.Run("USE bench\nSET ORDER TO tid");
+
+        b.Run("BEGIN TRANSACTION\nINSERT INTO bench (id, name, val, city) VALUES (99, 'new', 99, 'x')\nROLLBACK");
+
+        Assert.Equal(1m, b.Num("RECCOUNT()"));
+        Assert.Equal(1, b.DiskRecordCount());
+        b.Run("=SEEK(99, 'bench', 'tid')");
+        Assert.False(b.Bool("FOUND()"));
+        Assert.Null(IndexMaintTestSupport.Seek(b.DbfPath, "tid", 99));
+        Assert.Equal((uint)1, IndexMaintTestSupport.Seek(b.DbfPath, "tid", 1));
+    }
+
+    [Fact]
+    public void PrgTransactionRollback_SuccessfulCandidateInsert_RestoresDbfAndCdx()
+    {
+        using var b = new Bench(rows: 1);
+        b.Run("USE bench\nINDEX ON id TAG candtag CANDIDATE\nSET ORDER TO candtag");
+
+        b.Run("BEGIN TRANSACTION\nINSERT INTO bench (id, name, val, city) VALUES (99, 'new', 99, 'x')\nROLLBACK");
+
+        Assert.Equal(1m, b.Num("RECCOUNT()"));
+        Assert.Equal(1, b.DiskRecordCount());
+        b.Run("=SEEK(99, 'bench', 'candtag')");
+        Assert.False(b.Bool("FOUND()"));
+        Assert.Null(IndexMaintTestSupport.Seek(b.DbfPath, "candtag", 99));
+        Assert.Equal((uint)1, IndexMaintTestSupport.Seek(b.DbfPath, "candtag", 1));
+    }
+
+    [Fact]
+    public void PrgTransactionRollback_ReplaceThenInsert_PreservesEarliestPreimage()
+    {
+        using var b = new Bench(rows: 1);
+        b.Run("USE bench\nSET ORDER TO tid\nGO 1");
+        decimal original = b.Num("val");
+
+        b.Run("BEGIN TRANSACTION\nREPLACE val WITH 777\nINSERT INTO bench (id, name, val, city) VALUES (99, 'new', 99, 'x')\nROLLBACK");
+
+        b.Run("GO 1");
+        Assert.Equal(original, b.Num("val"));
+        Assert.Equal(original, b.DiskNum(0, "val"));
+        Assert.Equal(1m, b.Num("RECCOUNT()"));
+        Assert.Equal(1, b.DiskRecordCount());
+        Assert.Null(IndexMaintTestSupport.Seek(b.DbfPath, "tid", 99));
+        Assert.Equal((uint)1, IndexMaintTestSupport.Seek(b.DbfPath, "tid", 1));
     }
 
     // ─────────────────────────── (7) RI RESTRICT abort is atomic (record-level pre-image) ───────────────────────────

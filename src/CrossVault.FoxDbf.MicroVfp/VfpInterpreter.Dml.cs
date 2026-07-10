@@ -54,6 +54,7 @@ public sealed partial class VfpInterpreter
         // route below, so error text/numbers, the RI enforcement and the COW isolation all stay byte-identical.
         if (parsed is { SourceKind: InsertSourceKind.Values }
             && table is not null
+            && _txn.Count == 0
             && Session.TxBeginWritePath is null
             && TryDirectAppendInsert(parsed))
         {
@@ -86,7 +87,9 @@ public sealed partial class VfpInterpreter
         {
             VfpInsertProfile.Stop(VfpInsertProfileBucket.InsertTargetColumnResolution, targetStart);
             long indexStart = VfpInsertProfile.Start();
-            try { EnforceCandidateInsert(ins, candPath); }
+            string writePath = Path.GetFullPath(BeginTxWrite(candPath));
+            SnapshotForTxn(writePath);
+            try { EnforceCandidateInsert(ins, writePath, candPath); }
             finally { VfpInsertProfile.Stop(VfpInsertProfileBucket.IndexMaintenanceCall, indexStart); }
             return;
         }
@@ -96,6 +99,7 @@ public sealed partial class VfpInterpreter
         if (!EnforceReferentialIntegrity || table is null)
         {
             VfpInsertProfile.Stop(VfpInsertProfileBucket.BufferingRiChecks, checkStart);
+            SnapshotForTxn(ResolveInsertWritePath(table));
             long sqlStart = VfpInsertProfile.Start();
             try { Session.Execute(ins.Sql); } catch { /* best-effort; INSERT is not a target path */ }
             finally { VfpInsertProfile.Stop(VfpInsertProfileBucket.SqlDmlFallback, sqlStart); }
@@ -115,6 +119,7 @@ public sealed partial class VfpInterpreter
         // No resolvable target / no bound insert trigger ⇒ plain DML, no enforcement (free table or no rule).
         if (wa is null || ResolveTriggerProc(RiEvent.Insert, wa) is null)
         {
+            SnapshotForTxn(ResolveInsertWritePath(table));
             if (openedHere && wa is not null) { Session.CloseArea(wa.Area); _meta.Remove(wa.Area); }
             VfpInsertProfile.Stop(VfpInsertProfileBucket.BufferingRiChecks, checkStart);
             long sqlStart = VfpInsertProfile.Start();
@@ -130,8 +135,9 @@ public sealed partial class VfpInterpreter
         // read-your-writes and a trigger-abort RestoreSnapshot all operate on the copy — isolated + rollback-
         // able. No-op in autocommit (the live path is returned unchanged).
         long leaseStart = VfpInsertProfile.Start();
-        string? path = wa.Table.SourcePath is { } sp ? BeginTxWrite(sp) : null;
+        string? path = wa.Table.SourcePath is { } sp ? Path.GetFullPath(BeginTxWrite(sp)) : null;
         VfpInsertProfile.Stop(VfpInsertProfileBucket.BeginTxWriteLease, leaseStart);
+        SnapshotForTxn(path);
         FileSnapshot? snap = path is not null ? CaptureSnapshot(path) : null;   // pre-image for the rollback.
 
         long riSqlStart = VfpInsertProfile.Start();
@@ -166,6 +172,27 @@ public sealed partial class VfpInterpreter
         var parsed = SafeParseSql(ins.Sql);
         ins.ParsedCache = parsed;                       // backfill once (harmless when it stays a non-INSERT).
         return parsed as InsertStatement;
+    }
+
+    /// <summary>Resolve the effective path written by INSERT, including the ADO.NET COW redirect. When the
+    /// target is not already open, use a short-lived named-table handle only to discover its physical path.</summary>
+    private string? ResolveInsertWritePath(string? table)
+    {
+        if (table is null) return null;
+        string? path = Session.FindAreaByAlias(table)?.Table.SourcePath;
+        if (path is null)
+        {
+            DbfTable? opened = null;
+            CdxFile? cdx = null;
+            try
+            {
+                (opened, cdx) = Session.OpenNamedTable(table);
+                path = opened.SourcePath;
+            }
+            catch { return null; }
+            finally { cdx?.Dispose(); opened?.Dispose(); }
+        }
+        return path is null ? null : Path.GetFullPath(BeginTxWrite(path));
     }
 
     /// <summary>

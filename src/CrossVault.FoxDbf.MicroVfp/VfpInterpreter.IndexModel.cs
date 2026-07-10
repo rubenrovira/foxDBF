@@ -524,7 +524,7 @@ public sealed partial class VfpInterpreter
     /// incremental index maintenance), then re-check every candidate tag for a duplicate key. A violation
     /// rolls the write back (the .dbf/.cdx pre-image) and raises the same catchable error INDEX ON … CANDIDATE
     /// raises.</summary>
-    private void EnforceCandidateInsert(InsertStmt ins, string path)
+    private void EnforceCandidateInsert(InsertStmt ins, string path, string? candidateRegistrationPath = null)
     {
         var pre = CaptureSnapshot(path);
         try
@@ -533,7 +533,7 @@ public sealed partial class VfpInterpreter
             catch { RestoreSnapshot(pre); throw; }
             ReopenFileAreas(path);
 
-            string? bad = FirstViolatedCandidate(path);
+            string? bad = FirstViolatedCandidate(path, candidateRegistrationPath);
             if (bad is not null)
             {
                 RestoreSnapshot(pre);
@@ -546,9 +546,9 @@ public sealed partial class VfpInterpreter
 
     /// <summary>The first registered CANDIDATE tag on <paramref name="path"/> that now holds a duplicate key,
     /// or null when all are still unique. Opens the table + its structural <c>.cdx</c> read-only.</summary>
-    private string? FirstViolatedCandidate(string path)
+    private string? FirstViolatedCandidate(string path, string? candidateRegistrationPath = null)
     {
-        var set = CandidateTagsFor(path);
+        var set = CandidateTagsFor(candidateRegistrationPath ?? path);
         if (set is null) return null;
         string cdx = Path.ChangeExtension(path, ".cdx");
         if (!File.Exists(cdx)) return null;
