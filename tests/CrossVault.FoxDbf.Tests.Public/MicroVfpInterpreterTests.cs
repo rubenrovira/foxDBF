@@ -260,6 +260,42 @@ PROCEDURE repl_one
 
     // ───────────────────────── SET REPROCESS TO 0 branches on ON ERROR ─────────────────────────
 
+    [Theory]
+    [InlineData("REPLACE ALL value WITH 'XX'")]
+    [InlineData("REPLACE REST value WITH 'XX'")]
+    [InlineData("REPLACE NEXT 2 value WITH 'XX'")]
+    [InlineData("REPLACE RECORD 2 value WITH 'XX'")]
+    [InlineData("REPLACE value WITH 'XX' FOR .T.")]
+    [InlineData("REPLACE value WITH 'XX' WHILE .T.")]
+    [InlineData("BLANK ALL")]
+    public void Replace_RecordScopeOrFilter_IsRejectedWithoutChangingTable(string command)
+    {
+        using var dir = new MicroVfpTestSupport.TempDir("repl_scope");
+        var interp = MicroVfpTestSupport.NewTastrade(dir, out var s);
+        using (s)
+        {
+            interp.Execute("USE tastrade!setup IN 0\nSELECT setup");
+            interp.Load(PrgParser.Parse(@"
+PROCEDURE snapshot_setup_values
+  LOCAL result
+  result = ''
+  SELECT setup
+  GO TOP
+  SCAN
+    result = result + ALLTRIM(value) + '|'
+  ENDSCAN
+  RETURN result
+"));
+            string before = interp.Call("snapshot_setup_values").AsString;
+            interp.Execute("SELECT setup\nGO TOP");
+
+            var ex = Assert.Throws<MicroVfpRuntimeException>(() => interp.Execute(command));
+
+            Assert.Equal("REPLACE: record scope/FOR/WHILE clauses are not supported.", ex.Message);
+            Assert.Equal(before, interp.Call("snapshot_setup_values").AsString);
+        }
+    }
+
     [Fact]
     public void SetReprocessTo0_WithOnErrorHandler_IsFailFast()
     {

@@ -245,6 +245,9 @@ public sealed partial class VfpInterpreter
 
     private void ExecReplace(ReplaceStmt rp)
     {
+        if (rp.Scope is not null || rp.For is not null || rp.While is not null)
+            throw new MicroVfpRuntimeException("REPLACE: record scope/FOR/WHILE clauses are not supported.");
+
         // Default scope = the CURRENT record of the target area (risk #4 — never the whole table).
         int area = rp.In is not null ? ResolveAreaRef(rp.In) : AreaOfClause(rp.Clauses[0]);
         var wa = Session.AreaAt(area);
