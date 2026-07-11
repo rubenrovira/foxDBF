@@ -11,7 +11,7 @@ namespace CrossVault.FoxDbf;
 /// the version's fixed width (16/32/48 bytes). The descriptor array is terminated
 /// by a <c>0x0D</c> byte, located via a non-destructive peek; each column's
 /// <see cref="DbfColumn.Offset"/> is the prefix-sum of prior lengths, so the
-/// invariant <c>RecordLength == 1 + Σ column.Length</c> holds.
+/// invariant <c>RecordLength &gt;= 1 + Σ column.Length</c> holds (trailing record slack is allowed).
 /// Owns its backing <see cref="Stream"/> and disposes it unless opened with
 /// <c>leaveOpen: true</c>.
 /// </remarks>
@@ -438,6 +438,14 @@ public sealed partial class DbfTable : IDisposable
                 $"use DbfTable.TryOpen for a non-throwing probe or DbfOptions.ForceVersion to force a layout (§A12).");
 
         var columns = ParseColumns(stream, rawHeader.Version, rawHeader.HeaderLength);
+        long requiredRecordLength = 1;
+        foreach (var column in columns)
+            requiredRecordLength += column.Length;
+        if (rawHeader.RecordLength < requiredRecordLength)
+            throw new DbfCorruptHeaderException(
+                $"Header record geometry is inconsistent: declared RecordLength={rawHeader.RecordLength}, " +
+                $"required={requiredRecordLength} from the physical field descriptors; " +
+                "use Recovery.Reconstruct to rebuild the record geometry.");
         if (columnTransform is not null)
             columns = columnTransform(columns);
 
