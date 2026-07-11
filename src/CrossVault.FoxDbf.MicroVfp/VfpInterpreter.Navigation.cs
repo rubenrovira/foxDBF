@@ -509,6 +509,13 @@ public sealed partial class VfpInterpreter
         return key;
     }
 
+    /// <summary>The natural (unpadded) byte needle used by interpreter character seeks. GENERAL and other
+    /// non-MACHINE CDX tags store collation weights; MACHINE tags retain their existing Latin-1 bytes.</summary>
+    private static byte[] NaturalCharacterSeekNeedle(CdxTag tag, VfpValue key)
+        => tag.IsCharacterKey && !string.Equals(tag.Collation, "MACHINE", StringComparison.OrdinalIgnoreCase)
+            ? VfpCollations.FromSortSequence(tag.Collation).GetCollatedKey(key.AsString.AsSpan())
+            : Encoding.Latin1.GetBytes(key.AsString);
+
     /// <summary>Whether one stored CHARACTER key falls in the active SET KEY range, compared on collated
     /// key bytes. Single-value: SET EXACT ON ⇒ full byte-equality against the padded bound; SET EXACT OFF ⇒
     /// the (unpadded) bound weights are a byte PREFIX of the stored key (SEEK semantics).</summary>
@@ -913,6 +920,10 @@ public sealed partial class VfpInterpreter
         using var src = OpenOrderSource(area, identity);
         if (src is null) { m.Found = false; return false; }
 
+        byte[]? characterNeedle = src.CdxTag is { IsCharacterKey: true } characterTag && key.Type == VfpType.Character
+            ? NaturalCharacterSeekNeedle(characterTag, key)
+            : null;
+
         uint? recno = null;
         if (src.CdxTag is { } t)
         {
@@ -923,8 +934,8 @@ public sealed partial class VfpInterpreter
             // The RELATION reposition seek honours SET EXACT (hackfox quirk 1): under EXACT ON a prefix-only
             // hit on a composite child key is NOT a match (→ child EOF); the SEEK command path keeps its
             // always-prefix behaviour.
-            recno = (t.IsCharacterKey && key.Type == VfpType.Character)
-                ? t.Seek(Encoding.Latin1.GetBytes(key.AsString).AsSpan(), relationSeek && _ctx.Exact)
+            recno = characterNeedle is not null
+                ? t.Seek(characterNeedle.AsSpan(), relationSeek && _ctx.Exact)
                 : t.Seek(key.ToClr() ?? string.Empty);
         }
         else if (src.Idx is not null)
@@ -942,7 +953,7 @@ public sealed partial class VfpInterpreter
                 // CdxTag.Seek walks stored ascending bytes. For a descending controlling order it is only an
                 // existence probe; duplicate-key positioning must land on the first matching visible entry in
                 // that order.
-                int vis = FirstVisibleSeekMatch(src, key, wa);
+                int vis = FirstVisibleSeekMatch(src, key, wa, characterNeedle);
                 if (vis >= 1)
                     hit = vis;
                 else
@@ -959,7 +970,7 @@ public sealed partial class VfpInterpreter
             // (relationSeek) keeps its own established semantics and is deliberately left untouched.
             if (!relationSeek && !Visible(wa, hit))
             {
-                int vis = FirstVisibleSeekMatch(src, key, wa);
+                int vis = FirstVisibleSeekMatch(src, key, wa, characterNeedle);
                 if (vis >= 1)
                 {
                     m.RecNo = vis; m.Eof = false; m.Bof = false; m.Found = true; m.Cached = null;
@@ -980,7 +991,7 @@ public sealed partial class VfpInterpreter
         // (s4g268 — SEEK only, not relation repositioning); NEAR OFF (default) parks at EOF.
         if (_setNear && !relationSeek)
         {
-            int nearRec = NearRecord(src, key, area);
+            int nearRec = NearRecord(src, key, area, characterNeedle);
             if (nearRec >= 1)
             {
                 m.RecNo = nearRec; m.Eof = false; m.Bof = false; m.Found = false; m.Cached = null;
@@ -998,7 +1009,7 @@ public sealed partial class VfpInterpreter
     /// MATCH the seek key — walking the controlling order. This extends VFP's deleted-record skip to every
     /// visibility gate. Returns the recno, or −1 when every matching entry is hidden (⇒ the caller parks the
     /// pointer at EOF with FOUND()=.F.). Works over a CDX tag OR a standalone <c>.idx</c> source.</summary>
-    private int FirstVisibleSeekMatch(OrderSource src, VfpValue key, VfpSession.WorkArea wa)
+    private int FirstVisibleSeekMatch(OrderSource src, VfpValue key, VfpSession.WorkArea wa, byte[]? characterNeedle)
     {
         var entries = OrderedEntries(src);
         if (_meta.TryGetValue(wa.Area, out var m) && m.OrderReversed)
@@ -1007,7 +1018,7 @@ public sealed partial class VfpInterpreter
         foreach (var (keyBytes, recno) in entries)
         {
             if (recno < 1 || recno > wa.Table.RecordCount) continue;
-            if (!SeekEntryMatches(keyBytes, key, src)) continue;
+            if (!SeekEntryMatches(keyBytes, key, src, characterNeedle)) continue;
             if (Visible(wa, recno)) return recno;
         }
         return -1;
@@ -1017,13 +1028,13 @@ public sealed partial class VfpInterpreter
     /// hit did? Character keys match by PREFIX (mirroring the raw-byte prefix seek DoSeekCore issues); every
     /// other type matches by VALUE equality. Used to walk the equal-key run when the first hit is
     /// filtered/deleted out.</summary>
-    private static bool SeekEntryMatches(byte[] keyBytes, VfpValue key, OrderSource src)
+    private static bool SeekEntryMatches(byte[] keyBytes, VfpValue key, OrderSource src, byte[]? characterNeedle)
     {
         if (src.CdxTag is { } t)
         {
             if (t.IsCharacterKey && key.Type == VfpType.Character)
             {
-                var needle = Encoding.Latin1.GetBytes(key.AsString);
+                var needle = characterNeedle ?? NaturalCharacterSeekNeedle(t, key);
                 if (keyBytes.Length < needle.Length) return false;
                 for (int i = 0; i < needle.Length; i++) if (keyBytes[i] != needle[i]) return false;
                 return true;
@@ -1074,7 +1085,7 @@ public sealed partial class VfpInterpreter
 
     /// <summary>SET NEAR: the record the pointer parks on after a failed SEEK — the first entry that sorts
     /// AFTER the seek key in the CONTROLLING order that is in-range and visible; −1 when past the end.</summary>
-    private int NearRecord(OrderSource src, VfpValue key, int area)
+    private int NearRecord(OrderSource src, VfpValue key, int area, byte[]? characterNeedle)
     {
         var wa = Session.AreaAt(area);
         if (wa is null) return -1;
@@ -1091,7 +1102,7 @@ public sealed partial class VfpInterpreter
 
         foreach (var (keyBytes, recno) in entries)
         {
-            int cmp = CompareStoredKeyToSeek(keyBytes, key, src);
+            int cmp = CompareStoredKeyToSeek(keyBytes, key, src, characterNeedle);
             bool after = descending ? cmp < 0 : cmp > 0;   // sorts strictly after the seek key.
             if (after && recno >= 1 && recno <= wa.Table.RecordCount && Visible(wa, recno))
                 return recno;
@@ -1101,7 +1112,7 @@ public sealed partial class VfpInterpreter
 
     /// <summary>Three-way compare a STORED key (index bytes) against the SEEK value: &gt;0 when the stored
     /// key sorts after the seek value, &lt;0 before, 0 equal — in the key's own encoding.</summary>
-    private static int CompareStoredKeyToSeek(byte[] keyBytes, VfpValue key, OrderSource src)
+    private static int CompareStoredKeyToSeek(byte[] keyBytes, VfpValue key, OrderSource src, byte[]? characterNeedle)
     {
         if (src.Idx is not null)
         {
@@ -1111,7 +1122,7 @@ public sealed partial class VfpInterpreter
         // CDX: compare the raw stored bytes against the seek needle (unsigned byte order).
         var t = src.CdxTag!;
         byte[] needle = t.IsCharacterKey && key.Type == VfpType.Character
-            ? Encoding.Latin1.GetBytes(key.AsString)
+            ? characterNeedle ?? NaturalCharacterSeekNeedle(t, key)
             : (IndexKey.Decode(keyBytes, t.KeyType).Value is null ? Array.Empty<byte>() : keyBytes); // fallback
         if (t.IsCharacterKey && key.Type == VfpType.Character)
         {

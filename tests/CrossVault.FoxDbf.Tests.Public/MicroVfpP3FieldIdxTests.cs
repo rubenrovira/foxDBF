@@ -217,6 +217,20 @@ public sealed class MicroVfpP3FieldIdxTests
         Assert.Equal(2m, b.Num("RECNO()"));            // …still parked on rec 2.
     }
 
+    [Fact]
+    public void InterpreterGeneralCollatedKeyMatch_HitAndMissDoNotMovePointer()
+    {
+        using var b = new Bench();
+        b.Create("ktab", new[] { new DbfColumnDef("id", 'I'), new DbfColumnDef("nm", 'C', 8) },
+            new object?[] { 10, "Alpha" }, new object?[] { 20, "Beta" }, new object?[] { 30, "Gamma" });
+        b.Run("USE ktab\nSET COLLATE TO GENERAL\nINDEX ON nm TAG nmtag\nGO 2");
+
+        Assert.True(b.Bool("KEYMATCH('alpha', 1)"));
+        Assert.Equal(2m, b.Num("RECNO()"));
+        Assert.False(b.Bool("KEYMATCH('missing', 1)"));
+        Assert.Equal(2m, b.Num("RECNO()"));
+    }
+
     // ─────────────────────────── (8) CLOSE INDEXES — non-structural only ───────────────────────────
 
     [Fact]

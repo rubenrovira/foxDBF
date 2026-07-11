@@ -214,9 +214,14 @@ public sealed partial class VfpInterpreter
 
         uint? recno = null;
         if (src.CdxTag is { } t)
-            recno = (t.IsCharacterKey && key.Type == VfpType.Character)
-                ? t.Seek(Encoding.Latin1.GetBytes(key.AsString).AsSpan(), false)
+        {
+            byte[]? characterNeedle = t.IsCharacterKey && key.Type == VfpType.Character
+                ? NaturalCharacterSeekNeedle(t, key)
+                : null;
+            recno = characterNeedle is not null
+                ? t.Seek(characterNeedle.AsSpan(), false)
                 : t.Seek(key.ToClr() ?? string.Empty);
+        }
         else if (src.Idx is not null)
             recno = SeekIdx(src, key);
         return recno is uint r && r >= 1 && r <= (uint)wa.Table.RecordCount;

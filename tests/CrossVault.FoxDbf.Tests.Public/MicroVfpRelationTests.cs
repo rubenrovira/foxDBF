@@ -313,6 +313,37 @@ public sealed class MicroVfpRelationTests
         }
     }
 
+    [Fact]
+    public void InterpreterGeneralCollatedRelation_RepositionsOnEquivalentFullKeyUnderExactOn()
+    {
+        var b = new Bench();
+        b.CreateTable("customer", new[] { C("cust_id", 4) }, w =>
+        {
+            w.AppendRecord("a001");
+            w.AppendRecord("a002");
+        });
+        b.CreateTable("orders", new[] { C("ord_id", 6), C("cust_id", 4) }, w =>
+        {
+            w.AppendRecord("O1", "A001");
+            w.AppendRecord("O2", "A002");
+        });
+        b.Open();
+        using (b)
+        {
+            b.Run("SELECT 0\nUSE customer\nSELECT 0\nUSE orders\n" +
+                  "SET COLLATE TO GENERAL\nINDEX ON cust_id TAG custord");
+            b.Run("SET EXACT ON\nSELECT customer\nSET RELATION TO cust_id INTO orders\nGO TOP");
+
+            Assert.False(b.Bool("EOF('orders')"));
+            Assert.Equal(1m, b.Num("RECNO('orders')"));
+            Assert.Equal("A001", b.Str("orders.cust_id").TrimEnd());
+
+            b.Run("GO 2");
+            Assert.False(b.Bool("EOF('orders')"));
+            Assert.Equal(2m, b.Num("RECNO('orders')"));
+        }
+    }
+
     /// <summary>SET SKIP one-to-many clamp on a NUMERIC (integer) relation key: a programmatic SKIP in the
     /// child walks the matching rows, then goes EOF past the last match instead of leaking into the next
     /// parent group. Guards the fix where the group-boundary check compared numeric keys by full value

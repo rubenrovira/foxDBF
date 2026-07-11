@@ -189,6 +189,52 @@ public sealed class MicroVfpIndexWriteTests
     }
 
     [Fact]
+    public void InterpreterGeneralCollatedSeek_FullPrefixAndLookupFindRows()
+    {
+        using var b = new Bench();
+        b.Run("USE people\nSET COLLATE TO GENERAL\nINDEX ON name TAG g\nSET ORDER TO g");
+
+        b.Run("=SEEK('alice', 'people', 'g')");
+        Assert.True(b.Bool("FOUND()"));
+        Assert.Equal(2m, b.Num("RECNO()"));
+
+        b.Run("=SEEK('ali', 'people', 'g')");
+        Assert.True(b.Bool("FOUND()"));
+        Assert.Equal(2m, b.Num("RECNO()"));
+
+        Assert.Equal("alice", b.Str("LOOKUP(name, 'alice', name, 'g')").TrimEnd());
+        Assert.True(b.Bool("FOUND()"));
+    }
+
+    [Fact]
+    public void InterpreterGeneralCollatedSeek_DeletedEquivalentDescendingLandsOnVisibleRow()
+    {
+        using var b = new Bench();
+        b.Run("USE people\nGO 2\nDELETE\nGO 4\nREPLACE name WITH 'ALICE'\n" +
+              "SET DELETED OFF\nSET COLLATE TO GENERAL\nINDEX ON name TAG g DESCENDING\n" +
+              "SET ORDER TO g\nSET DELETED ON");
+
+        b.Run("=SEEK('alice', 'people', 'g')");
+
+        Assert.True(b.Bool("FOUND()"));
+        Assert.False(b.Bool("DELETED()"));
+        Assert.Equal(4m, b.Num("RECNO()"));
+    }
+
+    [Fact]
+    public void InterpreterGeneralCollatedSeek_SetNearUsesCollatedSortPosition()
+    {
+        using var b = new Bench();
+        b.Run("USE people\nSET COLLATE TO GENERAL\nINDEX ON name TAG g\nSET ORDER TO g\nSET NEAR ON");
+
+        b.Run("=SEEK('Bzz', 'people', 'g')");
+
+        Assert.False(b.Bool("FOUND()"));
+        Assert.False(b.Bool("EOF()"));
+        Assert.Equal("Charlie", b.Str("name").TrimEnd());
+    }
+
+    [Fact]
     public void SetCollateTo_UnsupportedSequence_Raises()
     {
         using var b = new Bench();
