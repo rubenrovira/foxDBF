@@ -762,25 +762,65 @@ public sealed partial class DbfWriter : IDisposable
         if (blocks <= 0)
             blocks = 1;
 
-        uint pointer = _fptNextFree;
-        long pos = (long)pointer * _fptBlockSize;
-
         var buffer = new byte[blocks * _fptBlockSize];
         // FPT block header is BIG-endian: type (1 = text/memo) @0, content length @4.
         BinaryPrimitives.WriteUInt32BigEndian(buffer.AsSpan(0, 4), 1);
         BinaryPrimitives.WriteUInt32BigEndian(buffer.AsSpan(4, 4), (uint)content.Length);
         content.CopyTo(buffer, 8);
 
+        if (_lockMode == LockMode.Shared)
+        {
+            // S4FOX memo-file lock. Reserve the block range in the header while holding the
+            // sidecar lock, then release it before dumping the payload, as CodeBase does.
+            const long memoLockPosition = 0x40000000L;
+            uint pointer;
+
+#pragma warning disable CA1416 // FileStream.Lock/Unlock are supported on the Windows target used for VFP interop.
+            _fpt!.Lock(memoLockPosition, 1);
+            try
+            {
+                Span<byte> diskHeader = stackalloc byte[4];
+                if (RandomAccess.Read(_fptHandle!, diskHeader, 0) != diskHeader.Length)
+                    throw new DbfWriteException("Could not read the FPT NextFree header.");
+
+                uint diskNextFree = BinaryPrimitives.ReadUInt32BigEndian(diskHeader);
+                pointer = Math.Max(_fptNextFree, diskNextFree);
+                ulong reservationEnd = (ulong)pointer + (uint)blocks;
+                if (pointer > int.MaxValue || reservationEnd > uint.MaxValue)
+                    throw new DbfWriteException(
+                        $"FPT memo allocation at block {pointer} with length {blocks} cannot be represented.");
+
+                _fptNextFree = (uint)reservationEnd;
+
+                BinaryPrimitives.WriteUInt32BigEndian(diskHeader, _fptNextFree);
+                RandomAccess.Write(_fptHandle!, diskHeader, 0);
+                _fpt.Flush(flushToDisk: true);
+            }
+            finally
+            {
+                _fpt.Unlock(memoLockPosition, 1);
+            }
+#pragma warning restore CA1416
+
+            long sharedPos = (long)pointer * _fptBlockSize;
+            _fpt.Seek(sharedPos, SeekOrigin.Begin);
+            _fpt.Write(buffer, 0, buffer.Length);
+            return (int)pointer;
+        }
+
+        uint exclusivePointer = _fptNextFree;
+        long pos = (long)exclusivePointer * _fptBlockSize;
+
         _fpt!.Seek(pos, SeekOrigin.Begin);
         _fpt.Write(buffer, 0, buffer.Length);
 
-        _fptNextFree = pointer + (uint)blocks;
+        _fptNextFree = exclusivePointer + (uint)blocks;
         var head = new byte[4];
         BinaryPrimitives.WriteUInt32BigEndian(head, _fptNextFree);
         _fpt.Seek(0, SeekOrigin.Begin);
         _fpt.Write(head, 0, 4);
 
-        return (int)pointer;
+        return (int)exclusivePointer;
     }
 
     private byte[] EncodeMemoText(DbfColumn col, string s)
