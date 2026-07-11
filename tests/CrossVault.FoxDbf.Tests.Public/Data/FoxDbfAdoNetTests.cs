@@ -126,6 +126,29 @@ public sealed class FoxDbfAdoNetTests
         Assert.Equal(new[] { 'x', 'y' }, chars);
     }
 
+    [Fact]
+    public void Reader_Enumeration_ReturnsDbDataRecord_WithNormalizedValues()
+    {
+        using var db = new PersonDb();
+        using var conn = db.Open();
+        var result = new SqlResult(
+            new[]
+            {
+                new SqlColumn("nullable", 'C', 3, 0, typeof(string)),
+                new SqlColumn("hired", 'D', 8, 0, typeof(DateOnly)),
+            },
+            new[] { new object?[] { null, new DateOnly(2024, 2, 29) } });
+        using var reader = new FoxDbfDataReader(result, conn, CommandBehavior.Default);
+
+        var records = reader.Cast<DbDataRecord>().ToList();
+
+        var dataRecord = Assert.Single(records);
+        Assert.Same(DBNull.Value, dataRecord.GetValue(0));
+        Assert.Equal(new DateTime(2024, 2, 29), dataRecord.GetValue(1));
+        Assert.IsType<DateTime>(dataRecord.GetValue(1));
+        Assert.IsNotType<object[]>(dataRecord);
+    }
+
     // ---- (2) ExecuteScalar + ExecuteNonQuery (DML) ----------------------------------------
 
     [Fact]

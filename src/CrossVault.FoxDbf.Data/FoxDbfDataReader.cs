@@ -392,7 +392,7 @@ public sealed class FoxDbfDataReader : DbDataReader
 
     public override IEnumerator GetEnumerator()
     {
-        return new DataReaderEnumerator(this);
+        return new DbEnumerator(this);
     }
 
     public override DataTable? GetSchemaTable()
@@ -448,33 +448,4 @@ public sealed class FoxDbfDataReader : DbDataReader
         base.Dispose(disposing);
     }
 
-    private sealed class DataReaderEnumerator : IEnumerator
-    {
-        private readonly FoxDbfDataReader _reader;
-        private bool _started;
-
-        public DataReaderEnumerator(FoxDbfDataReader reader) => _reader = reader;
-
-        public object Current
-        {
-            get
-            {
-                if (_reader._currentRow == null)
-                    throw new InvalidOperationException("No current row.");
-                return _reader._currentRow;
-            }
-        }
-
-        public bool MoveNext()
-        {
-            if (!_started)
-            {
-                _started = true;
-                return _reader.Read();
-            }
-            return _reader.Read();
-        }
-
-        public void Reset() => throw new NotSupportedException("DataReader does not support Reset.");
-    }
 }
