@@ -1174,14 +1174,15 @@ public static class PrgParser
             string rest = rest0;
             var (head, segs) = Carve(rest, "FOR", "WHILE", "IN");
             string? scope = head.Trim().Length == 0 ? null : head.Trim();
-            PrgExpr? forE = null;
+            PrgExpr? forE = null, whileE = null;
             NameRef? inArea = null;
             foreach (var (k, b) in segs)
             {
                 if (k == "FOR") forE = PrgExpr.Parse(b);
+                else if (k == "WHILE") whileE = PrgExpr.Parse(b);
                 else if (k == "IN") inArea = ToNameRef(FirstToken(b));
             }
-            return new DeleteStmt(scope, forE, inArea);
+            return new DeleteStmt(scope, forE, whileE, inArea);
         }
 
         /// <summary><c>DELETE TAG &lt;name&gt;[, …] | ALL [OF &lt;cdx&gt;] [IN area]</c>. A single trailing
@@ -1248,7 +1249,8 @@ public static class PrgParser
             var (head, segs) = Carve(rest, "FOR", "WHILE");
             string? scope = head.Trim().Length == 0 ? null : head.Trim();
             PrgExpr? forE = segs.FirstOrDefault(s => s.Kw == "FOR").Body is { Length: > 0 } b ? PrgExpr.Parse(b) : null;
-            return new RecallStmt(scope, forE);
+            PrgExpr? whileE = segs.FirstOrDefault(s => s.Kw == "WHILE").Body is { Length: > 0 } w ? PrgExpr.Parse(w) : null;
+            return new RecallStmt(scope, forE, whileE);
         }
 
         private static SumStmt BuildSum(string text)

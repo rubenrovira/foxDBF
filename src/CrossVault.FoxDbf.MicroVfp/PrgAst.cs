@@ -293,8 +293,8 @@ internal sealed record ReplaceStmt(
     PrgExpr? While,
     NameRef? In) : PrgStatement;
 
-internal sealed record DeleteStmt(string? Scope, PrgExpr? For, NameRef? In) : PrgStatement;
-internal sealed record RecallStmt(string? Scope, PrgExpr? For) : PrgStatement;
+internal sealed record DeleteStmt(string? Scope, PrgExpr? For, PrgExpr? While, NameRef? In) : PrgStatement;
+internal sealed record RecallStmt(string? Scope, PrgExpr? For, PrgExpr? While) : PrgStatement;
 
 /// <summary><c>INSERT INTO …</c>; routed to the existing SQL parser when possible. <see cref="Parsed"/> is
 /// the parse captured at PRG-parse time (non-null for a well-formed INSERT); <see cref="ParsedCache"/> is a

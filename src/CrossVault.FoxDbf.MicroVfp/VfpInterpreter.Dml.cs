@@ -401,7 +401,8 @@ public sealed partial class VfpInterpreter
 
     private void ExecDelete(DeleteStmt del)
     {
-        if (del.Scope is not null || del.For is not null) return; // only NEXT-1 default scope is in scope.
+        if (del.Scope is not null || del.For is not null || del.While is not null)
+            throw new MicroVfpRuntimeException("DELETE: record scope/FOR/WHILE clauses are not supported.");
         int area = del.In is not null ? ResolveAreaRef(del.In) : Session.CurrentArea;
         var mdel = Meta(area);
         if (mdel.Buffering > 1 && Session.AreaAt(area) is { } wdel) { BufferDeleteFlag(area, wdel, mdel, deleted: true); return; }
@@ -412,7 +413,8 @@ public sealed partial class VfpInterpreter
 
     private void ExecRecall(RecallStmt rc)
     {
-        if (rc.Scope is not null || rc.For is not null) return;
+        if (rc.Scope is not null || rc.For is not null || rc.While is not null)
+            throw new MicroVfpRuntimeException("RECALL: record scope/FOR/WHILE clauses are not supported.");
         int area = Session.CurrentArea;
         var mrc = Meta(area);
         if (mrc.Buffering > 1 && Session.AreaAt(area) is { } wrc) { BufferDeleteFlag(area, wrc, mrc, deleted: false); return; }
