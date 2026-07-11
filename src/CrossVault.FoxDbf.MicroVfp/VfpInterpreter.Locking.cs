@@ -142,8 +142,15 @@ public sealed partial class VfpInterpreter
         // A whole-file lock supersedes our own record locks. They sit INSIDE the file range, and Windows
         // rejects an overlapping lock on the SAME handle, so release our own tracked record locks first (they
         // are re-covered by the file lock). Cross-session exclusion is unaffected (the OS still denies others).
+        int[] heldRecords = set.Records.ToArray();
         ReleaseOwnRecordLocks(set);
         bool ok = TryAcquireWithReprocess(writer.LockFile, () => set.File = true);
+        if (!ok)
+        {
+            foreach (int rec in heldRecords)
+                if (TryAcquireOnce(() => { if (rec == 0) writer.LockHeader(); else writer.Lock(rec); }))
+                    set.Records.Add(rec);
+        }
         return VfpValue.Logical(ok);
     }
 

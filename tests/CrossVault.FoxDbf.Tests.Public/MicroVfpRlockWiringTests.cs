@@ -162,6 +162,31 @@ public sealed class MicroVfpRlockWiringTests
     }
 
     [WindowsOnlyFact]
+    public void FailedFlock_PreservesCallersExistingRecordLock()
+    {
+        using var s = new Shared(rows: 9);
+        var a = s.NewClient(out var sa);
+        var b = s.NewClient(out var sb);
+        try
+        {
+            a.Execute("USE bt\nSET REPROCESS TO 1\nGO 5");
+            Assert.True(Bool(a, "RLOCK()"));
+            Assert.True(Bool(a, "ISRLOCKED(5)"));
+
+            b.Execute("USE bt\nSET REPROCESS TO 1\nGO 9");
+            Assert.True(Bool(b, "RLOCK()"));                  // foreign record lock forces A's FLOCK failure.
+
+            Assert.False(Bool(a, "FLOCK()"));
+            Assert.True(Bool(a, "ISRLOCKED(5)"));            // failed promotion must restore A's old lock.
+            Assert.True(Shared.RecordLockedOnDisk(s.DbfPath, 5));
+
+            b.Execute("GO 5");
+            Assert.False(Bool(b, "RLOCK()"));                // A still owns rec5 at the OS layer.
+        }
+        finally { sa.Dispose(); sb.Dispose(); }
+    }
+
+    [WindowsOnlyFact]
     public void IsRlockedAndIsFlocked_ReportOwnHeldLocks()
     {
         using var s = new Shared();
