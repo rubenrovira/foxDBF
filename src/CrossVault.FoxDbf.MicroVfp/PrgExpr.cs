@@ -1,4 +1,4 @@
-using System.Text.RegularExpressions;
+using System.Text;
 using CrossVault.FoxDbf.Expressions;
 
 namespace CrossVault.FoxDbf.MicroVfp;
@@ -32,8 +32,51 @@ internal sealed class PrgExpr
     }
 
     // VFP's by-reference marker '@var' is legal only in argument position; it is a no-op for
-    // PARSE-structure, so we strip it as a fallback when the raw fragment won't parse.
-    private static readonly Regex ByRef = new(@"@(?=[A-Za-z_])", RegexOptions.Compiled);
+    // PARSE-structure, so we strip it as a fallback when the raw fragment won't parse. The
+    // scanner must leave @ characters in all literal forms untouched.
+    private static bool IsIdentifierStart(char c) => char.IsAsciiLetter(c) || c == '_';
+
+    private static string StripByRefMarkers(string text)
+    {
+        var sb = new StringBuilder(text.Length);
+        bool inString = false;
+        char quote = '\0';
+
+        for (int i = 0; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (inString)
+            {
+                sb.Append(c);
+                if (c == quote) inString = false;
+                continue;
+            }
+
+            if (c is '\'' or '"')
+            {
+                inString = true;
+                quote = c;
+                sb.Append(c);
+                continue;
+            }
+
+            if (c == '[' && PrgScan.IsBracketLiteralStart(text, i))
+            {
+                int close = text.IndexOf(']', i + 1);
+                int end = close < 0 ? text.Length : close + 1;
+                sb.Append(text, i, end - i);
+                i = end - 1;
+                continue;
+            }
+
+            if (c == '@' && i + 1 < text.Length && IsIdentifierStart(text[i + 1]))
+                continue;
+
+            sb.Append(c);
+        }
+
+        return sb.ToString();
+    }
 
     /// <summary>
     /// Parses <paramref name="text"/> via <see cref="VfpExpression.Parse"/>. Never throws:
@@ -52,7 +95,7 @@ internal sealed class PrgExpr
         }
         catch (ExpressionException)
         {
-            var stripped = ByRef.Replace(norm, string.Empty);
+            var stripped = StripByRefMarkers(norm);
             if (!string.Equals(stripped, norm, System.StringComparison.Ordinal))
             {
                 try { return new PrgExpr(t, VfpExpression.Parse(stripped)); }
