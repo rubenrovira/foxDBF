@@ -576,8 +576,9 @@ public sealed partial class VfpInterpreter
 
     // GETFLDSTATE(cFieldName | nFieldNumber [, cAlias]) — the per-field buffer change state: 1 unchanged,
     // 2 changed, 3 appended (unchanged field), 4 appended+changed. nFieldNumber is 1-based (0 ⇒ the record
-    // delete-state). A buffered-but-unedited field is 1. An UNBUFFERED area raises catchable VFP error 1586
-    // (verified live). (s4g395: on real tables the state is derived from the buffer; SETFLDSTATE is inert.)
+    // delete-state). A buffered-but-unedited field is 1. An unknown character name raises catchable VFP
+    // error 11, while an UNBUFFERED area raises error 1586 (verified live). (s4g395: on real tables the
+    // state is derived from the buffer; SETFLDSTATE is inert.)
     private VfpValue FnGetFldState(VfpValue[] a)
     {
         if (a.Length == 0) return VfpValue.Integer(1);
@@ -587,7 +588,12 @@ public sealed partial class VfpInterpreter
         var m = Meta(area);
         if (m.Buffering <= 1)
             throw new MicroVfpRuntimeException("Function requires row or table buffering mode.", 1586);
+        bool isField0 = IsNumeric(a[0]) && a[0].AsNumber == 0m;
         int colIdx = IsNumeric(a[0]) ? (int)a[0].AsNumber - 1 : ColumnIndex(wa.Table, StripQualifier(a[0].AsString));
+        // -1 is reserved for numeric field 0 (the record delete-state). An unresolved character
+        // name is a real VFP error, not another spelling of field 0.
+        if (!isField0 && colIdx < 0)
+            throw new MicroVfpRuntimeException("Field name was not found.", 11);
         if (m.Buf is not { } buf) return VfpValue.Integer(1);   // buffering on, nothing pending.
         int rcTable = wa.Table.RecordCount;
         if (m.RecNo > rcTable)                                  // a buffered appended row.

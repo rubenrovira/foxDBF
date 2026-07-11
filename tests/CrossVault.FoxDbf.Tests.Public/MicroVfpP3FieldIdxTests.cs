@@ -453,6 +453,24 @@ public sealed class MicroVfpP3FieldIdxTests
         Assert.False(b.Bool("SETFLDSTATE(99, 2)"));
     }
 
+    [Fact]
+    public void FldState_UnknownNameDoesNotAliasNumericZero()
+    {
+        using var b = new Bench();
+        b.Create("fntab", new[] { new DbfColumnDef("id", 'I'), new DbfColumnDef("nm", 'C', 10) },
+            new object?[] { 1, "a" });
+        b.Run("USE fntab\n=CURSORSETPROP('Buffering', 5)\nGO 1");
+
+        Assert.Equal(1m, b.Num("GETFLDSTATE(0)"));
+        Assert.True(b.Bool("SETFLDSTATE(0, 2)"));
+        Assert.Equal(1m, b.Num("GETFLDSTATE(0)")); // SETFLDSTATE is inert for a real table.
+
+        var exGet = Assert.Throws<MicroVfpRuntimeException>(() => b.Run("=GETFLDSTATE('typo')"));
+        Assert.Equal(11, exGet.VfpErrorNumber);
+        var exSet = Assert.Throws<MicroVfpRuntimeException>(() => b.Run("=SETFLDSTATE('typo', 2)"));
+        Assert.Equal(11, exSet.VfpErrorNumber);
+    }
+
     // ─────────────────────────── (18) IDXCOLLATE — MACHINE vs GENERAL ───────────────────────────
 
     [Fact]

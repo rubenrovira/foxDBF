@@ -266,8 +266,9 @@ public sealed partial class VfpInterpreter
     /// <summary>SETFLDSTATE(cField|nField, nState [, area]) — validates the field + state and returns .T./.F.
     /// accordingly, but is INERT on a real table: GETFLDSTATE keeps deriving the state from the actual buffer
     /// (hackfox s4g395 — the view-buffering effect is not modelled). An UNBUFFERED area raises catchable VFP
-    /// error 1586 (verified live), matching GETFLDSTATE. FLAG: view TABLEUPDATE steering is out of scope (no
-    /// view model).</summary>
+    /// error 1586 (verified live), matching GETFLDSTATE; an unknown character name raises catchable error 11,
+    /// while numeric field 0 remains the record delete-state. FLAG: view TABLEUPDATE steering is out of
+    /// scope (no view model).</summary>
     private bool FnSetFldState(VfpValue[] a)
     {
         if (a.Length < 2) return false;
@@ -276,9 +277,13 @@ public sealed partial class VfpInterpreter
         if (wa is null) return false;
         if (Meta(area).Buffering <= 1)
             throw new MicroVfpRuntimeException("Function requires row or table buffering mode.", 1586);
+        bool isField0 = IsNumeric(a[0]) && a[0].AsNumber == 0m;
         int colIdx = IsNumeric(a[0]) ? (int)a[0].AsNumber - 1 : ColumnIndex(wa.Table, StripQualifier(a[0].AsString));
-        // field 0 (record delete-state) or a valid column, and a documented state code.
-        bool fieldOk = colIdx == -1 || (colIdx >= 0 && colIdx < wa.Table.Columns.Count);
+        // -1 is the internal column index for the legitimate numeric field 0. Do not let it also
+        // accept an unresolved character name: VFP9 raises error 11 for an unknown field name.
+        if (!isField0 && colIdx < 0)
+            throw new MicroVfpRuntimeException("Field name was not found.", 11);
+        bool fieldOk = isField0 || (colIdx >= 0 && colIdx < wa.Table.Columns.Count);
         int state = (int)a[1].AsNumber;
         bool stateOk = state is >= 0 and <= 4;
         return fieldOk && stateOk;
