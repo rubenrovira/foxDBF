@@ -242,6 +242,71 @@ public sealed class SqlSelectExecutorTests : IDisposable
     public void GroupBy_With_OrderBy_Matches_Oracle()
         => CheckOrdered("SELECT city, COUNT(*) FROM person GROUP BY city ORDER BY city");
 
+    [Fact]
+    public void Having_GroupedSumPlusOne_AppliesTheThresholdToTheCompoundValue()
+    {
+        var rows = SqlTestSupport.Materialize(_session.Execute(
+            "SELECT city, SUM(amount) + 1 AS adjusted FROM person " +
+            "GROUP BY city HAVING SUM(amount) + 1 > 650 ORDER BY city")!);
+
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(new object?[] { "Hamburg", 651m }, rows[0]);
+        Assert.Equal(new object?[] { "Munich", 851m }, rows[1]);
+    }
+
+    [Fact]
+    public void Having_GroupedSumTimesTwo_AppliesTheThresholdToTheCompoundValue()
+    {
+        var rows = SqlTestSupport.Materialize(_session.Execute(
+            "SELECT city, SUM(amount) * 2 AS doubled FROM person " +
+            "GROUP BY city HAVING SUM(amount) * 2 > 1000 ORDER BY city")!);
+
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(new object?[] { "Hamburg", 1300m }, rows[0]);
+        Assert.Equal(new object?[] { "Munich", 1700m }, rows[1]);
+    }
+
+    [Fact]
+    public void Having_GroupedSumPlusCount_CombinesAggregatesBeforeFiltering()
+    {
+        var rows = SqlTestSupport.Materialize(_session.Execute(
+            "SELECT city, SUM(amount) + COUNT(amount) AS combined FROM person " +
+            "GROUP BY city HAVING SUM(amount) + COUNT(amount) > 650 ORDER BY city")!);
+
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(new object?[] { "Hamburg", 652m }, rows[0]);
+        Assert.Equal(new object?[] { "Munich", 853m }, rows[1]);
+    }
+
+    [Fact]
+    public void Having_NestedScalarAroundGroupedSum_IsEvaluatedBeforeFiltering()
+    {
+        var rows = SqlTestSupport.Materialize(_session.Execute(
+            "SELECT city, ABS(SUM(amount)) AS absoluteTotal FROM person " +
+            "GROUP BY city HAVING ABS(SUM(amount)) > 700 ORDER BY city")!);
+
+        Assert.Equal(new object?[] { "Munich", 850m }, Assert.Single(rows));
+    }
+
+    [Fact]
+    public void Having_UngroupedSumPlusOne_EmitsTheSingleAggregateRow()
+    {
+        var rows = SqlTestSupport.Materialize(_session.Execute(
+            "SELECT SUM(amount) + 1 AS adjusted FROM person HAVING SUM(amount) + 1 > 2000")!);
+
+        Assert.Equal(new object?[] { 2001m }, Assert.Single(rows));
+    }
+
+    [Fact]
+    public void Having_AllNullAveragePlusOne_ExcludesThatGroup()
+    {
+        var rows = SqlTestSupport.Materialize(_session.Execute(
+            "SELECT active, AVG(IIF(active, amount, .NULL.)) + 1 AS adjusted FROM person " +
+            "GROUP BY active HAVING AVG(IIF(active, amount, .NULL.)) + 1 > 0 ORDER BY active")!);
+
+        Assert.Equal(new object?[] { true, 171m }, Assert.Single(rows));
+    }
+
     // ---- ORDER BY by an AGGREGATE column (must read the computed output, not re-evaluate) --
 
     [Theory]
