@@ -47,7 +47,15 @@ public readonly record struct DbfHeader
     /// <summary>Parse a header from a byte span (must hold at least the version-appropriate header).</summary>
     public static DbfHeader Read(ReadOnlySpan<byte> source)
     {
+        if (source.IsEmpty)
+            throw new DbfCorruptHeaderException("The DBF header is truncated: expected at least a version byte but received 0 bytes.");
+
         var versionByte = source[0];
+        int requiredLength = versionByte == 0x02 ? 8 : 32;
+        if (source.Length < requiredLength)
+            throw new DbfCorruptHeaderException(
+                $"The DBF header is truncated: version 0x{versionByte:x2} requires at least {requiredLength} bytes but received {source.Length}.");
+
         var version = DbfVersion.FromByte(versionByte);
 
         if (versionByte == 0x02)
