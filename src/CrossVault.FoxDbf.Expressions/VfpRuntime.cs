@@ -586,7 +586,7 @@ internal static class VfpRuntime
             if (p.Length > 0) pad = p[0];
         }
         if (s.Length >= len)
-            return VfpValue.Character(mode == 'L' ? s.Substring(s.Length - len) : s.Substring(0, len));
+            return VfpValue.Character(s.Substring(0, len));
         int total = len - s.Length;
         switch (mode)
         {

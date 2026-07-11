@@ -225,6 +225,17 @@ public sealed class ExpressionEngineTests
         => Assert.Equal(expected, Eval(expr).AsString);
 
     [Theory]
+    [InlineData("PADL('abcdef',3)")]
+    [InlineData("PADR('abcdef',3)")]
+    [InlineData("PADC('abcdef',3)")]
+    public void Pad_OverlongSource_TruncatesFromRight(string expression)
+    {
+        var parsed = VfpExpression.Parse(expression);
+        Assert.Equal("abc", parsed.Evaluate(TestRow.Empty).AsString);
+        Assert.Equal("abc", parsed.Compile()(TestRow.Empty).AsString);
+    }
+
+    [Theory]
     [InlineData("AT('CD','ABCDEF')", 3)]      // 1-based
     [InlineData("AT('x','ABC')", 0)]          // not found -> 0
     [InlineData("AT('A','ABABA',2)", 3)]      // 2nd occurrence
