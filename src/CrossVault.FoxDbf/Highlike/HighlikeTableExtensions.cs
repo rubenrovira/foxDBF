@@ -14,11 +14,12 @@ public static class HighlikeTableExtensions
     /// <summary>
     /// Attach a <see cref="HighlikeEngine"/> (with the given <paramref name="options"/>, or
     /// defaults) to <paramref name="table"/> as its opt-in query accelerator, and return the table
-    /// for fluent chaining. The result set is unaffected — Highlike only changes the plan (speed).
+    /// for fluent chaining. The table owns this created engine and disposes it when detached, replaced,
+    /// or when the table is disposed. The result set is unaffected — Highlike only changes the plan (speed).
     /// </summary>
     public static DbfTable UseHighlike(this DbfTable table, HighlikeOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(table);
-        return table.UseAccelerator(new HighlikeEngine(options));
+        return table.UseAccelerator(new HighlikeEngine(options), owned: true);
     }
 }

@@ -33,6 +33,7 @@ public sealed partial class DbfTable : IDisposable
     // Core surface the accelerator sub-project plugs into. Null → the Core QueryOptimizer
     // path runs unchanged. Dependency direction stays strictly Highlike → Core.
     private Query.IQueryAccelerator? _accelerator;
+    private bool _ownsAccelerator;
 
     // The opt-in read backend / drive-kind this table was opened with (§B-3). Carried so
     // OpenStructuralCdx() can forward the SAME backend to the sidecar .cdx page reader —
@@ -901,10 +902,23 @@ public sealed partial class DbfTable : IDisposable
     /// sub-project. Returns <see langword="this"/> for fluent chaining. While attached,
     /// <see cref="Query"/> / <see cref="ExplainQuery(string, Expressions.EvaluationContext?, Query.IQueryAccelerator?)"/>
     /// route through it; detached, the Core optimizer path runs byte-for-byte unchanged.
+    /// The caller retains ownership of accelerators attached through this public seam.
     /// </summary>
     public DbfTable UseAccelerator(Query.IQueryAccelerator? accelerator)
+        => UseAccelerator(accelerator, owned: false);
+
+    internal DbfTable UseAccelerator(Query.IQueryAccelerator? accelerator, bool owned)
     {
+        if (ReferenceEquals(_accelerator, accelerator))
+            return this; // A public same-reference reattach must not erase existing table ownership.
+
+        var previous = _accelerator;
+        bool disposePrevious = _ownsAccelerator;
+        if (disposePrevious && previous is IDisposable disposable)
+            disposable.Dispose();
+
         _accelerator = accelerator;
+        _ownsAccelerator = owned;
         return this;
     }
 
@@ -936,6 +950,12 @@ public sealed partial class DbfTable : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        var accelerator = _accelerator;
+        bool disposeAccelerator = _ownsAccelerator;
+        _accelerator = null;
+        _ownsAccelerator = false;
+        if (disposeAccelerator && accelerator is IDisposable disposable)
+            disposable.Dispose();
         // The sidecar memo file is owned by this table (§A6) — dispose it with us.
         _memo?.Dispose();
         if (!_leaveOpen)

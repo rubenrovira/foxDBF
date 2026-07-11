@@ -530,6 +530,77 @@ public sealed class HighlikeIndexCacheTests
         Assert.Equal(0, engine.CacheStatistics.ActiveWatchers);
     }
 
+    [Fact]
+    public void TableDispose_ReleasesWatcherOwnedByUseHighlike()
+    {
+        using var fx = new TempTable();
+        var table = DbfTable.Open(fx.Dbf).UseHighlike(
+            new HighlikeOptions { DriveKind = HighlikeDriveKind.Fixed });
+        using var engine = Assert.IsType<HighlikeEngine>(table.Accelerator);
+        _ = table.Query("ID = 1500");
+        Assert.True(engine.CacheStatistics.ActiveWatchers >= 1);
+
+        table.Dispose();
+
+        Assert.Equal(0, engine.CacheStatistics.ActiveWatchers);
+    }
+
+    [Fact]
+    public void ReplacingAndDetachingUseHighlike_DisposesEachPreviousOwnedEngine()
+    {
+        using var fx = new TempTable();
+        using var table = DbfTable.Open(fx.Dbf);
+        table.UseHighlike(new HighlikeOptions { DriveKind = HighlikeDriveKind.Fixed });
+        using var first = Assert.IsType<HighlikeEngine>(table.Accelerator);
+        _ = table.Query("ID = 1500");
+        Assert.True(first.CacheStatistics.ActiveWatchers >= 1);
+
+        table.UseHighlike(new HighlikeOptions { DriveKind = HighlikeDriveKind.Fixed });
+        using var second = Assert.IsType<HighlikeEngine>(table.Accelerator);
+        Assert.Equal(0, first.CacheStatistics.ActiveWatchers);
+        _ = table.Query("ID = 1500");
+        Assert.True(second.CacheStatistics.ActiveWatchers >= 1);
+
+        table.UseAccelerator(null);
+
+        Assert.Null(table.Accelerator);
+        Assert.Equal(0, second.CacheStatistics.ActiveWatchers);
+    }
+
+    [Fact]
+    public void CallerOwnedAccelerator_RemainsActiveUntilCallerDisposesIt()
+    {
+        using var fx = new TempTable();
+        using var engine = new HighlikeEngine(
+            new HighlikeOptions { DriveKind = HighlikeDriveKind.Fixed });
+        var table = DbfTable.Open(fx.Dbf).UseAccelerator(engine);
+        _ = table.Query("ID = 1500");
+        Assert.True(engine.CacheStatistics.ActiveWatchers >= 1);
+
+        table.Dispose();
+
+        Assert.True(engine.CacheStatistics.ActiveWatchers >= 1);
+        engine.Dispose();
+        Assert.Equal(0, engine.CacheStatistics.ActiveWatchers);
+    }
+
+    [Fact]
+    public void SameReferencePublicReattach_PreservesOwnershipAcrossDoubleTableDispose()
+    {
+        using var fx = new TempTable();
+        var table = DbfTable.Open(fx.Dbf).UseHighlike(
+            new HighlikeOptions { DriveKind = HighlikeDriveKind.Fixed });
+        using var engine = Assert.IsType<HighlikeEngine>(table.Accelerator);
+        _ = table.Query("ID = 1500");
+        Assert.True(engine.CacheStatistics.ActiveWatchers >= 1);
+
+        table.UseAccelerator(engine);
+        table.Dispose();
+        table.Dispose();
+
+        Assert.Equal(0, engine.CacheStatistics.ActiveWatchers);
+    }
+
     /// <summary>(6) Forced Network/Shared mode never attaches a watcher, yet warm reuse still works (token poll).</summary>
     [Fact]
     public void NetworkMode_NoWatcher_StillWarmReuses()
