@@ -615,9 +615,9 @@ public static class PrgParser
 
         private static PrgStatement BuildDefault(string text, string kw)
         {
-            if (PrgScan.IndexOfAssign(text) >= 0)
+            int eq = PrgScan.IndexOfAssign(text);
+            if (eq > 0 && IsAssignTarget(text.Substring(0, eq)))
             {
-                int eq = PrgScan.IndexOfAssign(text);
                 string target = text.Substring(0, eq).Trim();
                 return new Assignment(target, PrgExpr.Parse(text.Substring(eq + 1)));
             }

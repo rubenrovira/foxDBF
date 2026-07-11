@@ -384,4 +384,12 @@ PROCEDURE lv_targets
         // …while the bare store still becomes an Assignment even though STORE-less "delete"/"set" are verbs.
         Assert.IsType<Assignment>(PrgParser.Parse("delete = id = 1").Main[0]);
     }
+
+    [Fact]
+    public void UnknownCommandContainingTopLevelEquals_IsNotMisreadAsAssignment()
+    {
+        Assert.IsType<UnknownCommand>(PrgParser.Parse("BROWSE FOR total = 1").Main[0]);
+        Assert.IsType<Assignment>(PrgParser.Parse("total = 1").Main[0]);
+        Assert.IsType<DeleteStmt>(PrgParser.Parse("DELETE FOR total = 1").Main[0]);
+    }
 }
