@@ -71,6 +71,17 @@ public sealed class FoxDbfAdoNetTests
     }
 
     [Fact]
+    public void Atc_Filter_MatchesCaseInsensitiveNamesInPersonDb()
+    {
+        using var db = new PersonDb();
+        using var conn = db.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM person WHERE ATC('sm', name) = 1 ORDER BY id";
+
+        Assert.Equal(new[] { 1, 2, 3 }, ReadInts(cmd));
+    }
+
+    [Fact]
     public void GetSchemaTable_Describes_Columns()
     {
         using var db = new PersonDb();

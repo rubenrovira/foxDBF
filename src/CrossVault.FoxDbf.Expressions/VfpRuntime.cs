@@ -466,6 +466,7 @@ internal static class VfpRuntime
             case "CHRTRANC": return Chrtran(args);
             case "AT_C": return VfpValue.Integer(At(args, fromEnd: false));
             case "RATC": return VfpValue.Integer(At(args, fromEnd: true));
+            case "ATC": return VfpValue.Integer(At(args, false, StringComparison.OrdinalIgnoreCase));
             case "ATCC": return VfpValue.Integer(At(args, fromEnd: false, StringComparison.OrdinalIgnoreCase));
             // ISLEADBYTE(cExpr): the first byte is a DBCS lead byte. Always .F. on a single-byte code page
             // (VFP9-verified). Takes ONE argument only (a 2nd arg raises an error in VFP9); we ignore extras.

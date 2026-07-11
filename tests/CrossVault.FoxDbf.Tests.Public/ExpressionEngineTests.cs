@@ -234,6 +234,19 @@ public sealed class ExpressionEngineTests
     public void StringFunctions_ReturnNumeric(string expr, int expected)
         => Assert.Equal(expected, Eval(expr).AsInteger);
 
+    [Theory]
+    [InlineData("ATC('sm','Smith')", 1)]
+    [InlineData("ATC('SM','smith')", 1)]
+    [InlineData("ATC('x','Smith')", 0)]
+    [InlineData("ATC('','Smith')", 0)]
+    [InlineData("ATC('b','aBcb',2)", 4)]
+    public void Atc_IsCaseInsensitive_InEvaluateAndCompile(string expression, int expected)
+    {
+        var parsed = VfpExpression.Parse(expression);
+        Assert.Equal(expected, parsed.Evaluate(TestRow.Empty).AsInteger);
+        Assert.Equal(expected, parsed.Compile()(TestRow.Empty).AsInteger);
+    }
+
     // STR: width + decimals, right-justified, padded with leading spaces.
     [Theory]
     [InlineData("STR(123,5)", "  123")]
