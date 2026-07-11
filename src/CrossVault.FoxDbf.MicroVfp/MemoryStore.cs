@@ -77,7 +77,14 @@ internal sealed class VfpArray
     public int ALen(int dim) => dim switch { 1 => Rows, 2 => Is2D ? Cols : 0, _ => Length };
 
     private int Index(int sub1, int? sub2)
-        => sub2 is int c ? (sub1 - 1) * Math.Max(1, Cols) + (c - 1) : sub1 - 1;
+    {
+        if (sub2 is int col)
+        {
+            if (!Is2D || sub1 < 1 || sub1 > Rows || col < 1 || col > Cols) return -1;
+            return (sub1 - 1) * Cols + (col - 1);
+        }
+        return sub1 >= 1 && sub1 <= Length ? sub1 - 1 : -1;
+    }
 
     /// <summary>Reads element <c>(sub1[,sub2])</c> (1-based); out-of-range ⇒ <c>.F.</c>.</summary>
     public VfpValue Get(int sub1, int? sub2)
