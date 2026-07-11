@@ -714,19 +714,46 @@ public sealed partial class VfpInterpreter
         // SCAN's default scope is ALL (an implicit GO TOP). A WHILE clause with no explicit scope is
         // REST — it processes from the CURRENT record (the canonical `SEEK key` / `SCAN WHILE key=…`
         // RI cascade idiom relies on this; a GO TOP would discard the SEEK). See MICROVFP_SEMANTICS §SCAN.
-        bool fromCurrent = sc.While is not null && sc.Scope is null;
-        if (!fromCurrent) GoTop(area);
-        while (true)
+        var (scope, count) = ResolveLocScope(sc.Scope);
+        if (sc.Scope is null && sc.While is not null) scope = LocScope.Rest;
+
+        switch (scope)
+        {
+            case LocScope.All:
+                GoTop(area);
+                break;
+            case LocScope.Record:
+                GoRecord(area, count);
+                break;
+        }
+
+        int remaining = scope switch
+        {
+            LocScope.Next => Math.Max(0, count),
+            LocScope.Record => 1,
+            _ => int.MaxValue,
+        };
+
+        while (remaining > 0)
         {
             Session.SelectArea(area);                            // body may have switched areas.
             var m = Meta(area);
             if (m.Eof) break;
+            var wa = Session.AreaAt(area);
+            if (wa is null) break;
+            if (!Visible(wa, m.RecNo))
+            {
+                if (scope == LocScope.Record) break;
+                Skip(area, 1);
+                continue;
+            }
             if (sc.While is not null && !Truth(Eval(sc.While))) break;
+            remaining--;                                        // NEXT counts visited records, not FOR matches.
             bool match = sc.For is null || Truth(Eval(sc.For));
             if (match)
             {
                 try { ExecBlock(sc.Body); }
-                catch (ExitSignal) { break; }
+                catch (ExitSignal) { Session.SelectArea(area); break; }
                 catch (LoopSignal) { /* implicit skip below */ }
             }
             Session.SelectArea(area);
