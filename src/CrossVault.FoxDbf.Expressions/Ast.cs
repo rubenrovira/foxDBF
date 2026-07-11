@@ -17,6 +17,12 @@ internal abstract class AstNode
     /// <summary>Tree-walking interpretation.</summary>
     public abstract VfpValue Eval(IRowContext row, EvaluationContext ctx);
 
+    internal virtual VfpValue Eval(
+        IRowContext row, EvaluationContext ctx, ExpressionFunctionResolver functionResolver)
+        => Eval(row, ctx);
+
+    internal virtual bool ContainsFunction(Func<string, int, bool> predicate) => false;
+
     /// <summary>Lowers this node to a <see cref="Expression"/> of type <see cref="VfpValue"/>.</summary>
     public abstract Expression Build(BuildContext b);
 
@@ -104,6 +110,13 @@ internal sealed class UnaryNode : AstNode
     public override VfpValue Eval(IRowContext row, EvaluationContext ctx)
         => VfpRuntime.Unary(_op, _operand.Eval(row, ctx), ctx);
 
+    internal override VfpValue Eval(
+        IRowContext row, EvaluationContext ctx, ExpressionFunctionResolver functionResolver)
+        => VfpRuntime.Unary(_op, _operand.Eval(row, ctx, functionResolver), ctx);
+
+    internal override bool ContainsFunction(Func<string, int, bool> predicate)
+        => _operand.ContainsFunction(predicate);
+
     public override Expression Build(BuildContext b)
         => Expression.Call(typeof(VfpRuntime), nameof(VfpRuntime.Unary), null,
             Expression.Constant(_op), _operand.Build(b), b.Ctx);
@@ -122,6 +135,14 @@ internal sealed class BinaryNode : AstNode
 
     public override VfpValue Eval(IRowContext row, EvaluationContext ctx)
         => VfpRuntime.Binary(_op, _left.Eval(row, ctx), _right.Eval(row, ctx), ctx);
+
+    internal override VfpValue Eval(
+        IRowContext row, EvaluationContext ctx, ExpressionFunctionResolver functionResolver)
+        => VfpRuntime.Binary(
+            _op, _left.Eval(row, ctx, functionResolver), _right.Eval(row, ctx, functionResolver), ctx);
+
+    internal override bool ContainsFunction(Func<string, int, bool> predicate)
+        => _left.ContainsFunction(predicate) || _right.ContainsFunction(predicate);
 
     public override Expression Build(BuildContext b)
         => Expression.Call(typeof(VfpRuntime), nameof(VfpRuntime.Binary), null,
@@ -195,6 +216,27 @@ internal sealed class FunctionNode : AstNode
         return VfpRuntime.CallFunction(_upper, values, ctx, row);
     }
 
+    internal override VfpValue Eval(
+        IRowContext row, EvaluationContext ctx, ExpressionFunctionResolver functionResolver)
+    {
+        var arguments = new ExpressionArgument[_args.Length];
+        for (int i = 0; i < _args.Length; i++) arguments[i] = new ExpressionArgument(_args[i]);
+        if (functionResolver(_upper, arguments, out var resolved)) return resolved;
+
+        if (_upper == "ICASE") return EvalIcase(row, ctx, functionResolver);
+        var values = new VfpValue[_args.Length];
+        for (int i = 0; i < _args.Length; i++) values[i] = _args[i].Eval(row, ctx, functionResolver);
+        return VfpRuntime.CallFunction(_upper, values, ctx, row);
+    }
+
+    internal override bool ContainsFunction(Func<string, int, bool> predicate)
+    {
+        if (predicate(_upper, _args.Length)) return true;
+        foreach (var argument in _args)
+            if (argument.ContainsFunction(predicate)) return true;
+        return false;
+    }
+
     private VfpValue EvalIcase(IRowContext row, EvaluationContext ctx)
     {
         int n = _args.Length;
@@ -203,6 +245,17 @@ internal sealed class FunctionNode : AstNode
             if (VfpRuntime.AsCondition(_args[i].Eval(row, ctx)))
                 return _args[i + 1].Eval(row, ctx);
         return i < n ? _args[i].Eval(row, ctx) : VfpValue.Null;   // odd trailing arg = default; else .NULL.
+    }
+
+    private VfpValue EvalIcase(
+        IRowContext row, EvaluationContext ctx, ExpressionFunctionResolver functionResolver)
+    {
+        int n = _args.Length;
+        int i = 0;
+        for (; i + 1 < n; i += 2)
+            if (VfpRuntime.AsCondition(_args[i].Eval(row, ctx, functionResolver)))
+                return _args[i + 1].Eval(row, ctx, functionResolver);
+        return i < n ? _args[i].Eval(row, ctx, functionResolver) : VfpValue.Null;
     }
 
     public override Expression Build(BuildContext b)

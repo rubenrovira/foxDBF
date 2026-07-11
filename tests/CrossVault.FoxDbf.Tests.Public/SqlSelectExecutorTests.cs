@@ -140,6 +140,95 @@ public sealed class SqlSelectExecutorTests : IDisposable
     [InlineData("SELECT COUNT(*), SUM(amount), MIN(amount), MAX(amount) FROM person")]
     public void Aggregate_WholeTable_Matches_Oracle(string sql) => CheckUnordered(sql);
 
+    [Fact]
+    public void CompoundAggregate_SumPlusOne_EmitsOneAliasedRow()
+    {
+        var result = _session.Execute("SELECT SUM(amount) + 1 AS adjusted FROM person")!;
+        var rows = SqlTestSupport.Materialize(result);
+
+        Assert.Equal("ADJUSTED", Assert.Single(result.Columns).Name.ToUpperInvariant());
+        Assert.Equal(2001m, Assert.Single(Assert.Single(rows)));
+    }
+
+    [Fact]
+    public void CompoundAggregate_TwoSums_AreEvaluatedOverTheWholeGroup()
+    {
+        var rows = SqlTestSupport.Materialize(
+            _session.Execute("SELECT SUM(amount) + SUM(id) AS combined FROM person")!);
+
+        Assert.Equal(2048m, Assert.Single(Assert.Single(rows)));
+    }
+
+    [Fact]
+    public void CompoundAggregate_Grouped_IsEvaluatedPerGroup()
+    {
+        var rows = SqlTestSupport.Materialize(_session.Execute(
+            "SELECT city, SUM(amount) + 1 AS adjusted FROM person GROUP BY city ORDER BY city")!);
+
+        Assert.Equal(3, rows.Count);
+        Assert.Equal(new object?[] { "Berlin", 501m }, rows[0]);
+        Assert.Equal(new object?[] { "Hamburg", 651m }, rows[1]);
+        Assert.Equal(new object?[] { "Munich", 851m }, rows[2]);
+    }
+
+    [Fact]
+    public void CompoundAggregate_SumOfConditional_IgnoresNullArguments()
+    {
+        var rows = SqlTestSupport.Materialize(_session.Execute(
+            "SELECT SUM(IIF(active, amount, .NULL.)) + 1 AS adjusted FROM person")!);
+
+        Assert.Equal(851m, Assert.Single(Assert.Single(rows)));
+    }
+
+    [Fact]
+    public void CompoundAggregate_GroupedAllNullAverage_StaysNull()
+    {
+        var rows = SqlTestSupport.Materialize(_session.Execute(
+            "SELECT active, AVG(IIF(active, amount, .NULL.)) + 1 AS adjusted " +
+            "FROM person GROUP BY active ORDER BY active")!);
+
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(false, rows[0][0]);
+        Assert.Null(rows[0][1]);
+        Assert.Equal(true, rows[1][0]);
+        Assert.Equal(171m, rows[1][1]);
+    }
+
+    [Fact]
+    public void CompoundAggregate_EmptyGroup_PreservesPrimitiveEmptySemantics()
+    {
+        var sumRows = SqlTestSupport.Materialize(
+            _session.Execute("SELECT SUM(amount) + 1 FROM person WHERE id = 99999")!);
+        var avgRows = SqlTestSupport.Materialize(
+            _session.Execute("SELECT AVG(amount) + 1 FROM person WHERE id = 99999")!);
+        var countRows = SqlTestSupport.Materialize(
+            _session.Execute("SELECT COUNT(amount) + 1 FROM person WHERE id = 99999")!);
+
+        Assert.Equal(1m, Assert.Single(Assert.Single(sumRows)));
+        Assert.Null(Assert.Single(Assert.Single(avgRows)));
+        Assert.Equal(1m, Assert.Single(Assert.Single(countRows)));
+    }
+
+    [Fact]
+    public void CompoundAggregate_Distinct_AppliesAfterGroupedProjection()
+    {
+        var rows = SqlTestSupport.Materialize(_session.Execute(
+            "SELECT DISTINCT SUM(IIF(active, amount, .NULL.)) + 1 AS adjusted " +
+            "FROM person GROUP BY city")!);
+
+        Assert.Equal(new[] { 251m, 301m }, rows.Select(r => Assert.IsType<decimal>(r[0])).OrderBy(x => x));
+    }
+
+    [Fact]
+    public void ScalarMaxWithTwoArguments_RemainsRowwise()
+    {
+        var rows = SqlTestSupport.Materialize(
+            _session.Execute("SELECT MAX(amount, 100) + 1 AS adjusted FROM person ORDER BY id")!);
+
+        Assert.Equal(new[] { 101m, 201m, 301m, 151m, 251m, 251m, 301m, 101m, 401m },
+            rows.Select(r => Assert.IsType<decimal>(r[0])));
+    }
+
     // ---- GROUP BY + HAVING ----------------------------------------------------------------
 
     [Theory]

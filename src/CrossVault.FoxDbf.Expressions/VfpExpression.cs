@@ -23,6 +23,18 @@ public readonly struct VfpTypeInfo : IEquatable<VfpTypeInfo>
     public override string ToString() => $"{Type}({Length},{Decimals})";
 }
 
+/// <summary>An opaque AST argument exposed only to internal expression function resolvers.</summary>
+internal readonly struct ExpressionArgument
+{
+    private readonly AstNode _node;
+    internal ExpressionArgument(AstNode node) => _node = node;
+    internal VfpValue Evaluate(IRowContext row, EvaluationContext context) => _node.Eval(row, context);
+}
+
+/// <summary>Internal hook for hosts that need to replace selected function calls during tree evaluation.</summary>
+internal delegate bool ExpressionFunctionResolver(
+    string upperName, IReadOnlyList<ExpressionArgument> arguments, out VfpValue result);
+
 /// <summary>
 /// A parsed VFP/xBase expression. <see cref="Parse"/> builds the immutable AST;
 /// <see cref="Compile"/> lowers it to a fast delegate via <c>System.Linq.Expressions</c>,
@@ -52,6 +64,13 @@ public sealed class VfpExpression
     /// <summary>Tree-walking interpreter. Never throws on bad/null data.</summary>
     public VfpValue Evaluate(IRowContext row, EvaluationContext? context = null)
         => _root.Eval(row, context ?? EvaluationContext.Default);
+
+    internal bool ContainsFunction(Func<string, int, bool> predicate)
+        => _root.ContainsFunction(predicate);
+
+    internal VfpValue EvaluateWithFunctionResolver(
+        IRowContext row, EvaluationContext context, ExpressionFunctionResolver functionResolver)
+        => _root.Eval(row, context, functionResolver);
 
     /// <summary>
     /// Compiles the AST to a delegate over <see cref="IRowContext"/>. The context

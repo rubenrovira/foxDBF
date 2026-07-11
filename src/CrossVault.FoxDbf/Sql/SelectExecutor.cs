@@ -290,7 +290,7 @@ internal sealed class SelectExecutor
 
         // (3) aggregate vs row projection. Each output row is carried together with a representative
         // row context so ORDER BY / TOP can re-evaluate row-level keys after grouping.
-        bool aggregate = sel.GroupBy.Count > 0 || sel.Items.Any(it => IsAggregate(it, out _, out _));
+        bool aggregate = sel.GroupBy.Count > 0 || sel.Items.Any(ContainsAggregate);
 
         List<(object?[] row, IRowContext rep)> pairs;
         if (!aggregate)
@@ -805,7 +805,7 @@ internal sealed class SelectExecutor
             var schema = new CompositeSchema(src);
             var columns = BuildJoinColumns(src, schema, sel.Items);
 
-            bool aggregate = sel.GroupBy.Count > 0 || sel.Items.Any(it => IsAggregate(it, out _, out _));
+            bool aggregate = sel.GroupBy.Count > 0 || sel.Items.Any(ContainsAggregate);
 
             List<(object?[] row, IRowContext rep)> pairs;
             if (!aggregate)
@@ -1122,25 +1122,39 @@ internal sealed class SelectExecutor
                 return (decimal)members.Count;
             throw new NotSupportedException($"{it.AggregateStarFunction}(*) is not supported.");
         }
-        if (IsAggregate(it, out var func, out var arg))
-            return ComputeAggregate(func, arg!, members, ctx);
+        if (it.Expression is not null && ContainsAggregate(it.Expression))
+            return EvaluateAggregateExpression(it.Expression, members, rep, ctx);
 
         // non-aggregate item in an aggregate query (a GROUP BY column) → value of the first member;
         // an empty group has no member to read → null.
         return members.Count == 0 ? null : ToClr(it.Expression!.Evaluate(rep, ctx));
     }
 
-    private static object? ComputeAggregate(string func, string arg, List<IRowContext> members, EvaluationContext ctx)
+    private static object? EvaluateAggregateExpression(
+        VfpExpression expression, List<IRowContext> members, IRowContext rep, EvaluationContext ctx)
+    {
+        var value = expression.EvaluateWithFunctionResolver(rep, ctx,
+            (string upperName, IReadOnlyList<ExpressionArgument> arguments, out VfpValue result) =>
+            {
+                if (!IsSqlAggregateCall(upperName, arguments.Count))
+                {
+                    result = VfpValue.Null;
+                    return false;
+                }
+
+                result = VfpValue.FromClr(ComputeAggregate(upperName, arguments[0], members, ctx));
+                return true;
+            });
+        return Norm(ToClr(value));
+    }
+
+    private static object? ComputeAggregate(
+        string func, ExpressionArgument arg, List<IRowContext> members, EvaluationContext ctx)
     {
         if (func == "COUNT")
-        {
-            if (arg == "*") return (decimal)members.Count;
-            var e = VfpExpression.Parse(arg);
-            return (decimal)members.Count(m => !e.Evaluate(m, ctx).IsNull);
-        }
+            return (decimal)members.Count(m => !arg.Evaluate(m, ctx).IsNull);
 
-        var ex = VfpExpression.Parse(arg);
-        var vals = members.Select(m => ex.Evaluate(m, ctx)).Where(v => !v.IsNull).ToList();
+        var vals = members.Select(m => arg.Evaluate(m, ctx)).Where(v => !v.IsNull).ToList();
         switch (func)
         {
             case "SUM": return vals.Aggregate(0m, (acc, v) => acc + v.AsNumber);
@@ -1168,8 +1182,8 @@ internal sealed class SelectExecutor
         VfpValue Side(string s)
         {
             var parsed = SafeParse(s);
-            if (parsed is not null && IsAggregateText(parsed.Text, out var f, out var a))
-                return VfpValue.FromClr(ComputeAggregate(f, a!, members, ctx));
+            if (parsed is not null && ContainsAggregate(parsed))
+                return VfpValue.FromClr(EvaluateAggregateExpression(parsed, members, rep, ctx));
             return VfpExpression.Parse(s).Evaluate(rep, ctx);
         }
 
@@ -1574,6 +1588,16 @@ internal sealed class SelectExecutor
         if (it.Expression is null) return false;
         return IsAggregateText(it.Expression.Text, out func, out arg);
     }
+
+    private static bool ContainsAggregate(SelectItem item)
+        => item.AggregateStarFunction is not null ||
+           item.Expression is not null && ContainsAggregate(item.Expression);
+
+    private static bool ContainsAggregate(VfpExpression expression)
+        => expression.ContainsFunction(IsSqlAggregateCall);
+
+    private static bool IsSqlAggregateCall(string upperName, int arity)
+        => arity == 1 && upperName is "SUM" or "AVG" or "COUNT" or "MIN" or "MAX";
 
     private static bool IsAggregateText(string text, out string func, out string? arg)
     {
