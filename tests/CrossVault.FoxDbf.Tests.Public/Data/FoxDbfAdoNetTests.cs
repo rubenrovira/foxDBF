@@ -132,6 +132,20 @@ public sealed class FoxDbfAdoNetTests
     }
 
     [Fact]
+    public void ExecuteScalar_DistinguishesSqlNullFromNoRows()
+    {
+        using var db = new PersonDb();
+        using var conn = db.Open();
+        using var cmd = conn.CreateCommand();
+
+        cmd.CommandText = "SELECT MAX(amount) FROM person WHERE id = 999";
+        Assert.Same(DBNull.Value, cmd.ExecuteScalar());
+
+        cmd.CommandText = "SELECT amount FROM person WHERE id = 999";
+        Assert.Null(cmd.ExecuteScalar());
+    }
+
+    [Fact]
     public void ExecuteNonQuery_Insert_Update_Delete_ReturnAffected_AndAreVisible()
     {
         using var db = new PersonDb();

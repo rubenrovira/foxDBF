@@ -133,7 +133,7 @@ public sealed class FoxDbfCommand : DbCommand
         foreach (var row in result.Rows)
         {
             if (row != null && row.Length > 0)
-                return row[0];
+                return row[0] ?? DBNull.Value;
         }
         return null;
     }
