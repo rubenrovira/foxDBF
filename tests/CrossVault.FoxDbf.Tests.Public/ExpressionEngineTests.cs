@@ -287,6 +287,69 @@ public sealed class ExpressionEngineTests
         Assert.Equal(new DateOnly(2020, 2, 29), Eval("GOMONTH({^2020-01-31},1)").AsDate);
     }
 
+    [Theory]
+    [InlineData("{} + 1")]
+    [InlineData("1 + {}")]
+    [InlineData("{} + -1")]
+    [InlineData("-1 + {}")]
+    [InlineData("{} - 1")]
+    [InlineData("{} - -1")]
+    public void EmptyDate_Arithmetic_PreservesTypedEmpty(string expression)
+        => AssertTypedEmptyBoth(expression, TestRow.Empty, VfpType.Date);
+
+    [Theory]
+    [InlineData("EMPTYDT + 1")]
+    [InlineData("1 + EMPTYDT")]
+    [InlineData("EMPTYDT + -1")]
+    [InlineData("-1 + EMPTYDT")]
+    [InlineData("EMPTYDT - 1")]
+    [InlineData("EMPTYDT - -1")]
+    public void EmptyDateTime_Arithmetic_PreservesTypedEmpty(string expression)
+        => AssertTypedEmptyBoth(
+            expression, new TestRow().Set("EMPTYDT", DateTime.MinValue), VfpType.DateTime);
+
+    [Theory]
+    [InlineData("GOMONTH({}, 1)", VfpType.Date)]
+    [InlineData("GOMONTH({}, -1)", VfpType.Date)]
+    [InlineData("GOMONTH(EMPTYDT, 1)", VfpType.Date)]
+    [InlineData("GOMONTH(EMPTYDT, -1)", VfpType.Date)]
+    public void Gomonth_EmptyDateAndDateTime_PreserveTypedEmpty(string expression, VfpType type)
+        => AssertTypedEmptyBoth(
+            expression, new TestRow().Set("EMPTYDT", DateTime.MinValue), type);
+
+    [Fact]
+    public void DateAndDateTime_BoundaryOverflow_ReturnsTypedEmpty()
+    {
+        var row = new TestRow()
+            .Set("DLOW", DateOnly.MinValue.AddDays(1))
+            .Set("DMAX", DateOnly.MaxValue)
+            .Set("TLOW", DateTime.MinValue.AddSeconds(1))
+            .Set("TMAX", DateTime.MaxValue);
+
+        AssertTypedEmptyBoth("DMAX + 1", row, VfpType.Date);
+        AssertTypedEmptyBoth("1 + DMAX", row, VfpType.Date);
+        AssertTypedEmptyBoth("DLOW - 2", row, VfpType.Date);
+        AssertTypedEmptyBoth("GOMONTH(DMAX, 1)", row, VfpType.Date);
+        AssertTypedEmptyBoth("GOMONTH(DLOW, -1)", row, VfpType.Date);
+        AssertTypedEmptyBoth("TMAX + 1", row, VfpType.DateTime);
+        AssertTypedEmptyBoth("1 + TMAX", row, VfpType.DateTime);
+        AssertTypedEmptyBoth("TLOW - 2", row, VfpType.DateTime);
+        AssertTypedEmptyBoth("GOMONTH(TMAX, 1)", row, VfpType.DateTime);
+        AssertTypedEmptyBoth("GOMONTH(TLOW, -1)", row, VfpType.DateTime);
+    }
+
+    [Fact]
+    public void DateDifferencesAndNumericMinusDate_RemainNumeric()
+    {
+        var row = new TestRow()
+            .Set("T1", new DateTime(2020, 1, 1, 0, 0, 0))
+            .Set("T2", new DateTime(2020, 1, 1, 0, 1, 0));
+
+        AssertNumericBoth("{^2020-01-02} - {^2020-01-01}", TestRow.Empty, 1);
+        AssertNumericBoth("T2 - T1", row, 60);
+        AssertNumericBoth("1 - {}", TestRow.Empty, 1);
+    }
+
     [Fact]
     public void Ctod_ParsesDate()
         => Assert.Equal(new DateOnly(2020, 3, 3), Eval("CTOD('03/03/2020')").AsDate);
@@ -633,5 +696,28 @@ public sealed class ExpressionEngineTests
             result = VfpValue.Null;
             return false;
         }
+    }
+
+    private static void AssertTypedEmptyBoth(string expression, IRowContext row, VfpType expectedType)
+    {
+        var parsed = VfpExpression.Parse(expression);
+        AssertTypedEmpty(parsed.Evaluate(row), expectedType);
+        AssertTypedEmpty(parsed.Compile()(row), expectedType);
+    }
+
+    private static void AssertTypedEmpty(VfpValue value, VfpType expectedType)
+    {
+        Assert.Equal(expectedType, value.Type);
+        if (expectedType == VfpType.Date)
+            Assert.Equal(default, value.AsDate);
+        else
+            Assert.Equal(default, value.AsDateTime);
+    }
+
+    private static void AssertNumericBoth(string expression, IRowContext row, double expected)
+    {
+        var parsed = VfpExpression.Parse(expression);
+        Assert.Equal(expected, parsed.Evaluate(row).AsDouble);
+        Assert.Equal(expected, parsed.Compile()(row).AsDouble);
     }
 }

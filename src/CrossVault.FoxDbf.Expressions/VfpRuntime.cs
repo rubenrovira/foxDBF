@@ -115,13 +115,29 @@ internal static class VfpRuntime
         if (l.Type == VfpType.Character || r.Type == VfpType.Character)
             return VfpValue.Character(l.AsString + r.AsString);
         if (l.Type == VfpType.Date && IsNumeric(r))
-            return VfpValue.Date(l.AsDate.AddDays((int)r.AsDouble));
+        {
+            if (l.AsDate == default) return VfpValue.Date(default);
+            try { return VfpValue.Date(l.AsDate.AddDays((int)r.AsDouble)); }
+            catch (ArgumentOutOfRangeException) { return VfpValue.Date(default); }
+        }
         if (IsNumeric(l) && r.Type == VfpType.Date)
-            return VfpValue.Date(r.AsDate.AddDays((int)l.AsDouble));
+        {
+            if (r.AsDate == default) return VfpValue.Date(default);
+            try { return VfpValue.Date(r.AsDate.AddDays((int)l.AsDouble)); }
+            catch (ArgumentOutOfRangeException) { return VfpValue.Date(default); }
+        }
         if (l.Type == VfpType.DateTime && IsNumeric(r))
-            return VfpValue.DateTime(l.AsDateTime.AddSeconds(r.AsDouble));
+        {
+            if (l.AsDateTime == default) return VfpValue.DateTime(default);
+            try { return VfpValue.DateTime(l.AsDateTime.AddSeconds(r.AsDouble)); }
+            catch (ArgumentOutOfRangeException) { return VfpValue.DateTime(default); }
+        }
         if (IsNumeric(l) && r.Type == VfpType.DateTime)
-            return VfpValue.DateTime(r.AsDateTime.AddSeconds(l.AsDouble));
+        {
+            if (r.AsDateTime == default) return VfpValue.DateTime(default);
+            try { return VfpValue.DateTime(r.AsDateTime.AddSeconds(l.AsDouble)); }
+            catch (ArgumentOutOfRangeException) { return VfpValue.DateTime(default); }
+        }
         return VfpValue.Number(l.AsDouble + r.AsDouble);
     }
 
@@ -134,9 +150,17 @@ internal static class VfpRuntime
         if (l.Type == VfpType.DateTime && r.Type == VfpType.DateTime)
             return VfpValue.Number((l.AsDateTime - r.AsDateTime).TotalSeconds);
         if (l.Type == VfpType.Date && IsNumeric(r))
-            return VfpValue.Date(l.AsDate.AddDays(-(int)r.AsDouble));
+        {
+            if (l.AsDate == default) return VfpValue.Date(default);
+            try { return VfpValue.Date(l.AsDate.AddDays(-(int)r.AsDouble)); }
+            catch (ArgumentOutOfRangeException) { return VfpValue.Date(default); }
+        }
         if (l.Type == VfpType.DateTime && IsNumeric(r))
-            return VfpValue.DateTime(l.AsDateTime.AddSeconds(-r.AsDouble));
+        {
+            if (l.AsDateTime == default) return VfpValue.DateTime(default);
+            try { return VfpValue.DateTime(l.AsDateTime.AddSeconds(-r.AsDouble)); }
+            catch (ArgumentOutOfRangeException) { return VfpValue.DateTime(default); }
+        }
         return VfpValue.Number(l.AsDouble - r.AsDouble);
     }
 
@@ -740,7 +764,18 @@ internal static class VfpRuntime
         var d = Arg(a, 0);
         int m = IntArg(a, 1);
         if (d.Type == VfpType.DateTime)
-            return VfpValue.DateTime(d.AsDateTime.AddMonths(m));
+        {
+            // VFP9 returns an empty Date (not DateTime) for GOMONTH(CTOT(''), n).
+            if (d.AsDateTime == default) return VfpValue.Date(default);
+            try { return VfpValue.DateTime(d.AsDateTime.AddMonths(m)); }
+            catch (ArgumentOutOfRangeException) { return VfpValue.DateTime(default); }
+        }
+        if (d.Type == VfpType.Date)
+        {
+            if (d.AsDate == default) return VfpValue.Date(default);
+            try { return VfpValue.Date(d.AsDate.AddMonths(m)); }
+            catch (ArgumentOutOfRangeException) { return VfpValue.Date(default); }
+        }
         return VfpValue.Date(d.AsDate.AddMonths(m));
     }
 
