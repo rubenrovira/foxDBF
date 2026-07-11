@@ -110,13 +110,33 @@ public readonly struct VfpValue : IEquatable<VfpValue>
     public string AsString => _str ?? string.Empty;
 
     /// <summary>Numeric payload as <see cref="decimal"/>.</summary>
-    public decimal AsNumber => _isExact ? _dec : (decimal)_num;
+    public decimal AsNumber
+    {
+        get
+        {
+            if (_isExact) return _dec;
+            if (double.IsNaN(_num)) return 0m;
+            if (_num >= (double)decimal.MaxValue) return decimal.MaxValue;
+            if (_num <= (double)decimal.MinValue) return decimal.MinValue;
+            return (decimal)_num;
+        }
+    }
 
     /// <summary>Numeric payload as <see cref="double"/>.</summary>
     public double AsDouble => _isExact ? (double)_dec : _num;
 
     /// <summary>Numeric payload truncated to <see cref="int"/>.</summary>
-    public int AsInteger => (int)AsNumber;
+    public int AsInteger
+    {
+        get
+        {
+            double value = AsDouble;
+            if (double.IsNaN(value)) return 0;
+            if (value >= int.MaxValue) return int.MaxValue;
+            if (value <= int.MinValue) return int.MinValue;
+            return (int)value;
+        }
+    }
 
     /// <summary>Logical payload.</summary>
     public bool AsLogical => _bool;
@@ -177,6 +197,7 @@ public readonly struct VfpValue : IEquatable<VfpValue>
         VfpType.Logical => _bool ? ".T." : ".F.",
         VfpType.Date => AsDate.ToString("yyyy-MM-dd"),
         VfpType.DateTime => _date.ToString("yyyy-MM-dd HH:mm:ss"),
-        _ => AsNumber.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        _ => (_isExact ? _dec.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                       : _num.ToString(System.Globalization.CultureInfo.InvariantCulture)),
     };
 }
