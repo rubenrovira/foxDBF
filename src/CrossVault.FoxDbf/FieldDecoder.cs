@@ -210,11 +210,19 @@ public static class FieldDecoder
         // second to recover the intended value — this matches how the CDX index
         // double decodes the same datetime (see IndexKey.DecodeDateTime).
         long seconds = (long)Math.Round((uint)millis / 1000.0, MidpointRounding.AwayFromZero);
-        // Clamp into a day so a corrupt time can't overflow the date (never throw).
-        // Valid max is 86399 (23:59:59); >= 86400 would roll the date forward a full
-        // day, so fall back to the date-only result instead.
+        // VFP9 has a one-millisecond asymmetry at day rollover: exactly 23:59:59.500
+        // stays at 23:59:59, while .501 through the valid 24:00:00.000 sentinel roll
+        // to next-day midnight. Guard DateTime's max date; corrupt millis retain the
+        // established never-throw same-date-midnight degradation.
         if (seconds >= 86_400)
-            return result;
+        {
+            if (millis == 86_399_500)
+                seconds = 86_399;
+            else if (millis is >= 86_399_501 and <= 86_400_000)
+                return date.DayNumber < DateOnly.MaxValue.DayNumber ? result.AddDays(1) : result;
+            else
+                return result;
+        }
         return result.AddSeconds(seconds);
     }
 

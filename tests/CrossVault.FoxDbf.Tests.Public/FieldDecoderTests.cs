@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Text;
 
 namespace CrossVault.FoxDbf.Tests;
@@ -203,16 +204,53 @@ public sealed class FieldDecoderTests
         Assert.Null(Decode('T', 0, 0, 0, 0, 0, 0, 0, 0, 0));
     }
 
-    [Fact]
-    public void T_MillisExactly86400000_ClampsToDateNoDayAdvance()
+    [Theory]
+    [InlineData(86_399_499, 2012, 6, 14, 23, 59, 59)]
+    [InlineData(86_399_500, 2012, 6, 14, 23, 59, 59)]
+    [InlineData(86_399_501, 2012, 6, 15, 0, 0, 0)]
+    [InlineData(86_399_999, 2012, 6, 15, 0, 0, 0)]
+    [InlineData(86_400_000, 2012, 6, 15, 0, 0, 0)]
+    public void T_EndOfDayBoundary_MatchesVfp9(int millis, int year, int month, int day, int hour, int minute, int second)
     {
-        // days = 2456093 (2012-06-14), ms = 86400000 -> seconds == 86400 exactly.
-        // Valid max is 86399999ms; 86400000 / 1000 == 86400, which must clamp to the
-        // date-only result (00:00:00) WITHOUT rolling the date forward to 2012-06-15.
-        // 86400000 = 0x05265C00 -> LE bytes 00 5C 26 05.
-        var v = Decode('T', 0, 0x1D, 0x7A, 0x25, 0x00, 0x00, 0x5C, 0x26, 0x05);
-        Assert.IsType<DateTime>(v);
-        Assert.Equal(new DateTime(2012, 6, 14, 0, 0, 0), (DateTime)v!);
+        Assert.Equal(new DateTime(year, month, day, hour, minute, second), DecodeDateTime(2_456_093, millis));
+    }
+
+    [Theory]
+    [InlineData(35_999_499, 9, 59, 59)]
+    [InlineData(35_999_500, 10, 0, 0)]
+    [InlineData(35_999_998, 10, 0, 0)]
+    [InlineData(35_999_999, 10, 0, 0)]
+    public void T_NonBoundaryMillis_RoundToNearestSecond(int millis, int hour, int minute, int second)
+    {
+        Assert.Equal(new DateTime(2012, 6, 14, hour, minute, second), DecodeDateTime(2_456_093, millis));
+    }
+
+    [Fact]
+    public void T_MaxDateRollover_NeverThrowsAndDegradesToSameDateMidnight()
+    {
+        int maxJulianDay = 1_721_426 + DateOnly.MaxValue.DayNumber;
+
+        var exception = Record.Exception(() => DecodeDateTime(maxJulianDay, 86_399_501));
+
+        Assert.Null(exception);
+        Assert.Equal(new DateTime(9999, 12, 31, 0, 0, 0), DecodeDateTime(maxJulianDay, 86_399_501));
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(86_400_001)]
+    [InlineData(int.MaxValue)]
+    public void T_CorruptMillis_DegradeToSameDateMidnight(int millis)
+    {
+        Assert.Equal(new DateTime(2012, 6, 14, 0, 0, 0), DecodeDateTime(2_456_093, millis));
+    }
+
+    private static DateTime DecodeDateTime(int julianDay, int millis)
+    {
+        Span<byte> raw = stackalloc byte[8];
+        BinaryPrimitives.WriteInt32LittleEndian(raw, julianDay);
+        BinaryPrimitives.WriteInt32LittleEndian(raw[4..], millis);
+        return Assert.IsType<DateTime>(FieldDecoder.Decode(Col('T', 8), raw, Enc));
     }
 
     // ---- L (logical) -----------------------------------------------------
