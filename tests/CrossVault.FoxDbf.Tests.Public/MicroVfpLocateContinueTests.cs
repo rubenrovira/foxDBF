@@ -318,6 +318,26 @@ public sealed class MicroVfpLocateContinueTests
     }
 
     [Fact]
+    public void Locate_Mode5PendingAppend_MissParksAtEffectiveEofWithoutAppendField()
+    {
+        using var dir = new MicroVfpTestSupport.TempDir("loc_buffer_eof");
+        var i = OpenMtx(dir, out var s);
+        using (s)
+        {
+            i.Execute("=CURSORSETPROP('Buffering', 5)");
+            i.Execute("INSERT INTO mtx (n, c) VALUES (99, 'ZZ')");
+
+            i.Execute("LOCATE FOR n = 999");
+
+            Assert.Equal(7, i.EvalExpression("RECCOUNT()").AsInteger);
+            Assert.Equal(8, Recno(i));
+            Assert.True(Eof(i));
+            Assert.False(Found(i));
+            Assert.NotEqual("ZZ", i.EvalExpression("c").AsString.TrimEnd());
+        }
+    }
+
+    [Fact]
     public void Locate_State_IsPerWorkArea_Independent()
     {
         using var dir = new MicroVfpTestSupport.TempDir("loc_perarea");

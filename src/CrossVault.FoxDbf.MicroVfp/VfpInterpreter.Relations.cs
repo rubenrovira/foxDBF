@@ -139,7 +139,7 @@ public sealed partial class VfpInterpreter
     {
         var m = Meta(area);
         var wa = Session.AreaAt(area);
-        m.RecNo = (wa?.Table.RecordCount ?? 0) + 1;
+        m.RecNo = wa is null ? 1 : EffCount(area, wa) + 1;
         m.Eof = true; m.Bof = false; m.Found = false; m.Cached = null; m.OldVals = null;
     }
 

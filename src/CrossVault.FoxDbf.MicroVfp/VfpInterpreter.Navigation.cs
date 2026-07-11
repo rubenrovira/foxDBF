@@ -189,7 +189,7 @@ public sealed partial class VfpInterpreter
             m.Found = false;
             return;
         }
-        m.RecNo = wa.Table.RecordCount + 1; m.Eof = true; m.Bof = false; m.Found = false;
+        m.RecNo = EffCount(area, wa) + 1; m.Eof = true; m.Bof = false; m.Found = false;
         m.Cached = null; m.OldVals = null;
         if (ord is not null) m.OrderPos = ord.Count;
     }
@@ -201,7 +201,7 @@ public sealed partial class VfpInterpreter
         var ord = ActiveOrder(area);
         if (rec < 1 || rec > wa.Table.RecordCount)
         {
-            m.RecNo = wa.Table.RecordCount + 1; m.Eof = true; m.Bof = false; m.Found = false;
+            m.RecNo = EffCount(area, wa) + 1; m.Eof = true; m.Bof = false; m.Found = false;
             m.Cached = null; m.OldVals = null;
             if (ord is not null) m.OrderPos = ord.Count;
             return;
