@@ -500,6 +500,7 @@ public sealed partial class VfpInterpreter
     {
         if (a.Length < 2) return 0;
         string needle = a[0].AsString, hay = a[1].AsString;
+        if (needle.Length == 0) return 0;
         int occ = a.Length > 2 ? Math.Max(1, (int)a[2].AsNumber) : 1;
         int i = -1;
         for (int k = 0; k < occ; k++)

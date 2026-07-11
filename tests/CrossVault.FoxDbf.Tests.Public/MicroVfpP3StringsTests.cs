@@ -115,6 +115,13 @@ public sealed class MicroVfpP3StringsTests
     // ─────────────────────────── DBCS char variants == byte variants ───────────────────────────
 
     [Fact]
+    public void Atc_EmptyNeedle_ReturnsZero()
+    {
+        using var h = new H();
+        Assert.Equal(0m, h.Num("ATC('', 'ABCB')"));
+    }
+
+    [Fact]
     public void DbcsCharVariants_CoincideWithByteVariants_OnCp1252()
     {
         using var h = new H();
