@@ -226,11 +226,6 @@ internal sealed class DmlExecutor
                 positional[idx] = SelectExecutor.ToClr(val.Evaluate(rowCtx, ctx));
 
             writer.UpdateRecord(recNo - 1, positional);
-
-            // VFP UPDATE modifies field DATA only — a row that was already deleted stays deleted.
-            // (UpdateRecord rewrites the full row as active; re-apply the deletion mark here.)
-            if (rec.IsDeleted)
-                writer.Delete(recNo - 1);
         }
         return SqlResult.Dml(matched.Count);
     }

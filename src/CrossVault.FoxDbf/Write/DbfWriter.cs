@@ -629,6 +629,24 @@ public sealed partial class DbfWriter : IDisposable
             }
             oldRecordBytes = existing;
 
+            // UPDATE changes field data only. Preserve the live deletion marker for EVERY rewrite,
+            // including full positional/dictionary updates that need no other pre-image bytes. Read
+            // it before encoding or allocating FPT blocks so a corrupt/short record fails without
+            // orphaning newly appended memo content.
+            byte deletionMarker;
+            if (existing is not null)
+            {
+                deletionMarker = existing[0];
+            }
+            else
+            {
+                var marker = new byte[1];
+                if (RandomAccess.Read(_handle, marker, offset) != marker.Length)
+                    throw new DbfWriteException(
+                        $"Could not read record {index} deletion marker before updating it.");
+                deletionMarker = marker[0];
+            }
+
             // Encode the row. KeepValue slots are nulled for encoding so the memo-append path
             // (PatchMemoPointers) NEVER sees a read-back pointer/content as new blob data; their real
             // bytes are restored from `existing` below.
@@ -642,13 +660,12 @@ public sealed partial class DbfWriter : IDisposable
             }
 
             byte[] record = RecordEncoder.Encode(_schema, toEncode, deleted: false);
+            record[0] = deletionMarker;
             PatchMemoPointers(record, toEncode);
 
             if (hasKeep && existing is not null)
             {
-                // Preserve the deletion mark (UPDATE modifies field data only) and each KeepValue
-                // field's existing bytes + its _NullFlags bit.
-                record[0] = existing[0];
+                // Preserve each KeepValue field's existing bytes + its _NullFlags bit.
                 for (int i = 0; i < columns.Count && i < positional.Length; i++)
                 {
                     if (!ReferenceEquals(positional[i], KeepValue))
