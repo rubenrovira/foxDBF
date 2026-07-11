@@ -748,7 +748,7 @@ public sealed class VfpSession : IDisposable
         {
             path = existing.Table.SourcePath
                    ?? throw new FoxDbfSqlException($"Open table '{name}' has no source path on disk to write to.");
-            reopen = new ReopenInfo(existing.Area, name, existing.Alias, existing.Exclusive, existing.NoUpdate);
+            reopen = new ReopenInfo(existing.Area, existing.Table.SourcePath!, existing.Alias, existing.Exclusive, existing.NoUpdate);
             _areas.Remove(existing.Area);
             existing.Dispose(); // release the read handle so the writer can open the file.
         }
