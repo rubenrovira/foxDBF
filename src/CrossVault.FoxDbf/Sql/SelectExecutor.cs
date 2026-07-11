@@ -66,15 +66,16 @@ internal sealed class SelectExecutor
 
     public SqlResult Run(SelectStatement sel)
     {
+        // UNION owns its overall ORDER BY / TOP / INTO modifiers. VFP's grammar attaches a
+        // trailing INTO to the final SELECT branch rather than to the root statement.
+        if (sel.Union is not null)
+            return RunUnion(sel);
+
         // TOP … PERCENT and SELECT … INTO TABLE/CURSOR both need the FULLY materialized (ORDER BY-applied)
         // result before they can act, so they run the plain query first, then post-process. Plain SELECT
         // (no PERCENT, no INTO) keeps its original, unchanged path.
         if (sel.TopPercent || sel.Into is not null)
             return RunMaterializing(sel);
-
-        // UNION is handled at the top level.
-        if (sel.Union is not null)
-            return RunUnion(sel);
 
         bool multiTable = sel.Joins.Count > 0 || sel.From.Count > 1;
         return multiTable ? RunJoin(sel) : RunSingle(sel);
@@ -543,6 +544,10 @@ internal sealed class SelectExecutor
             selects.Add(cur);
         }
 
+        // Prefer the VFP-style trailing destination. Retain the historical leading destination
+        // extension as a fallback, but never materialize a middle branch independently.
+        IntoClause? into = selects[^1].Into ?? root.Into;
+
         // Execute each branch's core (without union-level ORDER BY / TOP / INTO) and collect every
         // branch's column schema so the result columns can be WIDENED to the common per-column type.
         var acc = new List<object?[]>();
@@ -590,8 +595,7 @@ internal sealed class SelectExecutor
 
         // Resolve each overall ORDER BY entry to a 0-based output-column index ONCE — explicit 1-based
         // ordinal, else by matching the column NAME against the (first-select) result schema. The SAME
-        // resolved index is reused by both the sort and the TOP tie-extension (a name-based ORDER BY must
-        // not silently degrade TOP into returning every row).
+        // resolved index is reused by the sort and all final UNION post-processing.
         var orderBy = selects[^1].OrderBy;
         var orderCols = new int[orderBy.Count];
         for (int k = 0; k < orderBy.Count; k++)
@@ -613,33 +617,28 @@ internal sealed class SelectExecutor
             acc = ordered!.ToList();
         }
 
-        // Overall TOP (tie-aware on ORDER BY keys, VFP semantics).
+        // Overall TOP. VFP keeps the exact ordered prefix for both integer TOP and TOP PERCENT;
+        // neither form extends the result across equal ORDER BY keys at the boundary.
         if (selects[0].Top is int top)
         {
-            top = Math.Max(0, top);
-            if (top == 0)
+            if (selects[0].TopPercent)
             {
-                acc = new List<object?[]>();
+                acc = ApplyTopPercent(acc, top);
             }
-            else if (top < acc.Count)
+            else
             {
-                if (orderBy.Count == 0)
-                {
+                top = Math.Max(0, top);
+                if (top < acc.Count)
                     acc = acc.Take(top).ToList();
-                }
-                else
-                {
-                    var ctx = _session.SqlContext();
-                    var keySels = orderCols.Select(UnionColKey).ToList();
-                    int end = top;
-                    while (end < acc.Count &&
-                           keySels.All(ks => CompareVfp(ks(acc[end]), ks(acc[top - 1]), ctx) == 0)) end++;
-                    acc = acc.Take(end).ToList();
-                }
             }
         }
 
-        return Materialize(accSchema, acc.Select((r, _) => (r, new DummyRowContext() as IRowContext)).ToList());
+        var finalResult = Materialize(
+            accSchema,
+            acc.Select((r, _) => (r, new DummyRowContext() as IRowContext)).ToList());
+        return into is null
+            ? finalResult
+            : MaterializeInto(into, finalResult.Columns, finalResult.Rows.ToList());
     }
 
     /// <summary>A union ORDER BY / TOP key selector reading the resolved 0-based output column.</summary>

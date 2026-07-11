@@ -262,6 +262,150 @@ public sealed class SqlRightFullUnionExecutorTests : IDisposable
         => CheckUnion("SELECT TOP 3 deptid FROM dept UNION SELECT deptid FROM emp ORDER BY 1", ordered: true);
 
     [Fact]
+    public void UnionDistinct_IntoCursor_ReturnsDmlCountAndRegistersQueryableResult()
+    {
+        using var s = new VfpSession();
+        s.OpenDirectory(_indexed.Path);
+
+        var materialized = s.Execute(
+            "SELECT deptid FROM dept UNION SELECT deptid FROM emp INTO CURSOR union_distinct")!;
+
+        Assert.Equal(5, materialized.AffectedRecords);
+        Assert.Empty(materialized.Rows);
+        var ids = s.Execute("SELECT deptid FROM union_distinct ORDER BY deptid")!.Rows
+            .Select(row => Convert.ToInt32(row[0])).ToArray();
+        Assert.Equal(new[] { 1, 2, 3, 4, 99 }, ids);
+    }
+
+    [Fact]
+    public void UnionAll_IntoCursor_PreservesDuplicates()
+    {
+        using var s = new VfpSession();
+        s.OpenDirectory(_indexed.Path);
+
+        var materialized = s.Execute(
+            "SELECT deptid FROM dept UNION ALL SELECT deptid FROM emp INTO CURSOR union_all")!;
+
+        Assert.Equal(10, materialized.AffectedRecords);
+        Assert.Empty(materialized.Rows);
+        var ids = s.Execute("SELECT deptid FROM union_all ORDER BY deptid")!.Rows
+            .Select(row => Convert.ToInt32(row[0])).ToArray();
+        Assert.Equal(new[] { 1, 1, 1, 2, 2, 2, 3, 3, 4, 99 }, ids);
+    }
+
+    [Fact]
+    public void Union_IntoTable_WritesFinalStructureAndRows()
+    {
+        using var s = new VfpSession();
+        s.OpenDirectory(_indexed.Path);
+
+        var materialized = s.Execute(
+            "SELECT deptid AS id FROM dept UNION SELECT deptid FROM emp INTO TABLE union_table")!;
+
+        Assert.Equal(5, materialized.AffectedRecords);
+        Assert.Empty(materialized.Rows);
+        string path = System.IO.Path.Combine(_indexed.Path, "union_table.dbf");
+        Assert.True(System.IO.File.Exists(path));
+        using var table = DbfTable.Open(path);
+        Assert.Equal(new[] { "ID" }, table.Columns.Select(c => c.Name.ToUpperInvariant()).ToArray());
+        Assert.Equal('I', char.ToUpperInvariant(table.Columns[0].Type));
+        Assert.Equal(new[] { 1, 2, 3, 4, 99 }, table.EnumerateAll(includeDeleted: false)
+            .Select(row => Convert.ToInt32(row["ID"])).OrderBy(id => id).ToArray());
+    }
+
+    [Fact]
+    public void Union_OrderBy_IsAppliedBeforeIntoCursorMaterialization()
+    {
+        using var s = new VfpSession();
+        s.OpenDirectory(_indexed.Path);
+
+        var materialized = s.Execute(
+            "SELECT deptid FROM dept UNION SELECT deptid FROM emp ORDER BY 1 DESC INTO CURSOR union_ordered")!;
+
+        Assert.Equal(5, materialized.AffectedRecords);
+        var idsInPhysicalOrder = s.Execute("SELECT deptid FROM union_ordered")!.Rows
+            .Select(row => Convert.ToInt32(row[0])).ToArray();
+        Assert.Equal(new[] { 99, 4, 3, 2, 1 }, idsInPhysicalOrder);
+    }
+
+    [Fact]
+    public void Union_IntegerTop_DoesNotExtendOrderByTiesBeforeIntoCursor()
+    {
+        using var s = new VfpSession();
+        s.OpenDirectory(_indexed.Path);
+
+        var materialized = s.Execute(
+            "SELECT TOP 2 deptid FROM dept UNION ALL SELECT deptid FROM emp " +
+            "ORDER BY 1 INTO CURSOR union_top")!;
+
+        Assert.Equal(2, materialized.AffectedRecords);
+        Assert.Equal(new[] { 1, 1 }, s.Execute("SELECT deptid FROM union_top")!.Rows
+            .Select(row => Convert.ToInt32(row[0])).ToArray());
+    }
+
+    [Fact]
+    public void Union_IntegerTop_DoesNotExtendOrderByTiesWithoutInto()
+    {
+        using var s = new VfpSession();
+        s.OpenDirectory(_indexed.Path);
+
+        var ids = s.Execute(
+            "SELECT TOP 2 deptid FROM dept UNION ALL SELECT deptid FROM emp ORDER BY 1")!.Rows
+            .Select(row => Convert.ToInt32(row[0])).ToArray();
+
+        Assert.Equal(new[] { 1, 1 }, ids);
+    }
+
+    [Fact]
+    public void Union_TopPercent_IsAppliedBeforeTrailingIntoCursor()
+    {
+        using var s = new VfpSession();
+        s.OpenDirectory(_indexed.Path);
+
+        var materialized = s.Execute(
+            "SELECT TOP 40 PERCENT deptid FROM dept UNION SELECT deptid FROM emp " +
+            "ORDER BY 1 INTO CURSOR union_percent")!;
+
+        Assert.Equal(2, materialized.AffectedRecords);
+        Assert.Equal(new[] { 1, 2 }, s.Execute("SELECT deptid FROM union_percent")!.Rows
+            .Select(row => Convert.ToInt32(row[0])).ToArray());
+    }
+
+    [Fact]
+    public void Union_LeadingIntoFallbackAndPlainControlsRemainSupported()
+    {
+        using var s = new VfpSession();
+        s.OpenDirectory(_indexed.Path);
+
+        var leading = s.Execute(
+            "SELECT deptid FROM dept INTO CURSOR union_leading UNION SELECT deptid FROM emp")!;
+        Assert.Equal(5, leading.AffectedRecords);
+        Assert.Equal(5, s.Execute("SELECT deptid FROM union_leading")!.Rows.Count());
+
+        var trailingWins = s.Execute(
+            "SELECT deptid FROM dept INTO CURSOR ignored_leading " +
+            "UNION SELECT deptid FROM emp INTO CURSOR union_trailing")!;
+        Assert.Equal(5, trailingWins.AffectedRecords);
+        Assert.Equal(5, s.Execute("SELECT deptid FROM union_trailing")!.Rows.Count());
+        Assert.ThrowsAny<Exception>(() => s.Execute("SELECT deptid FROM ignored_leading"));
+
+        var middleIgnored = s.Execute(
+            "SELECT deptid FROM dept UNION SELECT deptid FROM emp INTO CURSOR ignored_middle " +
+            "UNION SELECT deptid FROM dept")!;
+        Assert.Equal(-1, middleIgnored.AffectedRecords);
+        Assert.Equal(5, middleIgnored.Rows.Count());
+        Assert.ThrowsAny<Exception>(() => s.Execute("SELECT deptid FROM ignored_middle"));
+
+        var plainUnion = s.Execute("SELECT deptid FROM dept UNION SELECT deptid FROM emp")!;
+        Assert.Equal(-1, plainUnion.AffectedRecords);
+        Assert.Equal(5, plainUnion.Rows.Count());
+
+        var singleInto = s.Execute("SELECT deptid FROM dept INTO CURSOR single_control")!;
+        Assert.Equal(4, singleInto.AffectedRecords);
+        Assert.Equal(4, s.Execute("SELECT deptid FROM single_control")!.Rows.Count());
+    }
+
+    [Fact]
     public void Union_Nulls_Are_Equal_For_Dedup()
     {
         // Frank (orphan emp) LEFT JOIN dept yields (Frank, NULL). Unioning that branch with itself must
