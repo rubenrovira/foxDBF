@@ -63,6 +63,9 @@ public sealed class FoxDbfConnection : DbConnection
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_state == ConnectionState.Open) return;
 
+        VfpSession? session = null;
+        CrossVault.FoxDbf.Highlike.HighlikeEngine? accelerator = null;
+
         try
         {
             var builder = new FoxDbfConnectionStringBuilder(_connectionString);
@@ -79,7 +82,7 @@ public sealed class FoxDbfConnection : DbConnection
                 Ansi = builder.Ansi,
             };
 
-            _session = new VfpSession(context)
+            session = new VfpSession(context)
             {
                 DefaultExclusive = builder.Exclusive,
                 ReadOnly = builder.ReadOnly,
@@ -89,26 +92,26 @@ public sealed class FoxDbfConnection : DbConnection
             // through the Highlike engine (same result set, faster plan); None = the plain optimizer.
             if (builder.Accelerator == FoxDbfAccelerator.Highlike)
             {
-                _accelerator = new CrossVault.FoxDbf.Highlike.HighlikeEngine();
-                _session.Accelerator = _accelerator;
+                accelerator = new CrossVault.FoxDbf.Highlike.HighlikeEngine();
+                session.Accelerator = accelerator;
             }
 
             // Open the data source: .dbc, directory, or .dbf file
             string fullPath = Path.GetFullPath(_dataSource);
             if (fullPath.EndsWith(".dbc", StringComparison.OrdinalIgnoreCase))
             {
-                _session.OpenDatabase(fullPath);
+                session.OpenDatabase(fullPath);
             }
             else if (Directory.Exists(fullPath))
             {
-                _session.OpenDirectory(fullPath);
+                session.OpenDirectory(fullPath);
             }
             else if (fullPath.EndsWith(".dbf", StringComparison.OrdinalIgnoreCase) && File.Exists(fullPath))
             {
                 // Single .dbf file: open its directory
                 string? dirPath = Path.GetDirectoryName(fullPath);
                 if (dirPath is not null)
-                    _session.OpenDirectory(dirPath);
+                    session.OpenDirectory(dirPath);
                 else
                     throw new FoxDbfException($"Cannot determine directory for .dbf file '{fullPath}'.");
             }
@@ -116,10 +119,31 @@ public sealed class FoxDbfConnection : DbConnection
             {
                 throw new FoxDbfException($"Data Source '{_dataSource}' not found or is not a valid .dbc, directory, or .dbf file.");
             }
+        }
+        catch (FoxDbfException)
+        {
+            try { session?.Dispose(); } catch { }
+            try { accelerator?.Dispose(); } catch { }
+            throw;
+        }
+        catch (Exception ex)
+        {
+            try { session?.Dispose(); } catch { }
+            try { accelerator?.Dispose(); } catch { }
+            throw new FoxDbfException($"Failed to open connection: {ex.Message}", ex);
+        }
 
+        _session = session;
+        _accelerator = accelerator;
+        try
+        {
             SetState(ConnectionState.Open);
         }
-        catch (Exception ex) when (!(ex is FoxDbfException))
+        catch (FoxDbfException)
+        {
+            throw;
+        }
+        catch (Exception ex)
         {
             throw new FoxDbfException($"Failed to open connection: {ex.Message}", ex);
         }
