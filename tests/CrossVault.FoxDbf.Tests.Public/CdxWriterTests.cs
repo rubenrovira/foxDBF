@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using CrossVault.FoxDbf;
+using CrossVault.FoxDbf.Expressions;
 using CrossVault.FoxDbf.Index;
 using CrossVault.FoxDbf.Write;
 
@@ -154,6 +155,108 @@ public sealed class CdxWriterTests
 
             Assert.Equal("GENERAL", tag.Collation);
             Assert.Equal(new[] { 2, 1, 3 }, Recnos(tag));
+        }
+        finally { Cleanup(dir); }
+    }
+
+    [Fact]
+    public void CharacterTag_General_ValueSeek_UsesNaturalCollationWeights()
+    {
+        string dir = FreshTempDir();
+        try
+        {
+            var cols = new[] { new DbfColumnDef("NAME", 'C', 10) };
+            var rows = Rows(
+                new object?[] { "BANANA" },
+                new object?[] { "APPLE" });
+
+            var (dbf, cdx) = CreateWithTags(dir, cols, rows,
+                new CdxTagDefinition("GTAG", "NAME", collation: "GENERAL"));
+
+            using var table = DbfTable.Open(dbf);
+            using var cdxFile = CdxFile.Open(cdx, table);
+            var tag = cdxFile.Tag("GTAG")!;
+
+            Assert.Equal(IndexKeyType.Character, tag.KeyType);
+            Assert.Equal((uint)1, tag.Seek((object)"BANANA"));
+            Assert.Equal((uint)1, tag.Seek((object)"BAN"));
+            Assert.Null(tag.Seek((object)"MISSING"));
+        }
+        finally { Cleanup(dir); }
+    }
+
+    [Fact]
+    public void CharacterTag_General_RawSeek_RemainsCallerEncoded()
+    {
+        string dir = FreshTempDir();
+        try
+        {
+            var cols = new[] { new DbfColumnDef("NAME", 'C', 10) };
+            var rows = Rows(new object?[] { "BANANA" });
+
+            var (dbf, cdx) = CreateWithTags(dir, cols, rows,
+                new CdxTagDefinition("GTAG", "NAME", collation: "GENERAL"));
+
+            using var table = DbfTable.Open(dbf);
+            using var cdxFile = CdxFile.Open(cdx, table);
+            var tag = cdxFile.Tag("GTAG")!;
+            byte[] full = VfpCollations.General.GetCollatedKey("BANANA".AsSpan());
+            byte[] prefix = VfpCollations.General.GetCollatedKey("BAN".AsSpan());
+            byte[] rawLatin1 = System.Text.Encoding.Latin1.GetBytes("BANANA");
+
+            Assert.Equal((uint)1, tag.Seek(full.AsSpan(), exact: true));
+            Assert.Null(tag.Seek(prefix.AsSpan(), exact: true));
+            Assert.Null(tag.Seek(rawLatin1.AsSpan()));
+        }
+        finally { Cleanup(dir); }
+    }
+
+    [Fact]
+    public void CharacterTag_Machine_ValueSeek_RemainsCaseSensitive()
+    {
+        string dir = FreshTempDir();
+        try
+        {
+            var cols = new[] { new DbfColumnDef("NAME", 'C', 10) };
+            var rows = Rows(new object?[] { "BANANA" });
+            var (dbf, cdx) = CreateWithTags(dir, cols, rows,
+                new CdxTagDefinition("MTAG", "NAME"));
+
+            using var table = DbfTable.Open(dbf);
+            using var cdxFile = CdxFile.Open(cdx, table);
+            var tag = cdxFile.Tag("MTAG")!;
+
+            Assert.Equal((uint)1, tag.Seek((object)"BANANA"));
+            Assert.Null(tag.Seek((object)"banana"));
+        }
+        finally { Cleanup(dir); }
+    }
+
+    [Fact]
+    public void NumericAndIntegerTag_ValueSeek_AndNullRemainSupported()
+    {
+        string dir = FreshTempDir();
+        try
+        {
+            var cols = new[]
+            {
+                new DbfColumnDef("AMOUNT", 'N', 10, 2),
+                new DbfColumnDef("COUNT", 'I', 4),
+            };
+            var rows = Rows(new object?[] { 12.5m, 7 });
+            var (dbf, cdx) = CreateWithTags(dir, cols, rows,
+                new CdxTagDefinition("NTAG", "AMOUNT"),
+                new CdxTagDefinition("ITAG", "COUNT"));
+
+            using var table = DbfTable.Open(dbf);
+            using var cdxFile = CdxFile.Open(cdx, table);
+            var numeric = cdxFile.Tag("NTAG")!;
+            var integer = cdxFile.Tag("ITAG")!;
+
+            Assert.Equal((uint)1, numeric.Seek((object)12.5m));
+            Assert.Equal((uint)1, integer.Seek((object)7));
+            Assert.Null(numeric.Seek((object)null!));
+            Assert.Null(integer.Seek((object)null!));
         }
         finally { Cleanup(dir); }
     }

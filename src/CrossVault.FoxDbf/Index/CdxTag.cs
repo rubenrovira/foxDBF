@@ -1,4 +1,5 @@
 using CrossVault.FoxDbf;
+using CrossVault.FoxDbf.Expressions;
 
 namespace CrossVault.FoxDbf.Index;
 
@@ -183,6 +184,13 @@ public sealed class CdxTag
     /// </summary>
     public uint? Seek(object value)
     {
+        if (KeyType == IndexKeyType.Character && value is string s)
+        {
+            var collation = VfpCollations.FromSortSequence(Collation);
+            if (!string.Equals(collation.Name, VfpCollations.Machine.Name, StringComparison.OrdinalIgnoreCase))
+                return Seek(collation.GetCollatedKey(s.AsSpan()).AsSpan());
+        }
+
         var keyBytes = IndexKey.Encode(value, KeyType);
         return keyBytes is null ? NotFound : Seek(keyBytes.AsSpan());
     }
