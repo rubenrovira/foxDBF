@@ -533,8 +533,8 @@ public static class QueryOptimizer
     /// Parses the BODY of a VFP date/datetime literal (the text between <c>{</c> and
     /// <c>}</c>) into the SAME Julian-day-number (+ fractional day) scale the Date/DateTime
     /// index keys decode to (<see cref="IndexKey.YmdToJulianDay"/> + time-of-day in days).
-    /// Accepts <c>^YYYY-MM-DD</c> and <c>YYYY/MM/DD</c> dates with an optional
-    /// <c>HH:MM[:SS]</c> time. Returns false for empty / malformed / null-date blobs so the
+    /// Accepts the invariant date and optional time formats supported by the expression lexer.
+    /// Returns false for empty / malformed / null-date blobs so the
     /// caller can fall back to a non-optimizable (residual) leaf. Never throws.
     /// </summary>
     private static bool TryParseDateLiteral(string body, out double julian)
@@ -551,30 +551,22 @@ public static class QueryOptimizer
             string datePart = sp < 0 ? s : s[..sp];
             string timePart = sp < 0 ? string.Empty : s[(sp + 1)..].Trim();
 
-            var dp = datePart.Split(new[] { '-', '/', '.' }, StringSplitOptions.RemoveEmptyEntries);
-            if (dp.Length != 3) return false;
-            if (!int.TryParse(dp[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out int y) ||
-                !int.TryParse(dp[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int mo) ||
-                !int.TryParse(dp[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int da))
+            string[] dateFormats = { "yyyy-MM-dd", "yyyy/MM/dd", "MM/dd/yyyy", "M/d/yyyy" };
+            if (!DateTime.TryParseExact(datePart, dateFormats, CultureInfo.InvariantCulture,
+                    DateTimeStyles.None, out var date))
                 return false;
-            if (y <= 0 || mo is < 1 or > 12 || da is < 1 or > 31) return false;
 
-            double frac = 0;
+            TimeSpan timeOfDay = TimeSpan.Zero;
             if (timePart.Length > 0)
             {
-                // Strip a trailing AM/PM marker if present (keep it simple; 24h is the common case).
-                var tp = timePart.Split(':');
-                int hh = 0, mm = 0, ssi = 0;
-                if (tp.Length >= 1) int.TryParse(new string(tp[0].TakeWhile(char.IsDigit).ToArray()),
-                    NumberStyles.Integer, CultureInfo.InvariantCulture, out hh);
-                if (tp.Length >= 2) int.TryParse(new string(tp[1].TakeWhile(char.IsDigit).ToArray()),
-                    NumberStyles.Integer, CultureInfo.InvariantCulture, out mm);
-                if (tp.Length >= 3) int.TryParse(new string(tp[2].TakeWhile(char.IsDigit).ToArray()),
-                    NumberStyles.Integer, CultureInfo.InvariantCulture, out ssi);
-                frac = (hh * 3600.0 + mm * 60.0 + ssi) / 86_400.0;
+                string[] timeFormats = { "HH:mm:ss", "H:mm:ss", "HH:mm", "h:mm:ss tt", "hh:mm:ss tt" };
+                if (!DateTime.TryParseExact(timePart, timeFormats, CultureInfo.InvariantCulture,
+                        DateTimeStyles.None, out var time))
+                    return false;
+                timeOfDay = time.TimeOfDay;
             }
 
-            julian = IndexKey.YmdToJulianDay(y, mo, da) + frac;
+            julian = IndexKey.YmdToJulianDay(date.Year, date.Month, date.Day) + timeOfDay.TotalDays;
             return true;
         }
         catch

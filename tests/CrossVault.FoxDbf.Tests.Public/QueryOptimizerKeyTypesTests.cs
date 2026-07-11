@@ -94,6 +94,20 @@ public sealed class QueryOptimizerKeyTypesTests : IClassFixture<QueryOptimizerKe
             result.RecordNumbers.OrderBy(x => x).ToArray());
     }
 
+    private void AssertIndexedFindAndCountEqualBruteForce(string filter)
+    {
+        using var table = DbfTable.Open(_fx.Dbf);
+        using var cdx = CdxFile.Open(_fx.Cdx, table);
+        var expected = BruteForce(table, filter, EvaluationContext.Default);
+
+        var result = QueryOptimizer.FindRecords(table, cdx, filter);
+        int count = QueryOptimizer.Count(table, cdx, filter);
+
+        Assert.True(result.Optimized, $"expected indexed execution for: {filter}");
+        Assert.Equal(expected.OrderBy(x => x).ToArray(), result.RecordNumbers.OrderBy(x => x).ToArray());
+        Assert.Equal(expected.Count, count);
+    }
+
     private static EvaluationContext MachineExactOn => new() { Exact = true, Collation = VfpCollations.Machine };
     private static EvaluationContext General => new() { Collation = VfpCollations.General };
     private static EvaluationContext GeneralExactOn => new() { Exact = true, Collation = VfpCollations.General };
@@ -177,6 +191,39 @@ public sealed class QueryOptimizerKeyTypesTests : IClassFixture<QueryOptimizerKe
 
         Assert.Empty(machine.RecordNumbers);
         Assert.NotEmpty(general.RecordNumbers);
+    }
+
+    [Theory]
+    [InlineData("TS = {^2020-01-01 5:30:00 PM}")]
+    [InlineData("TS <= {^2020-01-01 5:30:00 PM}")]
+    [InlineData("BETWEEN(TS, {^2020-01-01 5:00:00 PM}, {^2020-01-01 6:00:00 PM})")]
+    [InlineData("TS = {^2020-01-01 12:00:00 AM}")]
+    [InlineData("TS = {^2020-01-01 12:00:00 PM}")]
+    public void DateTimeAmPm_IndexedFindAndCountEqualBruteForce(string filter)
+        => AssertIndexedFindAndCountEqualBruteForce(filter);
+
+    [Theory]
+    [InlineData("TS = {^2020-01-01 5:30:00 AM}")]
+    [InlineData("TS = {^2020-01-01 17:30:00}")]
+    [InlineData("DT = {^2020-01-01}")]
+    public void ExistingDateTimeLiteralFormats_IndexedFindAndCountEqualBruteForce(string filter)
+        => AssertIndexedFindAndCountEqualBruteForce(filter);
+
+    [Fact]
+    public void InvalidDateTimeLiteral_IsSafeAndNotOptimized()
+    {
+        const string filter = "TS = {^2020-01-01 25:00:00}";
+        using var table = DbfTable.Open(_fx.Dbf);
+        using var cdx = CdxFile.Open(_fx.Cdx, table);
+
+        var findException = Record.Exception(() => QueryOptimizer.FindRecords(table, cdx, filter));
+        var countException = Record.Exception(() => QueryOptimizer.Count(table, cdx, filter));
+        var plan = QueryOptimizer.Explain(table, cdx, filter);
+
+        Assert.Null(findException);
+        Assert.Null(countException);
+        Assert.Equal(OptimizationLevel.None, plan.Overall);
+        Assert.Empty(plan.UsedTags);
     }
 
     // ============================================================ optimization evidence
