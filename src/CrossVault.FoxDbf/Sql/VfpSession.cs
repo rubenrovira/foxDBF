@@ -386,7 +386,22 @@ public sealed class VfpSession : IDisposable
         // USE replaces whatever occupied the target area.
         if (_areas.Remove(targetArea, out var prev)) prev.Dispose();
 
-        string a = NormalizeAlias(alias ?? DefaultAlias(table));
+        string a;
+        if (alias is not null)
+        {
+            a = NormalizeAlias(alias);
+        }
+        else
+        {
+            string defaultAlias = NormalizeAlias(DefaultAlias(table));
+            bool collides = _areas.Values.Any(w =>
+                string.Equals(w.Alias, defaultAlias, StringComparison.OrdinalIgnoreCase));
+            a = collides
+                ? targetArea is >= 1 and <= 10
+                    ? ((char)('A' + targetArea - 1)).ToString()
+                    : "W" + targetArea.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                : defaultAlias;
+        }
         _areas[targetArea] = new WorkArea(targetArea, dbf, cdx, a, exclusive, noUpdate);
         if (selectAfter) _currentArea = targetArea;
     }

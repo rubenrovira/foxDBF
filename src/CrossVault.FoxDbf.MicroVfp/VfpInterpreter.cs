@@ -813,13 +813,19 @@ public sealed partial class VfpInterpreter
             else inArea = Session.FindAreaByAlias(u.In.Name!)?.Area;
         }
 
+        int targetArea = inArea switch
+        {
+            0 => Session.LowestFreeAreaNumber(),
+            int n => n,
+            _ => Session.CurrentArea,
+        };
+
         Session.Use(table, inArea, alias, again: u.Again,
             exclusive: u.Mode == UseMode.Exclusive, noUpdate: u.NoUpdate);
         ReleaseStaleLocks();    // 5.13: a USE that repurposed/closed an area drops the locks it held (before prune).
         PruneCachedWriters();   // 5.5: repurposing an area off its old table may release that file's cached writer.
 
-        string aliasName = alias ?? Path.GetFileNameWithoutExtension(table);
-        var wa = Session.FindAreaByAlias(aliasName);
+        var wa = Session.AreaAt(targetArea);
         if (wa is not null)
         {
             var m = new AreaMeta();
