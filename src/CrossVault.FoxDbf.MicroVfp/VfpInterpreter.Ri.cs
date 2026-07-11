@@ -234,14 +234,12 @@ public sealed partial class VfpInterpreter
         // rollback: a TABLEUPDATE that fails half-way rolls the file(s) back but has to leave the microVFP
         // buffer intact (so the caller can keep the edits buffered and return .F.). RestoreSnapshot otherwise
         // rebuilds AreaMeta from scratch, which would silently drop the buffer + reset the mode to 1.
-        var reopen = new List<(int Area, string Alias, string? Order, bool Excl, bool NoUpd, string? TablePath,
-                               int Buffering, TableBuffer? Buf, string? SourceName, VfpValue? SourceType, string? DatabaseProp)>();
+        var reopen = new List<(int Area, string Alias, bool Excl, bool NoUpd, string? TablePath, AreaMeta? Meta)>();
         foreach (var w in Session.OpenAreas)
             if (SamePath(w.Table.SourcePath, snap.Path))
             {
                 _meta.TryGetValue(w.Area, out var mm);
-                reopen.Add((w.Area, w.Alias, mm?.Order, w.Exclusive, w.NoUpdate, w.Table.SourcePath,
-                            mm?.Buffering ?? 1, mm?.Buf, mm?.SourceName, mm?.SourceType, mm?.DatabaseProp));
+                reopen.Add((w.Area, w.Alias, w.Exclusive, w.NoUpdate, w.Table.SourcePath, mm));
             }
 
         foreach (var r in reopen) Session.CloseArea(r.Area);
@@ -260,19 +258,45 @@ public sealed partial class VfpInterpreter
             // redirect onto the copy. In autocommit TxLivePath is null → the path is used unchanged.
             string? reopenTarget = r.TablePath is { } tp && Session.TxLivePath is { } toLive ? toLive(tp) : r.TablePath;
             Session.Use(reopenTarget ?? r.Alias, r.Area, r.Alias, again: false, exclusive: r.Excl, noUpdate: r.NoUpd);
-            _meta[r.Area] = new AreaMeta
-            {
-                Order = r.Order, Buffering = r.Buffering, Buf = r.Buf,
-                SourceName = r.SourceName, SourceType = r.SourceType, DatabaseProp = r.DatabaseProp,
-            };
-            GoTop(r.Area);
+            _meta[r.Area] = RestorePersistentAreaMeta(r.Meta);
         }
+        foreach (var r in reopen) GoTop(r.Area);
+        int[] relationParents = Session.OpenAreas.Select(w => w.Area).ToArray();
+        foreach (int area in relationParents) RepositionChildren(area);
         Session.SelectArea(savedCur);
         // 5.13: re-take on the fresh cached writer the explicit RLOCK/FLOCK we force-closed above, so a lock
         // an SP holds while a transaction / RI / CANDIDATE abort rolls the file back stays held afterwards.
         ReacquireHeldLocks(snap.Path);
         // 6.3: the pre-image temp files are consumed — delete them (so the temp dir is empty after a rollback).
         snap.Cleanup();
+    }
+
+    private static AreaMeta RestorePersistentAreaMeta(AreaMeta? old)
+    {
+        if (old is null) return new AreaMeta();
+        return new AreaMeta
+        {
+            Order = old.Order,
+            OrderReversed = old.OrderReversed,
+            Buffering = old.Buffering,
+            Buf = old.Buf,
+            SourceName = old.SourceName,
+            SourceType = old.SourceType,
+            DatabaseProp = old.DatabaseProp,
+            FilterExpr = old.FilterExpr,
+            FilterText = old.FilterText,
+            KeySet = old.KeySet,
+            KeyRange = old.KeyRange,
+            KeyLow = old.KeyLow,
+            KeyHigh = old.KeyHigh,
+            Relations = old.Relations is null ? null : new List<Relation>(old.Relations),
+            LocateActive = old.LocateActive,
+            LocateFor = old.LocateFor,
+            LocateWhile = old.LocateWhile,
+            LocateWindow = old.LocateWindow is null ? null : new HashSet<int>(old.LocateWindow),
+            LocateWindowFull = old.LocateWindowFull,
+            ExtraIndexes = old.ExtraIndexes is null ? null : new List<string>(old.ExtraIndexes),
+        };
     }
 
     private static void RestoreSnapshotSidecar(string path, string? tempPreimage)
