@@ -133,9 +133,7 @@ internal static class MicroVfpExprRewrite
             }
             if (c == '[')
             {
-                char prev = i > 0 ? s[i - 1] : '\0';
-                bool subscript = prev == ')' || prev == ']' || IsIdentChar(prev);
-                if (subscript) { sb.Append('('); continue; }
+                if (!PrgScan.IsBracketLiteralStart(s, i)) { sb.Append('('); continue; }
                 // value-position bracket string literal: copy through the matching ']'.
                 sb.Append(c); i++;
                 while (i < s.Length && s[i] != ']') { sb.Append(s[i]); i++; }

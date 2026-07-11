@@ -15,6 +15,12 @@ internal static class PrgScan
     private static bool IsIdentStart(char c) => char.IsAsciiLetter(c) || c == '_';
     private static bool IsIdentChar(char c) => char.IsAsciiLetterOrDigit(c) || c == '_';
 
+    internal static bool IsBracketLiteralStart(string s, int index)
+    {
+        char prev = index > 0 ? s[index - 1] : '\0';
+        return prev != ')' && prev != ']' && !IsIdentChar(prev);
+    }
+
     /// <summary>Top-level (depth-0, outside strings) identifier words, with positions.</summary>
     public static List<(int Start, int Len, string Upper)> TopWords(string s)
     {
@@ -37,8 +43,15 @@ internal static class PrgScan
                 case '"':
                     inStr = true; q = c; i++; continue;
                 case '(':
-                case '[':
                 case '{':
+                    depth++; i++; continue;
+                case '[':
+                    if (IsBracketLiteralStart(s, i))
+                    {
+                        int close = s.IndexOf(']', i + 1);
+                        i = close < 0 ? s.Length : close + 1;
+                        continue;
+                    }
                     depth++; i++; continue;
                 case ')':
                 case ']':
@@ -96,8 +109,15 @@ internal static class PrgScan
                 case '\'':
                 case '"': inStr = true; q = c; break;
                 case '(':
-                case '[':
                 case '{': depth++; break;
+                case '[':
+                    if (IsBracketLiteralStart(s, i))
+                    {
+                        int close = s.IndexOf(']', i + 1);
+                        i = close < 0 ? s.Length : close;
+                    }
+                    else depth++;
+                    break;
                 case ')':
                 case ']':
                 case '}': if (depth > 0) depth--; break;
@@ -131,6 +151,14 @@ internal static class PrgScan
                 tokens.Add(s.Substring(start, i - start));
                 continue;
             }
+            if (c == '[' && IsBracketLiteralStart(s, i))
+            {
+                int start = i;
+                int close = s.IndexOf(']', i + 1);
+                i = close < 0 ? s.Length : close + 1;
+                tokens.Add(s.Substring(start, i - start));
+                continue;
+            }
             if (c == '(')
             {
                 int start = i, depth = 0;
@@ -138,6 +166,12 @@ internal static class PrgScan
                 while (i < s.Length)
                 {
                     char d = s[i];
+                    if (!inStr && d == '[' && IsBracketLiteralStart(s, i))
+                    {
+                        int close = s.IndexOf(']', i + 1);
+                        i = close < 0 ? s.Length : close + 1;
+                        continue;
+                    }
                     if (inStr) { if (d == q) inStr = false; i++; continue; }
                     if (d == '\'' || d == '"') { inStr = true; q = d; i++; continue; }
                     if (d == '(') depth++;
@@ -177,8 +211,15 @@ internal static class PrgScan
                     case '\'':
                     case '"': inStr = true; q = c; continue;
                     case '(':
-                    case '[':
                     case '{': depth++; continue;
+                    case '[':
+                        if (IsBracketLiteralStart(s, i))
+                        {
+                            int close = s.IndexOf(']', i + 1);
+                            i = close < 0 ? s.Length : close;
+                        }
+                        else depth++;
+                        continue;
                     case ')':
                     case ']':
                     case '}': if (depth > 0) depth--; continue;
@@ -246,8 +287,15 @@ internal static class PrgScan
                 case '\'':
                 case '"': inStr = true; q = c; continue;
                 case '(':
-                case '[':
                 case '{': depth++; continue;
+                case '[':
+                    if (IsBracketLiteralStart(s, i))
+                    {
+                        int close = s.IndexOf(']', i + 1);
+                        i = close < 0 ? s.Length : close;
+                    }
+                    else depth++;
+                    continue;
                 case ')':
                 case ']':
                 case '}': if (depth > 0) depth--; continue;
@@ -275,6 +323,12 @@ internal static class PrgScan
             char c = line[i];
             if (inStr) { if (c == q) inStr = false; continue; }
             if (c == '\'' || c == '"') { inStr = true; q = c; continue; }
+            if (c == '[' && IsBracketLiteralStart(line, i))
+            {
+                int close = line.IndexOf(']', i + 1);
+                i = close < 0 ? line.Length : close;
+                continue;
+            }
             if (c == '&' && i + 1 < line.Length && line[i + 1] == '&') { cut = i; break; }
         }
         string code = line.Substring(0, cut).TrimEnd();
