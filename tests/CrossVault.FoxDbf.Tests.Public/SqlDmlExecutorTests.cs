@@ -236,6 +236,66 @@ public sealed class SqlDmlExecutorTests : IDisposable
         Assert.Equal("Munich", ((string)all.Single(x => Convert.ToInt32(x.Fields["ID"]) == 3).Fields["CITY"]!).Trim());
     }
 
+    [Theory]
+    [InlineData("person.name")]
+    [InlineData("PeRsOn.NaMe")]
+    public void Update_TableQualifiedSetTarget_MatchesPhysicalTargetCaseInsensitively(string assignmentTarget)
+    {
+        string path = NewPersonTable();
+        using var s = OpenSession();
+
+        var result = s.Execute($"UPDATE person SET {assignmentTarget} = 'Qualified' WHERE id = 1");
+
+        Assert.Equal(1, result!.AffectedRecords);
+        var row = ReadAll(path).Single(x => Convert.ToInt32(x.Fields["ID"]) == 1).Fields;
+        Assert.Equal("Qualified", ((string)row["NAME"]!).Trim());
+    }
+
+    [Fact]
+    public void Update_WrongSetQualifier_Throws2149WithoutMutation()
+    {
+        string path = NewPersonTable();
+        string before = ((string)ReadAll(path).Single(x => Convert.ToInt32(x.Fields["ID"]) == 1).Fields["NAME"]!).Trim();
+        using var s = OpenSession();
+
+        var ex = Assert.Throws<FoxDbfSqlException>(() =>
+            s.Execute("UPDATE person SET wrong.name = 'Changed' WHERE id = 1"));
+
+        string after = ((string)ReadAll(path).Single(x => Convert.ToInt32(x.Fields["ID"]) == 1).Fields["NAME"]!).Trim();
+        Assert.Equal(before, after);
+        Assert.Equal(2149, ex.VfpErrorNumber);
+        Assert.Equal("SQL: Invalid SET expression in UPDATE, 'wrong' is not a target table.", ex.Message);
+    }
+
+    [Fact]
+    public void Update_MatchingQualifiedUnknownColumn_Keeps1806AndOriginalTargetName()
+    {
+        string path = NewPersonTable();
+        string before = ((string)ReadAll(path).Single(x => Convert.ToInt32(x.Fields["ID"]) == 1).Fields["NAME"]!).Trim();
+        using var s = OpenSession();
+
+        var ex = Assert.Throws<FoxDbfSqlException>(() =>
+            s.Execute("UPDATE person SET person.nosuch = 1 WHERE id = 1"));
+
+        Assert.Equal(1806, ex.VfpErrorNumber);
+        Assert.Contains("person.nosuch", ex.Message, StringComparison.Ordinal);
+        string after = ((string)ReadAll(path).Single(x => Convert.ToInt32(x.Fields["ID"]) == 1).Fields["NAME"]!).Trim();
+        Assert.Equal(before, after);
+    }
+
+    [Fact]
+    public void Update_UnqualifiedSetTarget_RemainsSupported()
+    {
+        string path = NewPersonTable();
+        using var s = OpenSession();
+
+        var result = s.Execute("UPDATE person SET name = 'Bare' WHERE id = 1");
+
+        Assert.Equal(1, result!.AffectedRecords);
+        var row = ReadAll(path).Single(x => Convert.ToInt32(x.Fields["ID"]) == 1).Fields;
+        Assert.Equal("Bare", ((string)row["NAME"]!).Trim());
+    }
+
     [Fact]
     public void Update_Multi_Column()
     {

@@ -445,6 +445,15 @@ public sealed class SqlParserTests
         Assert.Null(st.Where);
     }
 
+    [Fact]
+    public void Update_QualifiedAssignmentTarget_IsPreservedInAst()
+    {
+        var st = Assert.IsType<UpdateStatement>(
+            SqlParser.Parse("UPDATE people SET people.name = 'New'"));
+
+        Assert.Equal("people.name", Assert.Single(st.Assignments).Column);
+    }
+
     // ====================================================================
     //  DELETE
     // ====================================================================

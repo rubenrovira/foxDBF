@@ -174,7 +174,20 @@ internal sealed class DmlExecutor
         var setColumns = new HashSet<int>();
         for (int i = 0; i < st.Assignments.Count; i++)
         {
-            int idx = IndexOfColumn(columns, st.Assignments[i].Column);
+            string assignmentTarget = st.Assignments[i].Column;
+            string columnName = assignmentTarget;
+            int dot = assignmentTarget.IndexOf('.');
+            if (dot > 0 && dot == assignmentTarget.LastIndexOf('.'))
+            {
+                string qualifier = assignmentTarget[..dot];
+                if (!string.Equals(qualifier, st.Table, StringComparison.OrdinalIgnoreCase))
+                    throw new FoxDbfSqlException(
+                        $"SQL: Invalid SET expression in UPDATE, '{qualifier}' is not a target table.")
+                        { VfpErrorNumber = 2149 };
+                columnName = assignmentTarget[(dot + 1)..];
+            }
+
+            int idx = IndexOfColumn(columns, columnName);
             if (idx < 0)
                 // An unknown SET column is the SQL-column class: err 1806 "SQL: Column '...' is not found."
                 // (oracle-pinned against the VFP9 runtime, project-review 5.3 — same number SELECT reports
