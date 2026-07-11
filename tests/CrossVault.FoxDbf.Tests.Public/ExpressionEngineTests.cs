@@ -340,6 +340,73 @@ public sealed class ExpressionEngineTests
     public void Iif_SelectsBranch(string expr, string expected)
         => Assert.Equal(expected, Eval(expr).AsString);
 
+    [Fact]
+    public void Iif_Evaluate_EvaluatesOnlySelectedBranch()
+    {
+        var expression = VfpExpression.Parse("IIF(.T., 1, BUMP())");
+        var row = new BumpRow();
+
+        Assert.Equal(1, expression.Evaluate(row).AsInteger);
+        Assert.Equal(0, row.BumpCount);
+
+        expression = VfpExpression.Parse("IIF(.NULL., 1, BUMP())");
+        Assert.Equal(99, expression.Evaluate(row).AsInteger);
+        Assert.Equal(1, row.BumpCount);
+    }
+
+    [Fact]
+    public void Iif_Compile_EvaluatesOnlySelectedBranch()
+    {
+        var row = new BumpRow();
+
+        Assert.Equal(1, VfpExpression.Parse("IIF(.T., 1, BUMP())").Compile()(row).AsInteger);
+        Assert.Equal(0, row.BumpCount);
+
+        Assert.Equal(99, VfpExpression.Parse("IIF(.F., 1, BUMP())").Compile()(row).AsInteger);
+        Assert.Equal(1, row.BumpCount);
+    }
+
+    [Fact]
+    public void Iif_EvaluateWithFunctionResolver_OffersIifThenEvaluatesOnlySelectedBranch()
+    {
+        int iifRefusals = 0;
+        int bumps = 0;
+        ExpressionFunctionResolver resolver =
+            (string name, IReadOnlyList<ExpressionArgument> _, out VfpValue result) =>
+            {
+                if (name == "IIF") iifRefusals++;
+                if (name == "BUMP")
+                {
+                    bumps++;
+                    result = VfpValue.Integer(99);
+                    return true;
+                }
+
+                result = VfpValue.Null;
+                return false;
+            };
+
+        var result = VfpExpression.Parse("IIF(.T., 1, BUMP())").EvaluateWithFunctionResolver(
+            TestRow.Empty, EvaluationContext.Default, resolver);
+
+        Assert.Equal(1, result.AsInteger);
+        Assert.Equal(1, iifRefusals);
+        Assert.Equal(0, bumps);
+    }
+
+    [Fact]
+    public void Iif_InvalidArgumentCount_RetainsEagerFallback()
+    {
+        var expression = VfpExpression.Parse("IIF(.T., BUMP(), BUMP(), 4)");
+        var interpretedRow = new BumpRow();
+        var compiledRow = new BumpRow();
+
+        Assert.Equal(99, expression.Evaluate(interpretedRow).AsInteger);
+        Assert.Equal(2, interpretedRow.BumpCount);
+        Assert.Equal(99, expression.Compile()(compiledRow).AsInteger);
+        Assert.Equal(2, compiledRow.BumpCount);
+    }
+
     [Theory]
     [InlineData("BETWEEN(5,1,10)", true)]
     [InlineData("BETWEEN(1,1,10)", true)]   // inclusive
@@ -543,5 +610,28 @@ public sealed class ExpressionEngineTests
             last = fn(row);
 
         Assert.Equal("AB   7", last.AsString); // STR(7,4) => "   7"
+    }
+
+    private sealed class BumpRow : IRowContext, IVfpFunctionHost
+    {
+        public int BumpCount { get; private set; }
+        public object? GetField(string name) => null;
+        public int RecNo => 1;
+        public bool Deleted => false;
+        public int RecCount => 0;
+
+        public bool TryInvoke(
+            string upperName, VfpValue[] args, EvaluationContext ctx, out VfpValue result)
+        {
+            if (upperName == "BUMP")
+            {
+                BumpCount++;
+                result = VfpValue.Integer(99);
+                return true;
+            }
+
+            result = VfpValue.Null;
+            return false;
+        }
     }
 }

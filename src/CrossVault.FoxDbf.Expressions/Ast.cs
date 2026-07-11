@@ -211,6 +211,10 @@ internal sealed class FunctionNode : AstNode
         // an odd trailing arg ⇒ that default; no match with no default ⇒ .NULL. (NOT .F.). So it cannot go
         // through the eager arg-array path below.
         if (_upper == "ICASE") return EvalIcase(row, ctx);
+        if (_upper == "IIF" && _args.Length == 3)
+            return VfpRuntime.AsCondition(_args[0].Eval(row, ctx))
+                ? _args[1].Eval(row, ctx)
+                : _args[2].Eval(row, ctx);
         var values = new VfpValue[_args.Length];
         for (int i = 0; i < _args.Length; i++) values[i] = _args[i].Eval(row, ctx);
         return VfpRuntime.CallFunction(_upper, values, ctx, row);
@@ -224,6 +228,10 @@ internal sealed class FunctionNode : AstNode
         if (functionResolver(_upper, arguments, out var resolved)) return resolved;
 
         if (_upper == "ICASE") return EvalIcase(row, ctx, functionResolver);
+        if (_upper == "IIF" && _args.Length == 3)
+            return VfpRuntime.AsCondition(_args[0].Eval(row, ctx, functionResolver))
+                ? _args[1].Eval(row, ctx, functionResolver)
+                : _args[2].Eval(row, ctx, functionResolver);
         var values = new VfpValue[_args.Length];
         for (int i = 0; i < _args.Length; i++) values[i] = _args[i].Eval(row, ctx, functionResolver);
         return VfpRuntime.CallFunction(_upper, values, ctx, row);
@@ -261,6 +269,12 @@ internal sealed class FunctionNode : AstNode
     public override Expression Build(BuildContext b)
     {
         if (_upper == "ICASE") return BuildIcase(b);
+        if (_upper == "IIF" && _args.Length == 3)
+            return Expression.Condition(
+                Expression.Call(
+                    typeof(VfpRuntime), nameof(VfpRuntime.AsCondition), null, _args[0].Build(b)),
+                _args[1].Build(b),
+                _args[2].Build(b));
         var elems = new Expression[_args.Length];
         for (int i = 0; i < _args.Length; i++) elems[i] = _args[i].Build(b);
         Expression array = Expression.NewArrayInit(typeof(VfpValue), elems);
