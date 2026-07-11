@@ -102,11 +102,21 @@ internal sealed class FoxDbfEnforcedWriteModel
         return new InsertStatement(null, table, cols, exprs);
     }
 
+    /// <summary>Read DBC rules when the target is a member table. Free tables are not present in the DBC
+    /// metadata and therefore use the physical-schema fallback in <see cref="FieldNames"/>.</summary>
+    private DbcTableRules? TableRules(string table)
+    {
+        var database = _connection.Session.Database;
+        if (database is null) return null;
+        try { return database.GetTableRules(table); }
+        catch (DbfFileNotFoundException) { return null; }
+    }
+
     /// <summary>The target table's field names in physical order: the DBC rules metadata when present, else a
     /// zero-row schema SELECT.</summary>
     private List<string> FieldNames(string table)
     {
-        var rules = _connection.Session.Database?.GetTableRules(table);
+        var rules = TableRules(table);
         if (rules is not null && rules.Fields.Count > 0)
             return rules.Fields.Select(f => f.FieldName).ToList();
         var res = _connection.Session.Execute($"SELECT * FROM {table} WHERE 1 = 0");
@@ -119,12 +129,14 @@ internal sealed class FoxDbfEnforcedWriteModel
 
     private int Insert(InsertStatement ins)
     {
-        var rules = _connection.Session.Database?.GetTableRules(ins.Table);
+        var rules = TableRules(ins.Table);
 
         // Column / value lists. An omitted column list means "all columns positionally" — recover the
-        // physical field order from the rules (one DbcFieldRules per field, in column order).
+        // physical field order from DBC rules when present, else from the target schema for free tables.
         var cols = new List<string>(
             ins.Columns ?? (rules?.Fields.Select(f => f.FieldName) ?? Enumerable.Empty<string>()));
+        if (ins.Columns is null && cols.Count == 0 && ins.Values.Count > 0)
+            cols = FieldNames(ins.Table);
         var valTexts = new List<string>(ins.Values.Select(v => v.Text));
 
         // Open the target so a DEFAULT UDF that reads the table state (e.g. createid()'s RECCOUNT())

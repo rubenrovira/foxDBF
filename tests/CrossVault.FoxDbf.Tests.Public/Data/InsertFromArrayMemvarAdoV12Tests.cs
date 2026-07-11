@@ -264,6 +264,7 @@ public sealed class InsertFromArrayMemvarAdoV12Tests : IDisposable
         public string Dir { get; }
         public string Dbc => Path.Combine(Dir, "shop.dbc");
         public string MemberDbf => Path.Combine(Dir, "parts.dbf");
+        public string FreeDbf => Path.Combine(Dir, "loose.dbf");
 
         public PartsDbc()
         {
@@ -278,6 +279,18 @@ public sealed class InsertFromArrayMemvarAdoV12Tests : IDisposable
                     new DbfColumnDef("QTY", 'N', 6, 2),
                 }),
             });
+
+            // A free table beside the open DBC exercises the physical-schema fallback in the enforced
+            // write model: it has no DBC rules metadata of its own.
+            using (var w = DbfWriter.Create(FreeDbf, new[]
+            {
+                new DbfColumnDef("FID", 'I', 4),
+                new DbfColumnDef("FNAME", 'C', 10),
+                new DbfColumnDef("FQTY", 'N', 6, 2),
+            }, new DbfCreateOptions { Overwrite = true }))
+            {
+                w.Flush();
+            }
         }
 
         public FoxDbfConnection OpenEnforced()
@@ -350,6 +363,21 @@ public sealed class InsertFromArrayMemvarAdoV12Tests : IDisposable
             Assert.Equal("gear", ((string)ExecScalar(conn, "SELECT pname FROM parts WHERE pid = 5")!).TrimEnd());
         }
         using var t = DbfTable.Open(db.MemberDbf);
+        Assert.Equal(1, t.RecordCount);
+    }
+
+    [Fact]
+    public void EnforceRules_OmittedColumnList_UsesPhysicalFields_ForFreeSiblingTable()
+    {
+        using var db = new PartsDbc();
+        using (var conn = db.OpenEnforced())
+        {
+            Assert.Equal(1, ExecNonQuery(conn, "INSERT INTO loose VALUES (42, 'free', 7.5)"));
+            Assert.Equal(42, Convert.ToInt32(ExecScalar(conn, "SELECT fid FROM loose")));
+            Assert.Equal("free", ((string)ExecScalar(conn, "SELECT fname FROM loose")!).TrimEnd());
+            Assert.Equal(7.5m, Convert.ToDecimal(ExecScalar(conn, "SELECT fqty FROM loose")));
+        }
+        using var t = DbfTable.Open(db.FreeDbf);
         Assert.Equal(1, t.RecordCount);
     }
 
