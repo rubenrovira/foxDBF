@@ -1054,6 +1054,13 @@ public sealed partial class VfpInterpreter
                 char c = line[i];
                 if (inStr) { sb.Append(c); if (c == q) inStr = false; i++; continue; }
                 if (c == '\'' || c == '"') { inStr = true; q = c; sb.Append(c); i++; continue; }
+                if (c == '[' && !IsSubscriptBracket(line, i))
+                {
+                    // A value-position [...] is a VFP string literal. Copy it verbatim; `name[...]`
+                    // remains an array subscript whose expression can contain a runtime macro.
+                    do { sb.Append(line[i]); } while (++i < line.Length && line[i - 1] != ']');
+                    continue;
+                }
                 if (c == '&' && i + 1 < line.Length && (char.IsAsciiLetter(line[i + 1]) || line[i + 1] == '_'))
                 {
                     int j = i + 1;
@@ -1071,6 +1078,15 @@ public sealed partial class VfpInterpreter
             if (!changed) break;
         }
         return line;
+    }
+
+    // Keep this local context rule aligned with MicroVfpExprRewrite.ConvertSubscripts: '[' immediately
+    // after an identifier character or a close delimiter is an array subscript; otherwise it starts a
+    // bracket string literal.
+    private static bool IsSubscriptBracket(string text, int index)
+    {
+        char prev = index > 0 ? text[index - 1] : '\0';
+        return prev == ')' || prev == ']' || char.IsAsciiLetterOrDigit(prev) || prev == '_';
     }
 
     // CLEAR MEMORY / CLEAR ALL. MEMORY releases every memvar + array; ALL additionally closes every open
@@ -1346,7 +1362,11 @@ public sealed partial class VfpInterpreter
     {
         // Normalise VFP array syntax (bracket subscripts → parens; ALEN/AERROR array-name → quoted name)
         // so dynamically-evaluated strings (TYPE/EVAL/macro/DIMENSION dimension expressions) resolve arrays.
-        try { return ParseExpressionCached(MicroVfpExprRewrite.Normalize(text)).Evaluate(_row, _ctx); }
+        try
+        {
+            if (text.IndexOf('&') >= 0) text = ExpandMacrosInLine(text);
+            return ParseExpressionCached(MicroVfpExprRewrite.Normalize(text)).Evaluate(_row, _ctx);
+        }
         catch { return VfpValue.Null; }
     }
 
