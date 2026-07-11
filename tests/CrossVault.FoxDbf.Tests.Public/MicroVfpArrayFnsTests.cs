@@ -25,6 +25,54 @@ public sealed class MicroVfpArrayFnsTests
         return new VfpInterpreter(s);
     }
 
+    [Fact]
+    public void ScalarAssignment_ToArray_BroadcastsThenIndexedAssignmentChangesOnlyTarget()
+    {
+        var interp = New(out _);
+        interp.Execute("DIMENSION a(3)\na = 5\na(2) = 9");
+
+        Assert.Equal(5m, interp.EvalExpression("a(1)").AsNumber);
+        Assert.Equal(9m, interp.EvalExpression("a(2)").AsNumber);
+        Assert.Equal(5m, interp.EvalExpression("a(3)").AsNumber);
+    }
+
+    [Fact]
+    public void StoreScalar_To2DArray_BroadcastsAllElements()
+    {
+        var interp = New(out _);
+        interp.Execute("DIMENSION b(2,2)\nSTORE 7 TO b");
+
+        Assert.Equal(7m, interp.EvalExpression("b(1,1)").AsNumber);
+        Assert.Equal(7m, interp.EvalExpression("b(1,2)").AsNumber);
+        Assert.Equal(7m, interp.EvalExpression("b(2,1)").AsNumber);
+        Assert.Equal(7m, interp.EvalExpression("b(2,2)").AsNumber);
+    }
+
+    [Fact]
+    public void Redimension_AfterBroadcast_PreservesOldAndFalseFillsNewElements()
+    {
+        var interp = New(out _);
+        interp.Execute("DIMENSION c(3)\nc = 5\nc(2) = 9\nREDIMENSION c(5)");
+
+        Assert.Equal(5m, interp.EvalExpression("c(1)").AsNumber);
+        Assert.Equal(9m, interp.EvalExpression("c(2)").AsNumber);
+        Assert.Equal(5m, interp.EvalExpression("c(3)").AsNumber);
+        Assert.Equal(VfpType.Logical, interp.EvalExpression("c(4)").Type);
+        Assert.False(interp.EvalExpression("c(4)").AsLogical);
+        Assert.Equal(VfpType.Logical, interp.EvalExpression("c(5)").Type);
+        Assert.False(interp.EvalExpression("c(5)").AsLogical);
+    }
+
+    [Fact]
+    public void ScalarAssignment_ToScalar_RemainsScalar()
+    {
+        var interp = New(out _);
+        interp.Execute("x = 1\nx = 5");
+
+        Assert.Null(interp.Memory.FindArray("x"));
+        Assert.Equal(5m, interp.EvalExpression("x").AsNumber);
+    }
+
     // ─────────────────────────────── ACOPY ───────────────────────────────
 
     [Fact]

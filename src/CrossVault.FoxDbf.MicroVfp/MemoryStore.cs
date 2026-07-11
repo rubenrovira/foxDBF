@@ -267,7 +267,18 @@ internal sealed class MemoryStore
         try
         {
             var cell = Find(name);
-            if (cell is not null) { cell.Value = value; cell.Defined = true; return; }
+            if (cell is not null)
+            {
+                if (cell.Array is { } array)
+                {
+                    for (int i = 1; i <= array.Length; i++) array.SetLinear(i, value);
+                    cell.Defined = true;
+                    return;
+                }
+                cell.Value = value;
+                cell.Defined = true;
+                return;
+            }
             Current.Vars[name] = new Cell { Value = value, Defined = true, Kind = VarKind.ImplicitPrivate };
         }
         finally
