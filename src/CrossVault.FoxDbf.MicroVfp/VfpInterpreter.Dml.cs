@@ -140,6 +140,9 @@ public sealed partial class VfpInterpreter
         SnapshotForTxn(path);
         FileSnapshot? snap = path is not null ? CaptureSnapshot(path) : null;   // pre-image for the rollback.
 
+        try
+        {
+
         long riSqlStart = VfpInsertProfile.Start();
         try { Session.Execute(ins.Sql); }
         catch { if (openedHere) { Session.CloseArea(area); _meta.Remove(area); } return; }
@@ -158,6 +161,8 @@ public sealed partial class VfpInterpreter
         // the inserted row back here so VFP's "blocked INSERT" is matched and no orphan child survives.
         if (!ok && snap is not null) RestoreSnapshot(snap);
         if (openedHere && Session.AreaAt(area) is not null) { Session.CloseArea(area); _meta.Remove(area); }
+        }
+        finally { snap?.Cleanup(); }
     }
 
     /// <summary>The parsed <see cref="InsertStatement"/> for <paramref name="ins"/>, reusing the parse
@@ -319,6 +324,10 @@ public sealed partial class VfpInterpreter
 
         bool autoFireUpdate = EnforceReferentialIntegrity && ResolveTriggerProc(RiEvent.Update, wa) is not null;
         RecordImage? parentImg = null; FileSnapshot? parentSnap = null;
+        bool hasCandidate = CandidateTagsFor(path) is not null;
+        RecordImage? candImg = null; FileSnapshot? candSnap = null;
+        try
+        {
         if (autoFireUpdate)
         {
             if (TryCaptureRecordImage(path, recIndex, wa, replacedFields, out var pImg)) parentImg = pImg;
@@ -330,8 +339,6 @@ public sealed partial class VfpInterpreter
         // duplicate visible in the tag (a free-table candidate tag is plain/non-UNIQUE on disk), so we
         // capture the pre-image up front and, after the maintained write, re-check every candidate tag —
         // rolling the record back and raising on a violation (the same flow the INSERT path uses).
-        bool hasCandidate = CandidateTagsFor(path) is not null;
-        RecordImage? candImg = null; FileSnapshot? candSnap = null;
         if (hasCandidate)
         {
             if (TryCaptureRecordImage(path, recIndex, wa, replacedFields, out var cImg)) candImg = cImg;
@@ -383,6 +390,12 @@ public sealed partial class VfpInterpreter
         {
             if (parentImg is { } pRevert) RestoreRecordImage(pRevert);
             else if (parentSnap is not null) RestoreSnapshot(parentSnap);
+        }
+        }
+        finally
+        {
+            parentSnap?.Cleanup();
+            candSnap?.Cleanup();
         }
     }
 
