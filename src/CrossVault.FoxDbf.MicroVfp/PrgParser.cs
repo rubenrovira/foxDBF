@@ -329,6 +329,8 @@ public static class PrgParser
             if (after.StartsWith('('))
             {
                 int close = MatchParen(after, 0);
+                if (close < 1)
+                    throw new MicroVfpSyntaxException("Unbalanced parameter list in PROCEDURE/FUNCTION header.", ll.LineNo);
                 string inner = after.Substring(1, close - 1);
                 foreach (var p in PrgScan.SplitTopCommas(inner))
                 {
@@ -1716,7 +1718,7 @@ public static class PrgParser
                 if (c == '(') depth++;
                 else if (c == ')') { depth--; if (depth == 0) return i; }
             }
-            return s.Length - 1;
+            return -1;
         }
 
         /// <summary>Index of the closing bracket matching the opener at <paramref name="open"/>
