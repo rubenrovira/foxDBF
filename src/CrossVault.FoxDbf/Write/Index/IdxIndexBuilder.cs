@@ -57,10 +57,11 @@ internal static class IdxIndexBuilder
             Exact = evalContext?.Exact ?? false,
             Ansi = evalContext?.Ansi ?? false,
             Culture = evalContext?.Culture,
-            Encoding = evalContext?.Encoding,
+            Encoding = schema.Encoding,
         };
 
         var (keyType, keyLen, _) = CdxIndexBuilder.ResolveKey(schema, keyExpr);
+        Encoding characterEncoding = ResolveCharacterEncoding(schema, keyExpr);
 
         var keyFn = VfpExpression.Parse(keyExpr).Compile(ctx);
         Func<IRowContext, VfpValue>? forFn = !string.IsNullOrWhiteSpace(forExpr)
@@ -81,7 +82,7 @@ internal static class IdxIndexBuilder
                     continue;
             }
             var value = keyFn(rc);
-            entries.Add(new Entry(EncodeKey(value, keyType, keyLen), (uint)row.RecNo));
+            entries.Add(new Entry(EncodeKey(value, keyType, keyLen, characterEncoding), (uint)row.RecNo));
         }
 
         entries.Sort(EntryComparer.Instance);
@@ -97,7 +98,7 @@ internal static class IdxIndexBuilder
 
     // ---- key encoding (legacy IDX == raw MACHINE bytes) ------------------------
 
-    private static byte[] EncodeKey(VfpValue value, IndexKeyType type, int keyLen)
+    private static byte[] EncodeKey(VfpValue value, IndexKeyType type, int keyLen, Encoding characterEncoding)
     {
         if (type == IndexKeyType.Character)
         {
@@ -105,7 +106,7 @@ internal static class IdxIndexBuilder
             for (int i = 0; i < keyLen; i++) buf[i] = 0x20;
             if (!value.IsNull)
             {
-                byte[] raw = Encoding.Latin1.GetBytes(value.AsString);
+                byte[] raw = characterEncoding.GetBytes(value.AsString);
                 raw.AsSpan(0, Math.Min(raw.Length, keyLen)).CopyTo(buf);
             }
             return buf;
@@ -124,6 +125,18 @@ internal static class IdxIndexBuilder
         if (encoded is not null)
             Array.Copy(encoded, key, Math.Min(encoded.Length, keyLen));
         return key;
+    }
+
+    /// <summary>Resolve the byte encoding a standalone character IDX stores and compares. A direct
+    /// binary/NOCPTRANS field is byte-identity Latin-1; a normal direct field and every character
+    /// expression use the table encoding.</summary>
+    internal static Encoding ResolveCharacterEncoding(DbfTable schema, string keyExpr)
+    {
+        string field = (keyExpr ?? string.Empty).Trim();
+        foreach (var col in schema.Columns)
+            if (string.Equals(col.Name, field, StringComparison.OrdinalIgnoreCase))
+                return col.IsBinary ? Encoding.Latin1 : schema.Encoding;
+        return schema.Encoding;
     }
 
     // ---- B-tree bulk loader ----------------------------------------------------

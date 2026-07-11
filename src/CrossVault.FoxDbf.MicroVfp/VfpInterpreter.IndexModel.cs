@@ -377,6 +377,7 @@ public sealed partial class VfpInterpreter
         public Index.CdxTag? CdxTag;
         public IdxFile? Idx;
         public IndexKeyType IdxKeyType;
+        public Encoding IdxCharacterEncoding = Encoding.Latin1;
         public bool Descending;
         public string Name = "";
         private readonly IDisposable? _owner;
@@ -423,6 +424,8 @@ public sealed partial class VfpInterpreter
                     {
                         Idx = idx, Name = IdxOrderName(p),
                         IdxKeyType = IndexKey.ResolveType(idx.Header.KeyExpression.Trim(), wa.Table),
+                        IdxCharacterEncoding = IdxIndexBuilder.ResolveCharacterEncoding(
+                            wa.Table, idx.Header.KeyExpression.Trim()),
                     };
                 }
             }

@@ -473,13 +473,11 @@ public sealed partial class VfpInterpreter
 
         if (src.IsCharacterKey)
         {
-            var coll = VfpCollations.FromSortSequence(src.CollationName);
-            // Encode each bound the SAME way the tag stores keys: collated weights padded (0x20) to the
-            // tag key length. Comparing bytes then mirrors the on-disk sort order exactly (this is what
-            // SEEK does), so a GENERAL tag's weight keys and a MACHINE tag's raw bytes both match.
-            byte[]? loBytes = m.KeyLow is { } lo ? CollatedBoundKey(coll, lo, src.KeyLength) : null;
-            byte[]? hiBytes = m.KeyRange && m.KeyHigh is { } hi ? CollatedBoundKey(coll, hi, src.KeyLength) : null;
-            byte[]? loNatural = !m.KeyRange && m.KeyLow is { } lo1 ? coll.GetCollatedKey((lo1.AsString ?? string.Empty).AsSpan()) : null;
+            // Encode each bound the SAME way the order stores keys: CDX collation weights or standalone
+            // IDX code-page bytes, padded to the key length. Raw comparison mirrors on-disk order.
+            byte[]? loBytes = m.KeyLow is { } lo ? PaddedCharacterKey(src, lo) : null;
+            byte[]? hiBytes = m.KeyRange && m.KeyHigh is { } hi ? PaddedCharacterKey(src, hi) : null;
+            byte[]? loNatural = !m.KeyRange && m.KeyLow is { } lo1 ? NaturalCharacterKey(src, lo1) : null;
             foreach (var (key, recno) in OrderedEntries(src))
             {
                 if (CharKeyInRange(m, key, loBytes, hiBytes, loNatural))
@@ -496,17 +494,29 @@ public sealed partial class VfpInterpreter
         return set;
     }
 
-    /// <summary>The stored-key bytes for a SET KEY bound over a CHARACTER tag: the bound's collated
-    /// weights, right-padded with spaces (0x20) to (or truncated at) the tag key length — byte-identical
-    /// to how the CDX builder laid the tag's own keys down.</summary>
-    private static byte[] CollatedBoundKey(IVfpCollation coll, VfpValue bound, int keyLen)
+    /// <summary>The stored-key bytes for a CHARACTER SET KEY bound: the natural CDX weights or IDX
+    /// code-page bytes, right-padded with spaces (0x20) to or truncated at the order's key length.</summary>
+    private static byte[] PaddedCharacterKey(OrderSource src, VfpValue bound)
     {
-        var natural = coll.GetCollatedKey((bound.AsString ?? string.Empty).AsSpan());
-        var key = new byte[keyLen];
+        var natural = NaturalCharacterKey(src, bound);
+        var key = new byte[src.KeyLength];
         Array.Fill(key, (byte)0x20);
-        int copy = Math.Min(natural.Length, keyLen);
+        int copy = Math.Min(natural.Length, src.KeyLength);
         natural.AsSpan(0, copy).CopyTo(key);
         return key;
+    }
+
+    /// <summary>The natural stored byte needle for a character order. Standalone IDX uses its
+    /// resolved table/direct-field encoding; CDX retains its existing collation encoding.</summary>
+    private static byte[] NaturalCharacterKey(OrderSource src, VfpValue value)
+    {
+        string text = value.AsString ?? string.Empty;
+        if (src.Idx is not null)
+            return src.IdxCharacterEncoding.GetBytes(text);
+        var tag = src.CdxTag!;
+        return !string.Equals(tag.Collation, "MACHINE", StringComparison.OrdinalIgnoreCase)
+            ? VfpCollations.FromSortSequence(tag.Collation).GetCollatedKey(text.AsSpan())
+            : Encoding.Latin1.GetBytes(text);
     }
 
     /// <summary>The natural (unpadded) byte needle used by interpreter character seeks. GENERAL and other
@@ -920,8 +930,8 @@ public sealed partial class VfpInterpreter
         using var src = OpenOrderSource(area, identity);
         if (src is null) { m.Found = false; return false; }
 
-        byte[]? characterNeedle = src.CdxTag is { IsCharacterKey: true } characterTag && key.Type == VfpType.Character
-            ? NaturalCharacterSeekNeedle(characterTag, key)
+        byte[]? characterNeedle = src.IsCharacterKey && key.Type == VfpType.Character
+            ? NaturalCharacterKey(src, key)
             : null;
 
         uint? recno = null;
@@ -1042,17 +1052,30 @@ public sealed partial class VfpInterpreter
             return CompareDecodedToValue(IndexKey.Decode(keyBytes, t.KeyType), t.KeyType, key) == 0;
         }
         if (src.Idx is not null)
+        {
+            if (src.IdxKeyType == IndexKeyType.Character && key.Type == VfpType.Character)
+                return IsBytePrefix(characterNeedle ?? NaturalCharacterKey(src, key), keyBytes);
             return SeekValueMatches(IndexKey.Decode(keyBytes, src.IdxKeyType), src.IdxKeyType, key);
+        }
         return false;
     }
 
-    /// <summary>Seek <paramref name="key"/> in a standalone <c>.idx</c> order by decoding each entry's key
-    /// and comparing by VALUE (first match wins); returns the recno, or null when absent.</summary>
+    /// <summary>Seek <paramref name="key"/> in a standalone <c>.idx</c> order. Character keys compare
+    /// raw stored bytes to a needle encoded with the order's resolved encoding; other types decode.</summary>
     private static uint? SeekIdx(OrderSource src, VfpValue key)
     {
         if (src.Idx is null) return null;
+        byte[]? characterNeedle = src.IdxKeyType == IndexKeyType.Character && key.Type == VfpType.Character
+            ? NaturalCharacterKey(src, key)
+            : null;
         foreach (var e in src.Idx.EnumerateEntries())
         {
+            if (characterNeedle is not null)
+            {
+                if (IsBytePrefix(characterNeedle, e.Key))
+                    return e.RecordNumber;
+                continue;
+            }
             var decoded = IndexKey.Decode(e.Key, src.IdxKeyType);
             if (SeekValueMatches(decoded, src.IdxKeyType, key))
                 return e.RecordNumber;
@@ -1116,6 +1139,10 @@ public sealed partial class VfpInterpreter
     {
         if (src.Idx is not null)
         {
+            if (src.IdxKeyType == IndexKeyType.Character && key.Type == VfpType.Character)
+                return CompareBytesUnsigned(
+                    keyBytes,
+                    characterNeedle ?? NaturalCharacterKey(src, key));
             var decoded = IndexKey.Decode(keyBytes, src.IdxKeyType);
             return CompareDecodedToValue(decoded, src.IdxKeyType, key);
         }
