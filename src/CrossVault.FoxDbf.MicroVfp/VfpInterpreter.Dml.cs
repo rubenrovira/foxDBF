@@ -456,7 +456,7 @@ public sealed partial class VfpInterpreter
         }
         m.RecNo = rc + 1; m.Eof = true; m.Bof = false; m.Cached = null;   // SUM leaves the pointer at EOF.
         for (int k = 0; k < sum.To.Count && k < n; k++)
-            Memory.Set(sum.To[k], VfpValue.Number(acc[k]));
+            AssignTo(sum.To[k], VfpValue.Number(acc[k]));
     }
 
     // ─────────────────────────── P2 table/record movers + whole-table I/O ───────────────────────────

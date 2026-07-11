@@ -732,7 +732,8 @@ public static class PrgParser
             if (toPos < 0)
                 return new StoreStmt(PrgExpr.Parse(rest), Array.Empty<string>());
             string value = rest.Substring(0, toPos);
-            var targets = IdentList(rest.Substring(toPos + 2));
+            var targets = PrgScan.SplitTopCommas(rest.Substring(toPos + 2))
+                .Select(p => p.Trim()).Where(p => p.Length > 0).ToList();
             return new StoreStmt(PrgExpr.Parse(value), targets);
         }
 
@@ -1261,7 +1262,8 @@ public static class PrgParser
             {
                 if (k == "FOR") forE = PrgExpr.Parse(b);
                 else if (k == "WHILE") whileE = PrgExpr.Parse(b);
-                else if (k == "TO") targets.AddRange(IdentList(b));
+                else if (k == "TO") targets.AddRange(
+                    PrgScan.SplitTopCommas(b).Select(p => p.Trim()).Where(p => p.Length > 0));
             }
             return new SumStmt(exprs, null, forE, whileE, targets);
         }
