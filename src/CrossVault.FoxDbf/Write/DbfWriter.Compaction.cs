@@ -83,11 +83,11 @@ public sealed partial class DbfWriter
 
         // Memo columns whose pointer (4-byte LE at Offset+1) we must relocate. Only meaningful
         // when a usable .fpt sidecar is open; without it we copy record bytes verbatim (pointers
-        // are left untouched — there is no memo store to compact). 'G' (General/OLE) stores a 4-byte
-        // .fpt block pointer exactly like M/W and MUST relocate too — otherwise Pack rebuilds the
-        // .fpt without those blocks and leaves every General field dangling (broken VFP-side OLE).
+        // are left untouched — there is no memo store to compact). 'G' (General/OLE) and 'P'
+        // (Picture) store a 4-byte .fpt block pointer exactly like M/W and MUST relocate too —
+        // otherwise Pack rebuilds the .fpt without those blocks and leaves them dangling.
         var memoColumns = _schema.Columns
-            .Where(c => c.Type is 'M' or 'W' or 'G' && c.Length >= 4)
+            .Where(c => c.Type is ('M' or 'W' or 'G' or 'P') && c.Length >= 4)
             .ToList();
         bool compactMemo = _fpt is not null && _fptHandle is not null && memoColumns.Count > 0;
 
