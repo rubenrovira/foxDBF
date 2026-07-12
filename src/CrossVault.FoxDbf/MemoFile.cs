@@ -204,9 +204,13 @@ public sealed class Dbase3MemoFile : MemoFile
 
             using var memo = new MemoryStream();
             var block = new byte[DefaultBlockSize];
+            bool readAny = false;
             while (true)
             {
                 int read = Stream.ReadAtLeast(block, DefaultBlockSize, throwOnEndOfStream: false);
+                if (read == 0 && !readAny)
+                    return null;
+                readAny |= read > 0;
                 // Strip all 0x00 and 0x1A bytes in this block, then append (§A6). The gem
                 // breaks on the STRIPPED length, so a block carrying the 0x00/0x1A
                 // terminator/padding ends the memo even on a full 512-byte raw read.
@@ -260,6 +264,10 @@ public sealed class Dbase4MemoFile : MemoFile
             // Skip 4 bytes; length is a LITTLE-endian u32 at block offset 4 (§A6).
             uint length = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(4));
             if (length == 0)
+                return null;
+
+            long remaining = Stream.Length - offset - BlockHeaderSize;
+            if (length > int.MaxValue || remaining < 0 || (long)length > remaining)
                 return null;
 
             var content = ReadExact(offset + BlockHeaderSize, (int)length);
@@ -321,6 +329,10 @@ public sealed class FoxproMemoFile : MemoFile
             uint type = BinaryPrimitives.ReadUInt32BigEndian(header);
             uint length = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(4));
             if (type != 1 || length == 0)
+                return null;
+
+            long remaining = Stream.Length - offset - BlockHeaderSize;
+            if (length > int.MaxValue || remaining < 0 || (long)length > remaining)
                 return null;
 
             // Content is read contiguously for the full length, spanning blocks (§A6).
