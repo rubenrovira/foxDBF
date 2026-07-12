@@ -767,6 +767,10 @@ public sealed partial class DbfWriter : IDisposable
 
     private int AppendMemoBlock(DbfColumn col, object value)
     {
+        if (_fptNextFree < (uint)FirstMemoDataBlock())
+            throw new DbfWriteException(
+                "The .fpt sidecar header is truncated or corrupt (NextFree points into the header region); refusing to append memo data.");
+
         byte[] content = value switch
         {
             byte[] b => b,
