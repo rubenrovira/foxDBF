@@ -40,57 +40,9 @@ public static class CsvExporter
         ArgumentNullException.ThrowIfNull(path);
         options ??= new CsvExportOptions();
 
-        string fullPath = Path.GetFullPath(path);
-        string publishPath = ResolvePublishPath(fullPath);
-        string directory = Path.GetDirectoryName(publishPath)!;
-        string tempPath = Path.Combine(directory,
-            $".{Path.GetFileName(publishPath)}.{Guid.NewGuid():N}.tmp");
-        bool tempCreated = false;
-
-        try
-        {
-            using (var fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            {
-                tempCreated = true;
-                using var writer = new StreamWriter(fs, options.Encoding);
-                WriteTo(table, writer, options);
-            }
-
-            File.Move(tempPath, publishPath, overwrite: true);
-        }
-        catch
-        {
-            if (tempCreated)
-            {
-                try { File.Delete(tempPath); } catch { /* best effort */ }
-            }
-            throw;
-        }
-    }
-
-    private static string ResolvePublishPath(string fullPath)
-    {
-        try
-        {
-            var file = new FileInfo(fullPath);
-            if (file.LinkTarget is null)
-                return fullPath;
-
-            var target = file.ResolveLinkTarget(returnFinalTarget: true);
-            if (target is FileInfo)
-                return target.FullName;
-
-            System.Diagnostics.Debug.WriteLine(
-                $"CsvExporter could not safely resolve file symlink '{fullPath}'; using the original path.");
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
-        {
-            System.Diagnostics.Debug.WriteLine(
-                $"CsvExporter could not resolve file symlink '{fullPath}'; using the original path: {ex.Message}");
-        }
-
-        // Broken or unsupported links retain the r1 behavior rather than turning resolution into a new error.
-        return fullPath;
+        using var fs = File.Create(path);
+        using var writer = new StreamWriter(fs, options.Encoding);
+        WriteTo(table, writer, options);
     }
 
     /// <summary>

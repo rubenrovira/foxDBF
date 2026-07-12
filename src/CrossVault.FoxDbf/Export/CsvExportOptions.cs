@@ -10,17 +10,18 @@ namespace CrossVault.FoxDbf;
 /// </summary>
 /// <remarks>
 /// The UTF-8 BOM is carried as the <see cref="Encoding"/>'s preamble
-/// (<c>new UTF8Encoding(encoderShouldEmitBOM: true)</c>) and is written EXPLICITLY by the
-/// path/stream export (a plain .NET UTF-8 <see cref="Encoding"/> never emits one on its own).
-/// To export without a BOM, set <see cref="Encoding"/> to <c>new UTF8Encoding(false)</c>.
+/// (<c>new UTF8Encoding(encoderShouldEmitBOM: true)</c>). The path export's
+/// <see cref="StreamWriter"/> writes that preamble automatically before streaming the body;
+/// the <see cref="TextWriter"/> overload uses the caller-owned writer and does not consult this
+/// option. To export without a BOM, set <see cref="Encoding"/> to <c>new UTF8Encoding(false)</c>.
 /// </remarks>
 public sealed record CsvExportOptions
 {
     /// <summary>
     /// Output text encoding. Default: UTF-8 <em>with</em> a BOM
     /// (<c>new UTF8Encoding(encoderShouldEmitBOM: true)</c>), whose preamble (<c>EF BB BF</c>)
-    /// the path/stream export writes explicitly. Ignored by the <see cref="TextWriter"/>
-    /// overload, whose own encoding/BOM the caller owns.
+    /// the path export's <see cref="StreamWriter"/> writes automatically. Ignored by the
+    /// <see cref="TextWriter"/> overload, whose own encoding/BOM the caller owns.
     /// </summary>
     public Encoding Encoding { get; init; } = new UTF8Encoding(true);
 
