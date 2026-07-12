@@ -306,7 +306,7 @@ internal sealed class HighlikeIndexCache : IDisposable
     // ============================================================ cached tag (identity + entries)
 
     /// <summary>
-    /// One decoded tag: the entries PLUS the identity (KEY / FOR / collation) they were decoded from, so a
+    /// One decoded tag: the entries PLUS the identity (KEY / FOR / collation / order / uniqueness / key type) they were decoded from, so a
     /// name collision against a recreated tag with a different expression is detected rather than served stale.
     /// </summary>
     private sealed class CachedTag
@@ -315,6 +315,9 @@ internal sealed class HighlikeIndexCache : IDisposable
         private readonly string _key;
         private readonly string _for;
         private readonly string _collation;
+        private readonly bool _descending;
+        private readonly bool _unique;
+        private readonly IndexKeyType _keyType;
 
         public CachedTag(CdxTag tag, IReadOnlyList<IndexEntry> entries)
         {
@@ -322,13 +325,19 @@ internal sealed class HighlikeIndexCache : IDisposable
             _key = tag.KeyExpression ?? string.Empty;
             _for = tag.ForExpression ?? string.Empty;
             _collation = tag.Collation ?? string.Empty;
+            _descending = tag.Descending;
+            _unique = tag.IsUnique;
+            _keyType = tag.KeyType;
         }
 
-        /// <summary>True when <paramref name="tag"/> still has the exact KEY / FOR / collation we decoded.</summary>
+        /// <summary>True when <paramref name="tag"/> still has the exact identity we decoded.</summary>
         public bool MatchesIdentity(CdxTag tag)
             => string.Equals(_key, tag.KeyExpression ?? string.Empty, StringComparison.Ordinal)
             && string.Equals(_for, tag.ForExpression ?? string.Empty, StringComparison.Ordinal)
-            && string.Equals(_collation, tag.Collation ?? string.Empty, StringComparison.Ordinal);
+            && string.Equals(_collation, tag.Collation ?? string.Empty, StringComparison.Ordinal)
+            && _descending == tag.Descending
+            && _unique == tag.IsUnique
+            && _keyType == tag.KeyType;
     }
 
     // ============================================================ per-table slot

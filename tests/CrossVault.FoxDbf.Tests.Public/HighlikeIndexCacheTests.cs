@@ -52,7 +52,7 @@ public sealed class HighlikeIndexCacheTests
 
         private static readonly string[] Names = { "Alice", "Bob", "cherry", "David", "alice", "eric" };
 
-        public TempTable(int rows = 2000)
+        public TempTable(int rows = 2000, bool idTagOnly = false)
         {
             RowCount = rows;
             Dir = Path.Combine(Path.GetTempPath(), "foxdbf_hicache_" + Guid.NewGuid().ToString("N"));
@@ -73,8 +73,11 @@ public sealed class HighlikeIndexCacheTests
                     w.AppendRecord(new object?[] { i, i % 1000, Names[i % Names.Length], "C" + (i % 4) });
 
                 w.CreateTag(new CdxTagDefinition("IDTAG", "ID"));
-                w.CreateTag(new CdxTagDefinition("AMTTAG", "AMOUNT"));
-                w.CreateTag(new CdxTagDefinition("UNAME", "UPPER(NAME)"));
+                if (!idTagOnly)
+                {
+                    w.CreateTag(new CdxTagDefinition("AMTTAG", "AMOUNT"));
+                    w.CreateTag(new CdxTagDefinition("UNAME", "UPPER(NAME)"));
+                }
             }
 
             Cdx = Path.ChangeExtension(Dbf, ".cdx");
@@ -200,6 +203,42 @@ public sealed class HighlikeIndexCacheTests
 
         // The decoded tag is resident.
         Assert.True(afterSecond.EntryCount >= 1);
+    }
+
+    [Fact]
+    public void RecreatedTag_WithDifferentDescendingFlag_IsNotServedFromWarmCache()
+    {
+        using var fx = new TempTable(rows: 50, idTagOnly: true);
+        using var engine = new HighlikeEngine(new HighlikeOptions { DriveKind = HighlikeDriveKind.Network });
+
+        using (var table = DbfTable.Open(fx.Dbf))
+        using (var cdx = CdxFile.Open(fx.Cdx, table))
+            _ = engine.FindRecords(table, cdx, "ID >= 10 AND ID <= 20");
+        var warm = engine.CacheStatistics;
+
+        byte[] dbfHeader = ReadDbfHeader8(fx.Dbf);
+        DateTime dbfWrite = File.GetLastWriteTimeUtc(fx.Dbf);
+        long cdxLength = new FileInfo(fx.Cdx).Length;
+        DateTime cdxWrite = File.GetLastWriteTimeUtc(fx.Cdx);
+
+        using (var writer = DbfWriter.Open(fx.Dbf))
+        {
+            Assert.Equal(0, writer.DeleteTagsIn(fx.Cdx, structural: true, names: null));
+            writer.CreateTag(new CdxTagDefinition("IDTAG", "ID", descending: true));
+        }
+
+        Assert.Equal(cdxLength, new FileInfo(fx.Cdx).Length);
+        File.SetLastWriteTimeUtc(fx.Dbf, dbfWrite);
+        File.SetLastWriteTimeUtc(fx.Cdx, cdxWrite);
+        Assert.Equal(dbfHeader, ReadDbfHeader8(fx.Dbf));
+
+        using (var table = DbfTable.Open(fx.Dbf))
+        using (var cdx = CdxFile.Open(fx.Cdx, table))
+            _ = engine.FindRecords(table, cdx, "ID >= 10 AND ID <= 20");
+        var after = engine.CacheStatistics;
+
+        Assert.True(after.Evictions > warm.Evictions, "changed tag identity must evict the cached entries");
+        Assert.True(after.Misses > warm.Misses, "changed tag identity must be decoded again");
     }
 
     /// <summary>After a detected change the entry is EVICTED and the next query is a MISS again (re-decode).</summary>
