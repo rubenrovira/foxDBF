@@ -51,7 +51,8 @@ internal sealed class HighlikeStatsCache : IDisposable
     /// unchanged) reuses the in-memory <see cref="StxStatistics"/> with NO Load/Build; a MISS (first touch,
     /// or the token moved after a write) re-acquires it ONCE and adopts the new token. A stream-only table
     /// (no path) cannot be keyed, so it is built each call (unchanged from before). Never throws (any
-    /// failure → null → Core path).
+    /// failure → null → Core path). A path-less index is built per call and never memoised because
+    /// separate streams have no stable shared identity.
     /// </para>
     /// </summary>
     public StxStatistics? GetOrBuild(DbfTable? table, CdxFile? cdx)
@@ -67,9 +68,15 @@ internal sealed class HighlikeStatsCache : IDisposable
                 return HighlikeStatistics.Build(table, cdx, _options);
             }
 
+            if (cdx?.SourcePath is not { Length: > 0 })
+            {
+                Interlocked.Increment(ref _computes);
+                return HighlikeStatistics.Build(table, cdx, _options);
+            }
+
             string dbfFull = Normalize(dbfPath);
-            string? cdxPath = cdx?.SourcePath;
-            string cdxFull = cdxPath is { Length: > 0 } ? Normalize(cdxPath) : "\0stream";
+            string cdxPath = cdx.SourcePath!;
+            string cdxFull = Normalize(cdxPath);
             long cdxLiveLength = SafeLength(cdx);
             string key = dbfFull + "\0" + cdxFull;
 

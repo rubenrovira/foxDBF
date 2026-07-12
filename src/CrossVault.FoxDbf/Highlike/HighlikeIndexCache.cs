@@ -69,19 +69,20 @@ internal sealed class HighlikeIndexCache : IDisposable
     /// optimizer consults instead of re-walking the B-tree. The slot is keyed by (dbf path + cdx path) so a
     /// DIFFERENT index over the same table never serves the wrong cdx's decoded recnos. Returns
     /// <see langword="null"/> (→ the Core walks the tree itself, unchanged) when the cache is disabled /
-    /// disposed or the table has no path. Never throws.
+    /// disposed, the table has no path, or the index has no path. Never throws.
     /// </summary>
     public Func<CdxTag, IEnumerable<IndexEntry>>? BeginQuery(DbfTable? table, CdxFile? cdx)
     {
         if (_disposed || !_options.EnableIndexCache) return null;
         if (table?.SourcePath is not { Length: > 0 } dbfPath) return null;
+        if (cdx?.SourcePath is not { Length: > 0 }) return null;
 
         TableSlot slot;
         try
         {
             string dbfFull = Normalize(dbfPath);
-            string? cdxPath = cdx?.SourcePath;
-            string cdxFull = cdxPath is { Length: > 0 } ? Normalize(cdxPath) : "\0stream";
+            string cdxPath = cdx.SourcePath!;
+            string cdxFull = Normalize(cdxPath);
             long cdxLiveLength = SafeLength(cdx);
             string key = dbfFull + "\0" + cdxFull;
 

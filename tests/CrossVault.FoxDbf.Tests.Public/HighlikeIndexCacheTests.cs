@@ -206,6 +206,27 @@ public sealed class HighlikeIndexCacheTests
     }
 
     [Fact]
+    public void StreamOpenedIndexes_AreNeverStoredInTheWarmIndexCache()
+    {
+        using var fx = new TempTable(rows: 50, idTagOnly: true);
+        using var engine = new HighlikeEngine(new HighlikeOptions { DriveKind = HighlikeDriveKind.Network });
+        byte[] cdxBytes = File.ReadAllBytes(fx.Cdx);
+
+        for (int i = 0; i < 2; i++)
+        {
+            using var table = DbfTable.Open(fx.Dbf);
+            using var stream = new MemoryStream(cdxBytes, writable: false);
+            using var cdx = CdxFile.Open(stream, table);
+            _ = engine.FindRecords(table, cdx, "ID = 10");
+        }
+
+        var stats = engine.CacheStatistics;
+        Assert.Equal(0, stats.Hits);
+        Assert.Equal(0, stats.Misses);
+        Assert.Equal(0, stats.EntryCount);
+    }
+
+    [Fact]
     public void RecreatedTag_WithDifferentDescendingFlag_IsNotServedFromWarmCache()
     {
         using var fx = new TempTable(rows: 50, idTagOnly: true);

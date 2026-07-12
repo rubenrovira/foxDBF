@@ -169,6 +169,27 @@ public sealed class HighlikeStatsCacheTests
             $"expected at least {queries - 1} reuses; got {stats.Reuses} (stats re-acquired per query)");
     }
 
+    [Fact]
+    public void StreamOpenedIndexes_AreNeverStoredInTheStatsCache()
+    {
+        using var fx = new TempTable(rows: 50);
+        using var engine = StatsEngine();
+        byte[] cdxBytes = File.ReadAllBytes(fx.Cdx);
+
+        for (int i = 0; i < 2; i++)
+        {
+            using var table = DbfTable.Open(fx.Dbf);
+            using var stream = new MemoryStream(cdxBytes, writable: false);
+            using var cdx = CdxFile.Open(stream, table);
+            _ = engine.FindRecords(table, cdx, "ID = 10");
+        }
+
+        var stats = engine.StatsCacheStatistics;
+        Assert.Equal(2, stats.Computes);
+        Assert.Equal(0, stats.Reuses);
+        Assert.Equal(0, stats.EntryCount);
+    }
+
     /// <summary>
     /// The memo is shared across DIFFERENT filters on the same table (the statistics describe the TABLE,
     /// not the predicate): a mix of queries still Loads/Builds the stats once.
