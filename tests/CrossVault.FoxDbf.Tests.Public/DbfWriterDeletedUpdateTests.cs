@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -94,6 +95,54 @@ public sealed class DbfWriterDeletedUpdateTests : IDisposable
 
         Assert.Equal(0x20, RawMarker(path));
         Assert.Equal((false, 1, "KEPT"), ReadOnlyRow(path));
+    }
+
+    [Fact]
+    public void KeepValue_PreservesMemoPointers_FptLength_AndNullFlags()
+    {
+        string path = _dir.File("keep_memos.dbf");
+        byte[] general = Enumerable.Range(0, 91).Select(i => (byte)(i * 3)).ToArray();
+        byte[] picture = Enumerable.Range(0, 73).Select(i => (byte)(255 - i)).ToArray();
+        using (var writer = DbfWriter.Create(path,
+        [
+            new DbfColumnDef("ID", 'I'),
+            new DbfColumnDef("NOTE", 'C', 12),
+            new DbfColumnDef("MEMO", 'M', nullable: true),
+            new DbfColumnDef("GEN", 'G', nullable: true),
+            new DbfColumnDef("PIC", 'P', nullable: true),
+            new DbfColumnDef("OPTIONAL", 'I', nullable: true),
+        ], new DbfCreateOptions { Overwrite = true }))
+            writer.AppendRecord(1, "before", "memo text", general, picture, null);
+
+        string fpt = Path.ChangeExtension(path, ".fpt");
+        long fptLengthBefore = new FileInfo(fpt).Length;
+
+        static (int[] Pointers, byte NullFlags) Snapshot(string dbf)
+        {
+            using var table = DbfTable.Open(dbf, new DbfOptions { ExposeSystemColumns = true });
+            var record = table.GetRecord(0)!.Value;
+            int Pointer(string name) => BinaryPrimitives.ReadInt32LittleEndian(
+                record.GetRawField(table.Columns.Single(c => c.Name == name)));
+            var nullFlags = table.Columns.Single(c => c.Name == "_NullFlags");
+            return ([Pointer("MEMO"), Pointer("GEN"), Pointer("PIC")], record.GetRawField(nullFlags)[0]);
+        }
+
+        var before = Snapshot(path);
+        using (var writer = DbfWriter.Open(path))
+            writer.UpdateRecord(0,
+            [
+                DbfWriter.KeepValue,
+                "changed",
+                DbfWriter.KeepValue,
+                DbfWriter.KeepValue,
+                DbfWriter.KeepValue,
+                DbfWriter.KeepValue,
+            ]);
+        var after = Snapshot(path);
+
+        Assert.Equal(before.Pointers, after.Pointers);
+        Assert.Equal(before.NullFlags, after.NullFlags);
+        Assert.Equal(fptLengthBefore, new FileInfo(fpt).Length);
     }
 
     [Fact]
