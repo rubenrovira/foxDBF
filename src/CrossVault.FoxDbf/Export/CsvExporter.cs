@@ -30,8 +30,9 @@ public static class CsvExporter
 
     /// <summary>
     /// Export <paramref name="table"/> to the file at <paramref name="path"/> (plan §A9). The
-    /// <see cref="CsvExportOptions.Encoding"/>'s preamble (e.g. the UTF-8 BOM <c>EF BB BF</c>) is
-    /// written EXPLICITLY before the body — a plain .NET UTF-8 encoding never emits one on its own.
+    /// internally owned <see cref="StreamWriter"/> emits the
+    /// <see cref="CsvExportOptions.Encoding"/>'s preamble (e.g. the UTF-8 BOM <c>EF BB BF</c>)
+    /// before streaming the body.
     /// </summary>
     public static void Export(DbfTable table, string path, CsvExportOptions? options = null)
     {
@@ -39,20 +40,57 @@ public static class CsvExporter
         ArgumentNullException.ThrowIfNull(path);
         options ??= new CsvExportOptions();
 
-        // Build the body as text, then lay down [explicit preamble] + [encoded body]. GetBytes()
-        // never prepends a preamble itself, so the BOM appears exactly once (or zero times when the
-        // encoding's preamble is empty, e.g. new UTF8Encoding(false)).
-        var sw = new StringWriter { NewLine = RowTerminator };
-        WriteTo(table, sw, options);
-        string body = sw.ToString();
+        string fullPath = Path.GetFullPath(path);
+        string publishPath = ResolvePublishPath(fullPath);
+        string directory = Path.GetDirectoryName(publishPath)!;
+        string tempPath = Path.Combine(directory,
+            $".{Path.GetFileName(publishPath)}.{Guid.NewGuid():N}.tmp");
+        bool tempCreated = false;
 
-        var encoding = options.Encoding;
-        using var fs = File.Create(path);
-        byte[] preamble = encoding.GetPreamble();
-        if (preamble.Length > 0)
-            fs.Write(preamble, 0, preamble.Length);
-        byte[] bytes = encoding.GetBytes(body);
-        fs.Write(bytes, 0, bytes.Length);
+        try
+        {
+            using (var fs = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                tempCreated = true;
+                using var writer = new StreamWriter(fs, options.Encoding);
+                WriteTo(table, writer, options);
+            }
+
+            File.Move(tempPath, publishPath, overwrite: true);
+        }
+        catch
+        {
+            if (tempCreated)
+            {
+                try { File.Delete(tempPath); } catch { /* best effort */ }
+            }
+            throw;
+        }
+    }
+
+    private static string ResolvePublishPath(string fullPath)
+    {
+        try
+        {
+            var file = new FileInfo(fullPath);
+            if (file.LinkTarget is null)
+                return fullPath;
+
+            var target = file.ResolveLinkTarget(returnFinalTarget: true);
+            if (target is FileInfo)
+                return target.FullName;
+
+            System.Diagnostics.Debug.WriteLine(
+                $"CsvExporter could not safely resolve file symlink '{fullPath}'; using the original path.");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"CsvExporter could not resolve file symlink '{fullPath}'; using the original path: {ex.Message}");
+        }
+
+        // Broken or unsupported links retain the r1 behavior rather than turning resolution into a new error.
+        return fullPath;
     }
 
     /// <summary>
