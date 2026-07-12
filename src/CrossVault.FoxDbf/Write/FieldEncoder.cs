@@ -407,6 +407,8 @@ public static class FieldEncoder
         }
         int days = DateOnly.FromDateTime(dt).DayNumber + JdnEpoch;
         int ms = (int)Math.Round(dt.TimeOfDay.TotalMilliseconds, MidpointRounding.AwayFromZero);
+        if (ms >= 86_400_000)
+            ms = 86_399_999;
         BinaryPrimitives.WriteInt32LittleEndian(dest, days);
         BinaryPrimitives.WriteInt32LittleEndian(dest[4..], ms);
     }

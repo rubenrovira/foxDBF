@@ -1,4 +1,5 @@
 using System.Text;
+using System.Buffers.Binary;
 using CrossVault.FoxDbf.Write;
 
 namespace CrossVault.FoxDbf.Tests;
@@ -201,6 +202,17 @@ public sealed class FieldEncoderTests
         var bytes = Encode(Col('T', 8), new DateTime(2012, 6, 14, 14, 25, 15), 8);
         Assert.Equal(new byte[] { 0x1D, 0x7A, 0x25, 0x00, 0xF8, 0x28, 0x18, 0x03 }, bytes);
         Assert.Equal(new DateTime(2012, 6, 14, 14, 25, 15), FieldDecoder.Decode(Col('T', 8), bytes, Enc));
+    }
+
+    [Fact]
+    public void T_LastFractionalMillisecond_StoresValidMsOfDay_AndDecodesAtSecondPrecision()
+    {
+        var input = new DateTime(2012, 6, 14, 23, 59, 59).AddTicks(9_999_000);
+
+        var bytes = Encode(Col('T', 8), input, 8);
+
+        Assert.Equal(86_399_999, BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(4)));
+        Assert.Equal(new DateTime(2012, 6, 15, 0, 0, 0), FieldDecoder.Decode(Col('T', 8), bytes, Enc));
     }
 
     [Fact]
