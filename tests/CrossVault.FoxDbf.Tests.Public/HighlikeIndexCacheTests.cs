@@ -217,6 +217,7 @@ public sealed class HighlikeIndexCacheTests
         var warm = engine.CacheStatistics;
 
         byte[] dbfHeader = ReadDbfHeader8(fx.Dbf);
+        long dbfLength = new FileInfo(fx.Dbf).Length;
         DateTime dbfWrite = File.GetLastWriteTimeUtc(fx.Dbf);
         long cdxLength = new FileInfo(fx.Cdx).Length;
         DateTime cdxWrite = File.GetLastWriteTimeUtc(fx.Cdx);
@@ -227,14 +228,21 @@ public sealed class HighlikeIndexCacheTests
             writer.CreateTag(new CdxTagDefinition("IDTAG", "ID", descending: true));
         }
 
-        Assert.Equal(cdxLength, new FileInfo(fx.Cdx).Length);
         File.SetLastWriteTimeUtc(fx.Dbf, dbfWrite);
         File.SetLastWriteTimeUtc(fx.Cdx, cdxWrite);
+
+        Assert.Equal(dbfLength, new FileInfo(fx.Dbf).Length);
+        Assert.Equal(cdxLength, new FileInfo(fx.Cdx).Length);
+        Assert.Equal(dbfWrite, File.GetLastWriteTimeUtc(fx.Dbf));
+        Assert.Equal(cdxWrite, File.GetLastWriteTimeUtc(fx.Cdx));
         Assert.Equal(dbfHeader, ReadDbfHeader8(fx.Dbf));
 
         using (var table = DbfTable.Open(fx.Dbf))
         using (var cdx = CdxFile.Open(fx.Cdx, table))
+        {
+            Assert.True(Assert.IsType<CdxTag>(cdx.Tag("IDTAG")).Descending);
             _ = engine.FindRecords(table, cdx, "ID >= 10 AND ID <= 20");
+        }
         var after = engine.CacheStatistics;
 
         Assert.True(after.Evictions > warm.Evictions, "changed tag identity must evict the cached entries");
