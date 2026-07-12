@@ -128,6 +128,8 @@ public sealed class DbfWriterDeletedUpdateTests : IDisposable
         }
 
         var before = Snapshot(path);
+        Assert.All(before.Pointers, pointer => Assert.NotEqual(0, pointer));
+        Assert.Equal(0b0000_1000, before.NullFlags);
         using (var writer = DbfWriter.Open(path))
             writer.UpdateRecord(0,
             [
@@ -143,6 +145,8 @@ public sealed class DbfWriterDeletedUpdateTests : IDisposable
         Assert.Equal(before.Pointers, after.Pointers);
         Assert.Equal(before.NullFlags, after.NullFlags);
         Assert.Equal(fptLengthBefore, new FileInfo(fpt).Length);
+        using var updated = DbfTable.Open(path);
+        Assert.Equal("changed", ((string)updated.GetRecord(0)!.Value["NOTE"]!).TrimEnd());
     }
 
     [Fact]
