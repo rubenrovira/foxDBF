@@ -303,6 +303,10 @@ public sealed partial class DbfWriter
             return (null, 0);
 
         uint length = BinaryPrimitives.ReadUInt32BigEndian(header.Slice(4, 4));
+        long fptLength = RandomAccess.GetLength(_fptHandle!);
+        if (pos < 0 || 8L + length > fptLength - pos)
+            return (null, 0);
+
         long total = 8L + length;
         int blocks = (int)((total + _fptBlockSize - 1) / _fptBlockSize);
         if (blocks <= 0)
