@@ -86,6 +86,19 @@ public sealed class DbfHeaderTruncationTests
         Assert.Equal(11, parsed.RecordLength);
     }
 
+    [Theory]
+    [InlineData(0x80000000u)]
+    [InlineData(0xFFFFFFFFu)]
+    public void Record_count_above_int_max_saturates_to_int_max(uint rawRecordCount)
+    {
+        byte[] header = CreateStandardHeader();
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(4, 4), rawRecordCount);
+
+        DbfHeader parsed = DbfHeader.Read(header);
+
+        Assert.Equal(int.MaxValue, parsed.RecordCount);
+    }
+
     private static byte[] CreateStandardHeader()
     {
         var header = new byte[32];
