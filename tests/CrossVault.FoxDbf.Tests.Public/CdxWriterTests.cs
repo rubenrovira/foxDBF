@@ -777,4 +777,46 @@ public sealed class CdxWriterTests
         }
         finally { Cleanup(dir); }
     }
+
+    [Fact]
+    public void ExpressionPool_Exactly512Bytes_IsAccepted()
+    {
+        string dir = FreshTempDir();
+        try
+        {
+            string dbf = Path.Combine(dir, "boundary.dbf");
+            string forExpression = ".T." + new string(' ', 503); // NAME + NUL + FOR + NUL = 512
+            using (var writer = DbfWriter.Create(dbf, [new DbfColumnDef("NAME", 'C', 8)]))
+            {
+                writer.AppendRecord(["ALPHA"]);
+                writer.CreateTag(new CdxTagDefinition("BOUNDARY", "NAME", forExpression));
+            }
+
+            using var table = DbfTable.Open(dbf);
+            using var cdx = CdxFile.Open(Path.ChangeExtension(dbf, ".cdx"), table);
+            Assert.NotNull(cdx.Tag("BOUNDARY"));
+        }
+        finally { Cleanup(dir); }
+    }
+
+    [Fact]
+    public void ExpressionPool_513Bytes_IsRejectedBeforeCdxEmission()
+    {
+        string dir = FreshTempDir();
+        try
+        {
+            string dbf = Path.Combine(dir, "overflow.dbf");
+            string cdx = Path.ChangeExtension(dbf, ".cdx");
+            string forExpression = ".T." + new string(' ', 504); // NAME + NUL + FOR + NUL = 513
+            using var writer = DbfWriter.Create(dbf, [new DbfColumnDef("NAME", 'C', 8)]);
+            writer.AppendRecord(["ALPHA"]);
+
+            var error = Assert.Throws<DbfWriteException>(() =>
+                writer.CreateTag(new CdxTagDefinition("OVERFLOW", "NAME", forExpression)));
+
+            Assert.Contains("512-byte expression pool", error.Message);
+            Assert.False(File.Exists(cdx));
+        }
+        finally { Cleanup(dir); }
+    }
 }

@@ -198,6 +198,12 @@ internal static class CdxIndexBuilder
     private static TagPlan PlanTag(DbfTable schema, IReadOnlyList<BuildRow> rows, CdxTagDefinition def,
         EvaluationContext? evalContext, bool includeDeleted, AppendUniqueState? appendUniqueState)
     {
+        string keyExpr = def.KeyExpression ?? string.Empty;
+        bool hasFor = !string.IsNullOrWhiteSpace(def.ForExpression);
+        string forExpr = hasFor ? def.ForExpression! : string.Empty;
+        if (Encoding.ASCII.GetByteCount(keyExpr) + Encoding.ASCII.GetByteCount(forExpr) + 2 > Page)
+            throw new DbfWriteException("CDX tag KEY + FOR expressions exceed the 512-byte expression pool.");
+
         // The per-row KEY/FOR derivation (collation, key type/length, FOR filter, encoding) is factored
         // into a reusable TagKeyComputer — the SAME primitive the incremental write-path maintenance
         // (DbfWriter index maintenance) drives, so a maintained entry is byte-identical to a bulk-built one.
@@ -236,7 +242,6 @@ internal static class CdxIndexBuilder
 
         byte options = (byte)0x60; // compound | compact
         if (def.Unique) options |= 0x01;
-        bool hasFor = !string.IsNullOrWhiteSpace(def.ForExpression);
         if (hasFor) options |= 0x08;
 
         // Tag signature (byte 15): 0x01 for an IDENTITY/MACHINE collation, 0x02 only for a real
@@ -256,8 +261,8 @@ internal static class CdxIndexBuilder
             Signature = tagSig,
             SortOrder = computer.Collation.Name,
             Descending = def.Descending,
-            KeyExpr = def.KeyExpression ?? string.Empty,
-            ForExpr = hasFor ? def.ForExpression! : string.Empty,
+            KeyExpr = keyExpr,
+            ForExpr = forExpr,
         };
     }
 
