@@ -281,6 +281,12 @@ public sealed class FieldEncoderTests
         Assert.Null(ex);
     }
 
+    [Theory]
+    [InlineData('N')]
+    [InlineData('F')]
+    public void NumericOverflow_FillsEntireFieldWithAsterisks(char type)
+        => Assert.Equal("***"u8.ToArray(), Encode(Col(type, 3), 123456, 3));
+
     // ---- F (float): right-justified ASCII --------------------------------------
 
     [Fact]
@@ -366,5 +372,39 @@ public sealed class FieldEncoderTests
 
         Assert.False(varlenUsed);
         Assert.Equal(Encoding.Latin1.GetBytes("ABCD"), dest);
+    }
+
+    [Fact]
+    public void Varbinary_Short_ZeroPads_WritesLength_AndCoercesString()
+    {
+        var dest = new byte[5];
+
+        bool varlenUsed = FieldEncoder.Encode(Col('Q', 5, 0, 0x04), "AB", Encoding.Latin1, dest);
+
+        Assert.True(varlenUsed);
+        Assert.Equal(new byte[] { 0x41, 0x42, 0x00, 0x00, 0x02 }, dest);
+    }
+
+    [Fact]
+    public void Varbinary_FullWidth_HasNoLengthByte()
+    {
+        var dest = new byte[4];
+
+        bool varlenUsed = FieldEncoder.Encode(Col('Q', 4, 0, 0x04), new byte[] { 1, 2, 3, 4 }, Enc, dest);
+
+        Assert.False(varlenUsed);
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, dest);
+    }
+
+    [Fact]
+    public void CharacterAndVarchar_TruncateUtf8OnlyAtCharacterBoundary()
+    {
+        var utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+        Assert.Equal(new byte[] { 0xC3, 0xA9, 0x20 }, Encode(Col('C', 3), "éé", 3, utf8));
+
+        var varchar = new byte[3];
+        bool varlenUsed = FieldEncoder.Encode(Col('V', 3, 0, 0x04), "éé", utf8, varchar);
+        Assert.True(varlenUsed);
+        Assert.Equal(new byte[] { 0xC3, 0xA9, 0x02 }, varchar);
     }
 }

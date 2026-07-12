@@ -141,38 +141,9 @@ public static class FieldEncoder
 
     private static int WriteEncodedPrefix(string s, Encoding encoding, Span<byte> dest)
     {
-        ReadOnlySpan<char> chars = s.AsSpan();
-        int byteCount = encoding.GetByteCount(chars);
-        int n = Math.Min(byteCount, dest.Length);
-        if (n == 0)
-            return byteCount;
-
-        if (byteCount <= dest.Length)
-        {
-            encoding.GetBytes(chars, dest);
-            return byteCount;
-        }
-
-        if (byteCount <= MaxStackEncodeBytes)
-        {
-            Span<byte> encoded = stackalloc byte[MaxStackEncodeBytes];
-            encoding.GetBytes(chars, encoded[..byteCount]);
-            encoded[..n].CopyTo(dest);
-            return byteCount;
-        }
-
-        byte[] rented = ArrayPool<byte>.Shared.Rent(byteCount);
-        try
-        {
-            Span<byte> encoded = rented.AsSpan(0, byteCount);
-            encoding.GetBytes(chars, encoded);
-            encoded[..n].CopyTo(dest);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(rented);
-        }
-        return byteCount;
+        encoding.GetEncoder().Convert(s.AsSpan(), dest, flush: true,
+            out _, out int bytesUsed, out _);
+        return bytesUsed;
     }
 
     // ---- numeric (N / F): right-justified ASCII, Decimal places ----------------
@@ -424,7 +395,9 @@ public static class FieldEncoder
         if (t == 'V')
             return WriteVarchar(CoerceString(value), encoding, dest);
 
-        ReadOnlySpan<byte> bytes = value is byte[] b ? b : ReadOnlySpan<byte>.Empty;
+        ReadOnlySpan<byte> bytes = value is byte[] b
+            ? b
+            : encoding.GetBytes(CoerceString(value));
 
         if (bytes.Length >= w)
         {
