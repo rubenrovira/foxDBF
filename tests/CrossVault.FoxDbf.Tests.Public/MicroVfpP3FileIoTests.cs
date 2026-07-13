@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Text;
+using CrossVault.FoxDbf.Expressions;
 using CrossVault.FoxDbf.MicroVfp;
 using CrossVault.FoxDbf.Sql;
 using Xunit;
@@ -191,6 +192,28 @@ public sealed class MicroVfpP3FileIoTests
         h.Run("=FCLOSE(nc)");
         byte[] onDisk = File.ReadAllBytes(h.Dir.File("ch.bin"));
         Assert.Equal(new byte[] { 0x61, 0x62, 0x63, 0x64, 0x00, 0x00, 0x00, 0x00 }, onDisk);
+    }
+
+    [Fact]
+    public void FChSize_And_FSeek_Return_Positions_Beyond_Int32_As_Numeric()
+    {
+        const decimal sparseSize = 2_147_483_648m;
+        using var h = new H();
+        h.Run($"nh = FCREATE({h.Q("sparse.bin")})");
+
+        VfpValue sized = h.Interp.EvalExpression("FCHSIZE(nh, 2147483648)");
+        if (sized.AsNumber == -1m && h.Int("FERROR()") != 0)
+            throw Xunit.Sdk.SkipException.ForSkip(
+                "Filesystem cannot create a sparse file larger than 2 GiB.");
+
+        Assert.Equal(VfpType.Numeric, sized.Type);
+        Assert.Equal(sparseSize, sized.AsNumber);
+        Assert.Equal(sparseSize, new FileInfo(h.Dir.File("sparse.bin")).Length);
+
+        VfpValue atEnd = h.Interp.EvalExpression("FSEEK(nh, 0, 2)");
+        Assert.Equal(VfpType.Numeric, atEnd.Type);
+        Assert.Equal(sparseSize, atEnd.AsNumber);
+        Assert.Equal(0, h.Int("FERROR()"));
     }
 
     // ─────────────────────────── FFLUSH ───────────────────────────

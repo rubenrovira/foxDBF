@@ -263,7 +263,7 @@ public sealed partial class VfpInterpreter : IDisposable
         {
             long pos = fs.Seek(off, origin);                 // seeking past EOF is allowed (returns the offset)
             _fError = 0;
-            return VfpValue.Integer((int)pos);
+            return VfpValue.Number((decimal)pos);
         }
         catch (Exception ex) { _fError = MapFError(ex); return VfpValue.Integer(-1); }
     }
@@ -297,7 +297,7 @@ public sealed partial class VfpInterpreter : IDisposable
         if (!_llFiles.TryGetValue(h, out var fs)) { _fError = 6; return VfpValue.Integer(-1); }
         if (!fs.CanWrite) { _fError = 5; return VfpValue.Integer(-1); }
         if (size < 0) { _fError = 5; return VfpValue.Integer(-1); }
-        try { fs.SetLength(size); _fError = 0; return VfpValue.Integer((int)size); }   // extend zero-fills
+        try { fs.SetLength(size); _fError = 0; return VfpValue.Number((decimal)size); }   // extend zero-fills
         catch (Exception ex) { _fError = MapFError(ex); return VfpValue.Integer(-1); }
     }
 
