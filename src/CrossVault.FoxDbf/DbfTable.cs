@@ -554,7 +554,11 @@ public sealed partial class DbfTable : IDisposable
     /// </summary>
     private static IReadOnlyList<DbfColumn> ParseColumns(Stream stream, DbfVersion version, long headerLengthBound, bool tolerantDescriptors = false)
     {
-        if (version.HasBacklink && !tolerantDescriptors)
+        long descriptorBytesBeforeBacklink = headerLengthBound - version.HeaderSize - 263 - 1;
+        bool hasCanonicalBacklinkGeometry = version.HasBacklink &&
+            descriptorBytesBeforeBacklink >= 0 &&
+            descriptorBytesBeforeBacklink % version.DescriptorWidth == 0;
+        if (hasCanonicalBacklinkGeometry && !tolerantDescriptors)
         {
             long expectedTerminator = headerLengthBound - 263 - 1;
             if (expectedTerminator < version.HeaderSize)
