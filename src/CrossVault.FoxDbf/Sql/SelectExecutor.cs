@@ -650,7 +650,14 @@ internal sealed class SelectExecutor
     /// (names come from the first SELECT). Throws when neither resolves.</summary>
     private static int ResolveUnionOrderCol(OrderItem ob, IReadOnlyList<SqlColumn> accSchema)
     {
-        if (ob.Ordinal.HasValue) return ob.Ordinal.Value - 1;
+        if (ob.Ordinal.HasValue)
+        {
+            int ordinal = ob.Ordinal.Value;
+            if (ordinal < 1 || ordinal > accSchema.Count)
+                throw new FoxDbfSqlException(
+                    $"UNION ORDER BY ordinal {ordinal} is outside the valid range 1..{accSchema.Count}.");
+            return ordinal - 1;
+        }
         if (ob.Expression is not null)
         {
             string exprText = StripWs(ob.Expression.Text).ToUpperInvariant();

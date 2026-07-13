@@ -257,6 +257,34 @@ public sealed class SqlRightFullUnionExecutorTests : IDisposable
     }
 
     [Fact]
+    public void Union_OrderBy_UnknownName_ThrowsTypedActionableError()
+    {
+        using var s = new VfpSession();
+        s.OpenDirectory(_indexed.Path);
+
+        var error = Assert.Throws<FoxDbfSqlException>(() =>
+            s.Execute("SELECT deptid FROM dept UNION SELECT deptid FROM emp ORDER BY missing"));
+
+        Assert.Contains("missing", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("first SELECT", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(2)]
+    public void Union_OrderBy_InvalidOrdinal_ThrowsTypedActionableError(int ordinal)
+    {
+        using var s = new VfpSession();
+        s.OpenDirectory(_indexed.Path);
+
+        var error = Assert.Throws<FoxDbfSqlException>(() =>
+            s.Execute($"SELECT deptid FROM dept UNION SELECT deptid FROM emp ORDER BY {ordinal}"));
+
+        Assert.Contains(ordinal.ToString(), error.Message, StringComparison.Ordinal);
+        Assert.Contains("1", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Union_Top_Applies_To_Whole_Result_Matches_Oracle()
         // {1,2,3,4,99} ordered ascending, TOP 3 -> {1,2,3} (the 3rd and 4th keys differ, so no tie spill).
         => CheckUnion("SELECT TOP 3 deptid FROM dept UNION SELECT deptid FROM emp ORDER BY 1", ordered: true);
