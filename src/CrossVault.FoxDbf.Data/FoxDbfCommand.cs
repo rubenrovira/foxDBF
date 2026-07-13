@@ -21,7 +21,8 @@ namespace CrossVault.FoxDbf.Data;
 /// <item>strings: delimited with the first of <c>'</c> / <c>"</c> / <c>[ ]</c> the value does NOT
 /// contain (doubling is unsafe — the lexer does no un-escaping); a value containing all three falls
 /// back to <c>CHR()</c>-concatenation; a NUL byte is rejected;</item>
-/// <item>DateTime: <c>{^yyyy-mm-dd HH:mm:ss}</c> (date-only when midnight); DateOnly: <c>{^yyyy-mm-dd}</c>;</item>
+/// <item>DateTime: always a VFP datetime/T literal <c>{^yyyy-mm-dd HH:mm:ss}</c>, including midnight;
+/// DateOnly alone uses the date/D literal <c>{^yyyy-mm-dd}</c>;</item>
 /// <item>numbers: invariant culture; booleans: <c>.T.</c>/<c>.F.</c>; null: <c>.NULL.</c>;</item>
 /// <item>byte[] (binary): NOT supported — throws, since no faithful VFP literal exists.</item>
 /// </list>
