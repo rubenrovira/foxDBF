@@ -335,6 +335,9 @@ internal static class VfpRuntime
         if (row is IVfpFunctionHost host && host.TryInvoke(name, args, ctx, out var hostResult))
             return hostResult;
 
+        if (name == "STRTRAN" && args.Length > 3)
+            throw new NotSupportedException("STRTRAN supports only two or three arguments; extended arities are not supported.");
+
         // Functions that must SEE a .NULL. argument rather than propagate it.
         switch (name)
         {
@@ -663,6 +666,9 @@ internal static class VfpRuntime
 
     private static VfpValue Strtran(VfpValue[] a)
     {
+        if (a.Length > 3)
+            throw new NotSupportedException("STRTRAN supports only two or three arguments; extended arities are not supported.");
+
         string source = Arg(a, 0).AsString;
         string sought = Arg(a, 1).AsString;
         string replacement = a.Length >= 3 ? Arg(a, 2).AsString : string.Empty;

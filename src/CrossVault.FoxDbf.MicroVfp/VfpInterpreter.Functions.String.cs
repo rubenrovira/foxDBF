@@ -516,6 +516,9 @@ public sealed partial class VfpInterpreter
     // "?"/"*" reuse marker in pcRIcursors with this.
     private static string FnStrtran(VfpValue[] a)
     {
+        if (a.Length > 3)
+            throw new MicroVfpRuntimeException("STRTRAN(): only two or three arguments are supported.");
+
         if (a.Length < 2) return a.Length > 0 ? a[0].AsString : string.Empty;
         string src = a[0].AsString, sought = a[1].AsString;
         string repl = a.Length > 2 ? a[2].AsString : string.Empty;

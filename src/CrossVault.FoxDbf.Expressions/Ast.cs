@@ -37,6 +37,9 @@ internal abstract class AstNode
 
     /// <summary>If this node is a numeric literal, returns its integer value.</summary>
     public virtual bool TryConstInt(out int value) { value = 0; return false; }
+
+    /// <summary>If this node is a character literal, returns its string value.</summary>
+    public virtual bool TryConstString(out string value) { value = string.Empty; return false; }
 }
 
 internal sealed class LiteralNode : AstNode
@@ -65,6 +68,13 @@ internal sealed class LiteralNode : AstNode
         value = 0;
         return false;
     }
+
+    public override bool TryConstString(out string value)
+    {
+        if (_value.Type == VfpType.Character) { value = _value.AsString; return true; }
+        value = string.Empty;
+        return false;
+    }
 }
 
 internal sealed class FieldNode : AstNode
@@ -82,7 +92,16 @@ internal sealed class FieldNode : AstNode
     public override VfpTypeInfo Infer(ISchema schema)
     {
         if (schema.TryGetColumn(_name, out char type, out int length, out int decimals))
+        {
+            // DBF memo descriptors expose only their four-byte FPT pointer as a structural length.
+            // Treat an expression reading M as unbounded; propagating C(4) or an arbitrary C(254)
+            // would silently truncate STRTRAN/other string results, while promoting the expression
+            // to an unpinned memo field would change the result contract. INTO therefore fails before
+            // target creation, whereas direct SELECT evaluation can still return the actual value.
+            if (char.ToUpperInvariant(type) == 'M')
+                return new VfpTypeInfo(VfpType.Character, int.MaxValue, decimals);
             return new VfpTypeInfo(MapColumnType(type), length, decimals);
+        }
         return new VfpTypeInfo(VfpType.Unknown);
     }
 
@@ -124,6 +143,18 @@ internal sealed class UnaryNode : AstNode
     public override VfpTypeInfo Infer(ISchema schema)
         => _op == UnOp.Not ? new VfpTypeInfo(VfpType.Logical, 1) : _operand.Infer(schema);
 
+    public override bool TryConstInt(out int value)
+    {
+        if (_op != UnOp.Neg || !_operand.TryConstInt(out int operand))
+        {
+            value = 0;
+            return false;
+        }
+
+        value = operand == int.MinValue ? int.MaxValue : -operand;
+        return true;
+    }
+
     public override void CollectFields(ICollection<string> into) => _operand.CollectFields(into);
 }
 
@@ -164,7 +195,7 @@ internal sealed class BinaryNode : AstNode
         if (_op == BinOp.Add)
         {
             if (l.Type == VfpType.Character || r.Type == VfpType.Character)
-                return new VfpTypeInfo(VfpType.Character, l.Length + r.Length);
+                return new VfpTypeInfo(VfpType.Character, SaturatingLengthAdd(l.Length, r.Length));
             if (l.Type is VfpType.Date or VfpType.DateTime) return l;
             if (r.Type is VfpType.Date or VfpType.DateTime) return r;
             return new VfpTypeInfo(VfpType.Numeric);
@@ -172,7 +203,7 @@ internal sealed class BinaryNode : AstNode
         if (_op == BinOp.Sub)
         {
             if (l.Type == VfpType.Character || r.Type == VfpType.Character)
-                return new VfpTypeInfo(VfpType.Character, l.Length + r.Length);
+                return new VfpTypeInfo(VfpType.Character, SaturatingLengthAdd(l.Length, r.Length));
             if (l.Type is VfpType.Date or VfpType.DateTime &&
                 r.Type is VfpType.Date or VfpType.DateTime)
                 return new VfpTypeInfo(VfpType.Numeric);
@@ -180,6 +211,14 @@ internal sealed class BinaryNode : AstNode
             return new VfpTypeInfo(VfpType.Numeric);
         }
         return new VfpTypeInfo(VfpType.Numeric);
+    }
+
+    private static int SaturatingLengthAdd(int left, int right)
+    {
+        long sum = (long)left + right;
+        if (sum > int.MaxValue) return int.MaxValue;
+        if (sum < int.MinValue) return int.MinValue;
+        return (int)sum;
     }
 
     public override void CollectFields(ICollection<string> into)
@@ -317,14 +356,16 @@ internal sealed class FunctionNode : AstNode
             case "SUBSTR":
                 // SUBSTR length is argument index 2 (SUBSTR(str, start, n)).
                 return new VfpTypeInfo(VfpType.Character, LiteralLen(2, ArgInfer(schema, 0).Length));
-            case "STR": return new VfpTypeInfo(VfpType.Character, LiteralLen(1, 10));
-            case "STRZERO": return new VfpTypeInfo(VfpType.Character, LiteralLen(1, 10));
+            case "STR": return new VfpTypeInfo(VfpType.Character, ExpansionLength(1, 10));
+            case "STRZERO": return new VfpTypeInfo(VfpType.Character, ExpansionLength(1, 10));
             case "PADL": case "PADR": case "PADC":
-                return new VfpTypeInfo(VfpType.Character, LiteralLen(1, ArgInfer(schema, 0).Length));
-            case "SPACE": return new VfpTypeInfo(VfpType.Character, LiteralLen(0, 0));
-            case "REPLICATE":
-                return new VfpTypeInfo(VfpType.Character, ArgInfer(schema, 0).Length * LiteralLen(1, 0));
-            case "CHRTRAN": case "STUFF": return ArgInfer(schema, 0);
+                return new VfpTypeInfo(VfpType.Character,
+                    ExpansionLength(1, ArgInfer(schema, 0).Length));
+            case "SPACE": return new VfpTypeInfo(VfpType.Character, ExpansionLength(0, 0));
+            case "REPLICATE": return InferReplicate(schema);
+            case "CHRTRAN": return ArgInfer(schema, 0);
+            case "STUFF": return InferStuff(schema);
+            case "STRTRAN": return InferStrtran(schema);
             case "DTOC": return new VfpTypeInfo(VfpType.Character, 10);
             case "DTOS": return new VfpTypeInfo(VfpType.Character, 8);
             case "TTOC": return new VfpTypeInfo(VfpType.Character, 22);
@@ -364,4 +405,136 @@ internal sealed class FunctionNode : AstNode
 
     private int LiteralLen(int argIndex, int fallback)
         => argIndex < _args.Length && _args[argIndex].TryConstInt(out int v) ? v : fallback;
+
+    private int ExpansionLength(int argIndex, int fallback)
+    {
+        if (argIndex >= _args.Length) return fallback;
+        if (!_args[argIndex].TryConstInt(out int length)) return UnknownCharacterLength;
+        return NonNegativeLength(length);
+    }
+
+    private VfpTypeInfo InferReplicate(ISchema schema)
+    {
+        if (_args.Length < 2) return new VfpTypeInfo(VfpType.Character, 0);
+        if (!_args[1].TryConstInt(out int count))
+            return new VfpTypeInfo(VfpType.Character, UnknownCharacterLength);
+
+        int sourceLength = ArgInfer(schema, 0).Length;
+        return new VfpTypeInfo(VfpType.Character,
+            SaturatingLengthMultiply(NonNegativeLength(sourceLength), NonNegativeLength(count)));
+    }
+
+    private VfpTypeInfo InferStuff(ISchema schema)
+    {
+        int sourceLength = CharacterOperandLength(schema, 0);
+        int replacementLength = _args.Length < 4 ? 0 : CharacterOperandLength(schema, 3);
+
+        if (TryConstString(0, out string source) &&
+            TryConstString(3, out string replacement) &&
+            _args.Length > 2 &&
+            _args[1].TryConstInt(out int start) &&
+            _args[2].TryConstInt(out int length))
+        {
+            return new VfpTypeInfo(VfpType.Character,
+                ExactStuffLength(source, start, length, replacement));
+        }
+
+        return new VfpTypeInfo(VfpType.Character,
+            SaturatingLengthAdd(sourceLength, replacementLength));
+    }
+
+    private int CharacterOperandLength(ISchema schema, int index)
+    {
+        if (index >= _args.Length) return 0;
+        if (_args[index].TryConstString(out string value)) return value.Length;
+        var info = ArgInfer(schema, index);
+        return info.Type == VfpType.Character ? info.Length : UnknownCharacterLength;
+    }
+
+    private static int ExactStuffLength(string source, int start, int length, string replacement)
+    {
+        long i = (long)start - 1;
+        if (i < 0) i = 0;
+        if (i > source.Length) i = source.Length;
+
+        int removed = NonNegativeLength(length);
+        long end = i + removed;
+        if (end > source.Length) removed = source.Length - (int)i;
+
+        return SaturatingLengthAdd(source.Length - removed, replacement.Length);
+    }
+
+    private static int SaturatingLengthAdd(int left, int right)
+    {
+        long sum = (long)left + right;
+        if (sum >= int.MaxValue) return int.MaxValue;
+        if (sum <= int.MinValue) return int.MinValue;
+        return (int)sum;
+    }
+
+    private static int NonNegativeLength(int value) => value < 0 ? 0 : value;
+
+    private static int SaturatingLengthMultiply(int length, int multiplier)
+    {
+        long product = (long)length * multiplier;
+        if (product > int.MaxValue) return int.MaxValue;
+        if (product < int.MinValue) return int.MinValue;
+        return (int)product;
+    }
+
+    // VFP character fields are capped at 254 bytes, but inference must retain widths above that
+    // threshold so the SQL materializer can reject them before creating a target. Never wrap a
+    // computed width back to a small/zero value when a dynamic operand can expand the result.
+    private const int UnknownCharacterLength = int.MaxValue;
+
+    private VfpTypeInfo InferStrtran(ISchema schema)
+    {
+        bool sourceLiteral = TryConstString(0, out string sourceText);
+        bool soughtLiteral = TryConstString(1, out string soughtText);
+        string replacementText = string.Empty;
+        bool replacementLiteral = _args.Length < 3 || TryConstString(2, out replacementText);
+
+        int sourceLength = sourceLiteral
+            ? sourceText.Length
+            : DynamicCharacterLength(ArgInfer(schema, 0));
+        int soughtLength = soughtLiteral ? soughtText.Length : 1; // a dynamic search can be one char.
+        int replacementLength = _args.Length < 3
+            ? 0
+            : replacementLiteral
+                ? replacementText.Length
+                : DynamicCharacterLength(ArgInfer(schema, 2));
+
+        if (sourceLiteral && soughtLiteral && replacementLiteral)
+        {
+            int exact = soughtLength == 0
+                ? sourceLength
+                : sourceText.Replace(soughtText, replacementText, StringComparison.Ordinal).Length;
+            return new VfpTypeInfo(VfpType.Character, AtLeastOne(exact));
+        }
+
+        return new VfpTypeInfo(VfpType.Character,
+            AtLeastOne(ConservativeStrtranLength(sourceLength, soughtLength, replacementLength)));
+    }
+
+    private bool TryConstString(int index, out string value)
+    {
+        if (index < _args.Length) return _args[index].TryConstString(out value);
+        value = string.Empty;
+        return false;
+    }
+
+    private static int DynamicCharacterLength(VfpTypeInfo info)
+        => info.Type == VfpType.Character && info.Length > 0 ? info.Length : UnknownCharacterLength;
+
+    private static int ConservativeStrtranLength(int sourceLength, int soughtLength, int replacementLength)
+    {
+        if (sourceLength <= 0 || soughtLength <= 0 || replacementLength <= soughtLength)
+            return Math.Max(0, sourceLength);
+
+        long occurrences = sourceLength / (long)soughtLength;
+        long result = sourceLength + occurrences * (replacementLength - (long)soughtLength);
+        return result >= int.MaxValue ? int.MaxValue : (int)result;
+    }
+
+    private static int AtLeastOne(int length) => length > 0 ? length : 1;
 }

@@ -173,8 +173,8 @@ internal sealed class SelectExecutor
 
     /// <summary>Derives the output <see cref="DbfColumnDef"/> set from the result schema: each column's
     /// VFP type drives a sensible on-disk field (fixed-width types take their canonical length; N/F clamp
-    /// to a valid 1–20 width; character types clamp to 1–254), with field names made DBF-legal (≤ 10
-    /// chars, unique, never the reserved <c>_NullFlags</c>).</summary>
+    /// to a valid 1–20 width; character types keep their inferred width and reject values above 254),
+    /// with field names made DBF-legal (≤ 10 chars, unique, never the reserved <c>_NullFlags</c>).</summary>
     private static List<DbfColumnDef> BuildColumnDefs(IReadOnlyList<SqlColumn> columns)
     {
         var defs = new List<DbfColumnDef>(columns.Count);
@@ -215,7 +215,10 @@ internal sealed class SelectExecutor
             }
             default: // C / V / Q and anything else → character
             {
-                int len = col.Length is >= 1 and <= 254 ? col.Length : (col.Length > 254 ? 254 : 10);
+                if (col.Length > 254)
+                    throw new FoxDbfSqlException(
+                        $"Character column '{name}' requires length {col.Length}, exceeding the VFP maximum of 254; target was not created.");
+                int len = col.Length >= 1 ? col.Length : 10;
                 return new DbfColumnDef(name, 'C', len);
             }
         }
