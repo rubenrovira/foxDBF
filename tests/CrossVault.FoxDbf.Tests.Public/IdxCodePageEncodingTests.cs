@@ -63,6 +63,20 @@ public sealed class IdxCodePageEncodingTests : IDisposable
     }
 
     [Fact]
+    public void Cp1252_ExtendedRawKeys_DecodeThroughCurrentLatin1PublicContract()
+    {
+        Encoding cp1252 = Encoding.GetEncoding(1252);
+        var (_, idx) = Build("cp1252_decode", 0x03, cp1252,
+            new[] { "€", "Š", "–", "Ÿ" }, unique: true);
+
+        var (keys, _) = ReadEntries(idx);
+        Assert.Equal(new byte[] { 0x80, 0x8A, 0x96, 0x9F },
+            keys.Select(key => Assert.Single(key)).ToArray());
+        Assert.Equal(new[] { "\u0080", "\u008A", "\u0096", "\u009F" },
+            keys.Select(key => IndexKey.Decode(key, IndexKeyType.Character).AsString).ToArray());
+    }
+
+    [Fact]
     public void Cp850_UsesExactBytesAndByteOrder()
     {
         Encoding cp850 = Encoding.GetEncoding(850);
