@@ -299,8 +299,6 @@ public sealed class FoxDbfCommand : DbCommand
 
     private string BindParameters(string sql)
     {
-        if (_parameters.Count == 0) return sql;
-
         // Collect positional (?) and named (@name, :name) parameters
         var positionalParams = new List<DbParameter>();
         var namedParams = new Dictionary<string, DbParameter>(StringComparer.OrdinalIgnoreCase);
@@ -419,10 +417,8 @@ public sealed class FoxDbfCommand : DbCommand
         if (value is string s) return EscapeString(s);
         if (value is bool b) return b ? ".T." : ".F.";
         if (value is DateTime dt)
-            // Emit full precision so a T (datetime) param keeps its time; pure-date stays date-only.
-            return dt.TimeOfDay == TimeSpan.Zero
-                ? $"{{^{dt:yyyy-MM-dd}}}"
-                : $"{{^{dt:yyyy-MM-dd HH:mm:ss}}}";
+            // A CLR DateTime is always a VFP T value, including midnight; DateOnly is the D form.
+            return $"{{^{dt:yyyy-MM-dd HH:mm:ss}}}";
         if (value is DateOnly d) return $"{{^{d:yyyy-MM-dd}}}";
         if (value is decimal d1) return d1.ToString(System.Globalization.CultureInfo.InvariantCulture);
         if (value is double d2) return d2.ToString(System.Globalization.CultureInfo.InvariantCulture);

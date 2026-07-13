@@ -4,6 +4,7 @@ using System.Data;
 using System.Data.Common;
 using System.Linq;
 using CrossVault.FoxDbf.Data;
+using CrossVault.FoxDbf.MicroVfp;
 using CrossVault.FoxDbf.Sql;
 using Xunit;
 
@@ -245,6 +246,73 @@ public sealed class FoxDbfAdoNetTests
         ((FoxDbfParameterCollection)cmd.Parameters).AddWithValue("@n", "x' OR '1'='1");
 
         Assert.Empty(ReadInts(cmd));
+    }
+
+    [Theory]
+    [InlineData("SELECT id FROM person WHERE '?' = '?' AND id = ?", 1)]
+    [InlineData("SELECT id FROM person WHERE [?] = [?] AND id = ?", 2)]
+    [InlineData("SELECT id FROM person WHERE id = ? && ? inside comment\n", 3)]
+    public void PositionalMarkers_InsideStringBracketAndComment_AreIgnored(string sql, int id)
+    {
+        using var db = new PersonDb();
+        using var conn = db.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        var parameter = cmd.CreateParameter();
+        parameter.Value = id;
+        cmd.Parameters.Add(parameter);
+
+        Assert.Equal(id, Convert.ToInt32(cmd.ExecuteScalar()));
+    }
+
+    [Fact]
+    public void PositionalMarker_InsideDateLiteral_IsIgnoredByBinder()
+    {
+        using var db = new PersonDb();
+        using var conn = db.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM person WHERE hired = {^2020-?1-01}";
+        var parameter = cmd.CreateParameter();
+        parameter.Value = 1;
+        cmd.Parameters.Add(parameter);
+
+        var error = Assert.Throws<FoxDbfException>(() => cmd.ExecuteScalar());
+        Assert.Contains("Too many positional", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void PositionalParameterArityErrors_AreTypedAndActionable()
+    {
+        using var db = new PersonDb();
+        using var conn = db.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id FROM person WHERE id = ?";
+        Assert.Contains("Not enough positional",
+            Assert.Throws<FoxDbfException>(() => cmd.ExecuteScalar()).Message,
+            StringComparison.OrdinalIgnoreCase);
+
+        var first = cmd.CreateParameter(); first.Value = 1; cmd.Parameters.Add(first);
+        var extra = cmd.CreateParameter(); extra.Value = 2; cmd.Parameters.Add(extra);
+        Assert.Contains("Too many positional",
+            Assert.Throws<FoxDbfException>(() => cmd.ExecuteScalar()).Message,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ParameterLiteralEdges_AreSafeAndPreserveDateTimeType()
+    {
+        const string allDelimiters = "left'center\"right]tail";
+        string literal = FoxDbfCommand.ToVfpLiteral(allDelimiters);
+        using var session = new VfpSession();
+        var interpreter = new VfpInterpreter(session);
+        Assert.Contains("CHR(39)", literal, StringComparison.Ordinal);
+        Assert.Equal(allDelimiters, interpreter.EvalExpression(literal).AsString);
+
+        Assert.Throws<NotSupportedException>(() => FoxDbfCommand.ToVfpLiteral(new byte[] { 1, 2 }));
+        Assert.Throws<NotSupportedException>(() => FoxDbfCommand.ToVfpLiteral("a\0b"));
+        Assert.Equal("{^2020-01-02 00:00:00}",
+            FoxDbfCommand.ToVfpLiteral(new DateTime(2020, 1, 2, 0, 0, 0)));
+        Assert.Equal("{^2020-01-02}", FoxDbfCommand.ToVfpLiteral(new DateOnly(2020, 1, 2)));
     }
 
     // ---- (4) Work-area commands via ExecuteNonQuery, then a SELECT against the alias -------
