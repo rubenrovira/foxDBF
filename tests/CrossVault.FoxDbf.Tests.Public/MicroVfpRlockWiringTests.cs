@@ -314,6 +314,20 @@ public sealed class MicroVfpRlockWiringTests
             holder.Execute("UNLOCK");
             Assert.True(Bool(contender, "RLOCK()"));
             contender.Execute("UNLOCK");
+
+            Assert.True(Bool(holder, "RLOCK()"));
+            using var releaseStarted = new ManualResetEventSlim(false);
+            Task release = Task.Run(() =>
+            {
+                releaseStarted.Wait();
+                Thread.Sleep(25); // safely inside the 20 x 5ms AUTOMATIC retry window.
+                holder.Execute("UNLOCK");
+            });
+
+            releaseStarted.Set();
+            Assert.True(Bool(contender, "RLOCK()")); // this same call must observe a retry, not fail fast.
+            release.GetAwaiter().GetResult();
+            contender.Execute("UNLOCK");
         }
         finally { holderSession.Dispose(); contenderSession.Dispose(); }
     }
