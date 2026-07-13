@@ -298,6 +298,27 @@ public sealed class MicroVfpRlockWiringTests
     }
 
     [WindowsOnlyFact]
+    public void DefaultReprocess_RetriesAreBounded_AndEventuallyDeny()
+    {
+        using var s = new Shared();
+        var holder = s.NewClient(out var holderSession);
+        var contender = s.NewClient(out var contenderSession);
+        try
+        {
+            holder.Execute("USE bt\nGO 4");
+            Assert.True(Bool(holder, "RLOCK()"));
+            contender.Execute("USE bt\nGO 4");
+
+            Assert.False(Bool(contender, "RLOCK()"));
+
+            holder.Execute("UNLOCK");
+            Assert.True(Bool(contender, "RLOCK()"));
+            contender.Execute("UNLOCK");
+        }
+        finally { holderSession.Dispose(); contenderSession.Dispose(); }
+    }
+
+    [WindowsOnlyFact]
     public void LocksReleasedOnClose_And_OnSessionDispose()
     {
         using var s = new Shared();

@@ -179,18 +179,29 @@ public sealed class IndexMaintAppendTagTests
     {
         using var dir = new IndexMaintTestSupport.TempDir();
         var cols = new[] { new DbfColumnDef("id", 'I'), new DbfColumnDef("name", 'C', 10) };
-        IndexMaintTestSupport.CreateTable(dir.Path, "t.dbf", cols,
+        string dbf = IndexMaintTestSupport.CreateTable(dir.Path, "t.dbf", cols,
             new[] { new object?[] { 1, "A" }, new object?[] { 2, "B" }, new object?[] { 3, "C" } });
 
         using var b = new IndexMaintTestSupport.Bench(dir.Path);
         b.Run("USE t\nINDEX ON id TAG c CANDIDATE");
+        byte[] dbfBefore = File.ReadAllBytes(dbf);
+        byte[] cdxBefore = File.ReadAllBytes(Path.ChangeExtension(dbf, ".cdx"));
         b.Run("=CURSORSETPROP('Buffering', 5)");
         b.Run("INSERT INTO t (id, name) VALUES (1, 'DUP')");   // buffered — deferred to TABLEUPDATE
 
         // The candidate violation must surface at COMMIT (CommitAppend), matching the write-through INSERT
         // path (review item 3 — buffered appends were unguarded). Invoked as a statement (=TABLEUPDATE(...))
         // so the raise propagates rather than being swallowed by the fail-soft expression evaluator.
-        Assert.Throws<MicroVfpRuntimeException>(() => b.Run("=TABLEUPDATE(.T.)"));
+        var error = Assert.Throws<MicroVfpRuntimeException>(() => b.Run("=TABLEUPDATE(.T.)"));
+        Assert.Equal(1884, error.VfpErrorNumber);
+        Assert.Equal(dbfBefore, File.ReadAllBytes(dbf));
+        Assert.Equal(cdxBefore, File.ReadAllBytes(Path.ChangeExtension(dbf, ".cdx")));
+        Assert.Equal(0, b.Interp.SnapshotTempFileCount());
+
+        _ = b.Bool("TABLEREVERT(.T.)"); // discard the rejected pending row before proving the area remains usable.
+        b.Run("INSERT INTO t (id, name) VALUES (4, 'VALID')");
+        Assert.True(b.Bool("TABLEUPDATE(.T.)"));
+        Assert.NotNull(IndexMaintTestSupport.Seek(dbf, "c", 4));
     }
 
     [Fact]

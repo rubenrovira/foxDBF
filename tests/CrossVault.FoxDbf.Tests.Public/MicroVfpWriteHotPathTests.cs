@@ -388,6 +388,47 @@ public sealed class MicroVfpWriteHotPathTests
         finally { try { Directory.Delete(dir, recursive: true); } catch { } }
     }
 
+    [Fact]
+    public void AbortedCandidateReplace_WithGeneralAndPicture_RestoresWholeFilesAndCleansSnapshot()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "foxdbf_whp_gp_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        string dbf = Path.Combine(dir, "candgp.dbf");
+        string fpt = Path.ChangeExtension(dbf, ".fpt");
+        string cdx = Path.ChangeExtension(dbf, ".cdx");
+        try
+        {
+            using (var writer = DbfWriter.Create(dbf,
+            [
+                new DbfColumnDef("id", 'I'),
+                new DbfColumnDef("gen", 'G'),
+                new DbfColumnDef("pic", 'P'),
+            ]))
+            {
+                writer.AppendRecord(1, "general one", "picture one");
+                writer.AppendRecord(2, "general two", "picture two");
+            }
+
+            using var session = new VfpSession();
+            session.OpenDirectory(dir);
+            using var interpreter = new VfpInterpreter(session);
+            interpreter.Execute("USE candgp\nINDEX ON id TAG cid CANDIDATE");
+            byte[] dbfBefore = File.ReadAllBytes(dbf);
+            byte[] fptBefore = File.ReadAllBytes(fpt);
+            byte[] cdxBefore = File.ReadAllBytes(cdx);
+
+            var error = Assert.Throws<MicroVfpRuntimeException>(() => interpreter.Execute(
+                "GO 2\nREPLACE id WITH 1, gen WITH 'changed general', pic WITH 'changed picture'"));
+
+            Assert.Equal(1884, error.VfpErrorNumber);
+            Assert.Equal(dbfBefore, File.ReadAllBytes(dbf));
+            Assert.Equal(fptBefore, File.ReadAllBytes(fpt));
+            Assert.Equal(cdxBefore, File.ReadAllBytes(cdx));
+            Assert.Equal(0, interpreter.SnapshotTempFileCount());
+        }
+        finally { try { Directory.Delete(dir, recursive: true); } catch { } }
+    }
+
     // ─────────────────────────── (10) MUST-FIX #2: buffered-commit SCAN+REPLACE is correct ───────────────────────────
 
     // ROW buffering (mode 3): a SCAN+REPLACE auto-commits each row on the ENDSCAN pointer move (through
