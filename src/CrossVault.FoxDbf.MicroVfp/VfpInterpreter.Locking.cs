@@ -59,6 +59,9 @@ public sealed partial class VfpInterpreter
     private const int LockRetryDelayMs = 5;
     private const int LockAutomaticRetryCap = 20;   // AUTOMATIC / TO-0-without-handler ⇒ bounded ~100 ms, then .F.
 
+    /// <summary>Internal deterministic test seam invoked after the initial lock attempt fails.</summary>
+    internal Action? LockFirstAcquireFailedForTesting { get; set; }
+
     // ─────────────────────────── RLOCK / LOCK ───────────────────────────
 
     // RLOCK([cRecordList,] nWorkArea | cTableAlias) — 0 args: current record of current area; 1 arg:
@@ -238,6 +241,8 @@ public sealed partial class VfpInterpreter
     private bool TryAcquireWithReprocess(Action acquire, Action onSuccess)
     {
         if (TryAcquireOnce(acquire)) { onSuccess(); return true; }
+
+        LockFirstAcquireFailedForTesting?.Invoke();
 
         int reproc = Runtime.Reprocess;
         if (reproc == 0)
