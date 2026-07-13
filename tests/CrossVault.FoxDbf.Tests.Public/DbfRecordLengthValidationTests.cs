@@ -100,6 +100,30 @@ public sealed class DbfRecordLengthValidationTests
         Assert.Contains("0x0D", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public void Vfp_missing_descriptor_terminator_is_typed_on_normal_open_but_reconstructs()
+    {
+        using var dir = new MicroVfpTestSupport.TempDir("vfp_missing_descriptor_terminator");
+        const int headerLength = 32 + 32 + 1 + 263;
+        byte[] bytes = new byte[headerLength + 5];
+        WriteHeader(bytes, version: 0x30, headerLength, recordLength: 5);
+        WriteDescriptor(bytes.AsSpan(32, 32), "ID", 'I', length: 4);
+        bytes[64] = 0x00; // damaged descriptor terminator; 263-byte VFP backlink follows
+        bytes[headerLength] = 0x20;
+        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(headerLength + 1, 4), 42);
+        string path = dir.File("vfp.dbf");
+        File.WriteAllBytes(path, bytes);
+
+        var ex = Assert.Throws<DbfCorruptHeaderException>(() => DbfTable.Open(path));
+        Assert.Contains("descriptor terminator", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        using var recovered = DbfTable.Open(path,
+            new DbfOptions { Recovery = Recovery.Reconstruct });
+        Assert.Equal(0x30, recovered.Version.Code);
+        Assert.Equal(1, recovered.RecordCount);
+        Assert.Equal(42, recovered.GetRecord(0)!.Value.GetInt32("ID"));
+    }
+
     private static string WriteStandardTable(MicroVfpTestSupport.TempDir dir, int declaredRecordLength)
     {
         const int headerLength = 65;

@@ -554,6 +554,21 @@ public sealed partial class DbfTable : IDisposable
     /// </summary>
     private static IReadOnlyList<DbfColumn> ParseColumns(Stream stream, DbfVersion version, long headerLengthBound, bool tolerantDescriptors = false)
     {
+        if (version.HasBacklink)
+        {
+            long expectedTerminator = headerLengthBound - 263 - 1;
+            if (expectedTerminator < version.HeaderSize)
+                throw new DbfCorruptHeaderException(
+                    $"Declared HeaderLength={headerLengthBound} leaves no room for field descriptor terminator 0x0D; " +
+                    "use Recovery.Reconstruct to recover from damaged header geometry.");
+
+            stream.Seek(expectedTerminator, SeekOrigin.Begin);
+            if (stream.ReadByte() != 0x0D)
+                throw new DbfCorruptHeaderException(
+                    $"Field descriptor terminator 0x0D is missing at expected offset {expectedTerminator} " +
+                    $"for declared HeaderLength={headerLengthBound}; use Recovery.Reconstruct to recover.");
+        }
+
         var scan = ParseColumnsScan(stream, version, headerLengthBound, tolerantDescriptors);
         if (scan.TerminatorOffset >= headerLengthBound)
             throw new DbfCorruptHeaderException(

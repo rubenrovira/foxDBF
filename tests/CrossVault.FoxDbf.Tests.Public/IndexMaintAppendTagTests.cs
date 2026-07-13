@@ -93,15 +93,28 @@ public sealed class IndexMaintAppendTagTests
     {
         using var dir = new IndexMaintTestSupport.TempDir();
         var cols = new[] { new DbfColumnDef("VAL", 'N', 10, 2) };
+        var rows = Enumerable.Range(1, 200).Select(i => new object?[] { (decimal)i }).ToArray();
         string dbf = IndexMaintTestSupport.CreateTable(dir.Path, "empty.dbf", cols,
-            new[] { new object?[] { 1m }, new object?[] { 2m }, new object?[] { 3m } },
+            rows,
             new CdxTagDefinition("FTAG", "VAL", forExpression: "VAL > 0"));
+
+        uint oldRootOffset;
+        using (var beforeTable = DbfTable.Open(dbf))
+        using (var beforeCdx = CdxFile.Open(Path.ChangeExtension(dbf, ".cdx"), beforeTable))
+        {
+            var beforeTag = Assert.IsType<CdxTag>(beforeCdx.Tag("FTAG"));
+            var beforeRoot = Assert.IsType<IndexNodeHeader>(
+                beforeCdx.Index.ReadNodeHeader(beforeTag.RootPageOffset));
+            oldRootOffset = beforeTag.RootPageOffset;
+            Assert.True(beforeRoot.IsRoot);
+            Assert.True(beforeRoot.IsBranch);
+            Assert.True(beforeRoot.KeyCount > 0);
+        }
 
         using (var w = DbfWriter.Open(dbf))
         {
-            w.UpdateRecord(0, new object?[] { -1m });
-            w.UpdateRecord(1, new object?[] { -2m });
-            w.UpdateRecord(2, new object?[] { -3m });
+            for (int i = 0; i < rows.Length; i++)
+                w.UpdateRecord(i, new object?[] { -(decimal)(i + 1) });
         }
 
         using var table = DbfTable.Open(dbf);
@@ -110,8 +123,10 @@ public sealed class IndexMaintAppendTagTests
         var root = Assert.IsType<IndexNodeHeader>(cdx.Index.ReadNodeHeader(tag.RootPageOffset));
 
         Assert.Empty(tag.EnumerateEntries());
+        Assert.NotEqual(oldRootOffset, tag.RootPageOffset);
         Assert.True(root.IsRoot);
         Assert.True(root.IsLeaf);
+        Assert.Equal(0, root.KeyCount);
         Assert.Null(root.LeftSibling);
         Assert.Null(root.RightSibling);
     }
