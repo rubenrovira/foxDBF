@@ -848,7 +848,7 @@ public sealed partial class DbfTable : IDisposable
     /// <summary>
     /// As <see cref="ExplainQuery(string, Expressions.EvaluationContext?)"/>, but routed through an
     /// opt-in <paramref name="accelerator"/> (the Highlike sub-project) when one is supplied here or
-    /// attached via <see cref="UseAccelerator"/>. With NO accelerator the Core
+    /// attached via <see cref="UseAccelerator(Query.IQueryAccelerator)"/>. With NO accelerator the Core
     /// <see cref="Query.QueryOptimizer.Explain"/> path runs unchanged.
     /// </summary>
     public Query.QueryPlan ExplainQuery(string filter, Expressions.EvaluationContext? context,
@@ -882,7 +882,7 @@ public sealed partial class DbfTable : IDisposable
     /// (always the EXACT set a full table scan would return). Auto-locates this table's sidecar
     /// structural <c>.cdx</c> (when opened from a path) to drive index seeks. When an opt-in
     /// <paramref name="accelerator"/> is supplied here — or attached via
-    /// <see cref="UseAccelerator"/> — execution is routed through it; otherwise the Core
+    /// <see cref="UseAccelerator(Query.IQueryAccelerator)"/> — execution is routed through it; otherwise the Core
     /// <see cref="Query.QueryOptimizer.FindRecords"/> path runs unchanged. The accelerator is a
     /// HINTS-only speed-up: the result set is identical either way (the seam's invariant). Never
     /// throws on a missing/unreadable index — it degrades to a correct full scan.
@@ -911,7 +911,7 @@ public sealed partial class DbfTable : IDisposable
     /// return as <c>RecordNumbers.Count</c>, computed more cheaply (no recno list, and for a fully
     /// index-resolvable filter no full-record reads). Auto-locates this table's sidecar structural
     /// <c>.cdx</c> to drive index seeks; routes through an opt-in <paramref name="accelerator"/> (here
-    /// or attached via <see cref="UseAccelerator"/>) when present, else the Core
+    /// or attached via <see cref="UseAccelerator(Query.IQueryAccelerator)"/>) when present, else the Core
     /// <see cref="Query.QueryOptimizer.Count"/> path. Never throws — degrades to a correct full count.
     /// </summary>
     public int Count(string filter, Expressions.EvaluationContext? context = null,
