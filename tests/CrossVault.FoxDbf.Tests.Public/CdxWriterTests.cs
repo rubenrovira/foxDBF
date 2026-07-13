@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using CrossVault.FoxDbf;
 using CrossVault.FoxDbf.Expressions;
 using CrossVault.FoxDbf.Index;
@@ -816,6 +817,40 @@ public sealed class CdxWriterTests
 
             Assert.Contains("512-byte expression pool", error.Message);
             Assert.False(File.Exists(cdx));
+        }
+        finally { Cleanup(dir); }
+    }
+
+    [Fact]
+    public void DescendingSeekFindsExactValue_AndExactCompositeRejectsBlankPaddedPrefix()
+    {
+        string dir = FreshTempDir();
+        try
+        {
+            var cols = new[]
+            {
+                new DbfColumnDef("NAME", 'C', 3),
+                new DbfColumnDef("CODE", 'C', 2),
+            };
+            var rows = Rows(
+                new object?[] { "AB", "X" },
+                new object?[] { "ZZ", "Y" });
+            var (dbf, cdxPath) = CreateWithTags(dir, cols, rows,
+                new CdxTagDefinition("SINGLE", "NAME"),
+                new CdxTagDefinition("COMPOSITE", "NAME + CODE"),
+                new CdxTagDefinition("DESCNAME", "NAME", descending: true));
+
+            using var table = DbfTable.Open(dbf);
+            using var cdx = CdxFile.Open(cdxPath, table);
+            byte[] needle = Encoding.ASCII.GetBytes("AB");
+
+            var descending = cdx.Tag("DESCNAME")!;
+            Assert.True(descending.Descending);
+            Assert.Equal((uint)1, descending.Seek((object)"AB"));
+
+            Assert.Equal((uint)1, cdx.Tag("SINGLE")!.Seek(needle, exact: true));
+            Assert.Equal((uint)1, cdx.Tag("COMPOSITE")!.Seek(needle, exact: false));
+            Assert.Null(cdx.Tag("COMPOSITE")!.Seek(needle, exact: true));
         }
         finally { Cleanup(dir); }
     }

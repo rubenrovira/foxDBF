@@ -463,4 +463,30 @@ public sealed class CompactLeafBmi2Tests
 
         Assert.Null(ex);
     }
+
+    [Fact]
+    public void CorruptKeyCount_IsCappedToPhysicalEntryRegion()
+    {
+        byte[] page = BuildLeaf(cRN: 4, cDC: 1, cTC: 1, kBy: 1, keyLength: 1,
+            (recno: 1u, dup: 0, trail: 0, fresh: new byte[] { 0x41 }));
+        BinaryPrimitives.WriteUInt16LittleEndian(page.AsSpan(2), ushort.MaxValue);
+
+        var entries = CompactLeaf.Decode(page, 1, isCharacter: true, CompactLeaf.DecodePath.Scalar);
+
+        Assert.Equal(IndexFile.PageSize - LeafInfo.EntryArrayOffset, entries.Count);
+    }
+
+    [Fact]
+    public void CorruptDupAndTrailCounts_AreClampedToKeyLength()
+    {
+        byte[] page = BuildLeaf(cRN: 4, cDC: 4, cTC: 4, kBy: 2, keyLength: 4,
+            (recno: 1u, dup: 0, trail: 0, fresh: Ascii("ABCD")),
+            (recno: 2u, dup: 15, trail: 15, fresh: Array.Empty<byte>()),
+            (recno: 3u, dup: 3, trail: 15, fresh: Array.Empty<byte>()));
+
+        var entries = CompactLeaf.Decode(page, 4, isCharacter: true, CompactLeaf.DecodePath.Scalar);
+
+        Assert.Equal("ABCD", Encoding.ASCII.GetString(entries[1].Key));
+        Assert.Equal("ABC ", Encoding.ASCII.GetString(entries[2].Key));
+    }
 }
