@@ -407,4 +407,35 @@ public sealed class FieldEncoderTests
         Assert.True(varlenUsed);
         Assert.Equal(new byte[] { 0xC3, 0xA9, 0x02 }, varchar);
     }
+
+    [Fact]
+    public void CharacterAndVarchar_WidthOne_DegradeWithoutPartialUtf8OrDbcsBytes()
+    {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        var encodings = new[]
+        {
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true),
+            Encoding.GetEncoding(932, EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback),
+        };
+        string[] values = ["é", "あ"];
+
+        for (int i = 0; i < encodings.Length; i++)
+        {
+            Assert.Equal(new byte[] { 0x20 }, Encode(Col('C', 1), values[i], 1, encodings[i]));
+
+            var varchar = new byte[1];
+            Assert.True(FieldEncoder.Encode(Col('V', 1, 0, 0x04), values[i], encodings[i], varchar));
+            Assert.Equal(new byte[] { 0x00 }, varchar);
+        }
+    }
+
+    [Fact]
+    public void Character_EncodingFallback_IsWrittenOnlyWhenItFits()
+    {
+        var utf8WithReplacement = new UTF8Encoding(false, false);
+        const string invalidSurrogate = "\uD800";
+
+        Assert.Equal(new byte[] { 0x20 }, Encode(Col('C', 1), invalidSurrogate, 1, utf8WithReplacement));
+        Assert.Equal(new byte[] { (byte)'?' }, Encode(Col('C', 1), invalidSurrogate, 1, Encoding.ASCII));
+    }
 }

@@ -141,9 +141,24 @@ public static class FieldEncoder
 
     private static int WriteEncodedPrefix(string s, Encoding encoding, Span<byte> dest)
     {
-        encoding.GetEncoder().Convert(s.AsSpan(), dest, flush: true,
-            out _, out int bytesUsed, out _);
-        return bytesUsed;
+        if (dest.IsEmpty || s.Length == 0)
+            return 0;
+
+        int charsUsed = 0;
+        for (int i = 0; i < s.Length;)
+        {
+            int next = i + 1;
+            if (char.IsHighSurrogate(s[i]) && next < s.Length && char.IsLowSurrogate(s[next]))
+                next++;
+
+            if (encoding.GetByteCount(s.AsSpan(0, next)) > dest.Length)
+                break;
+
+            charsUsed = next;
+            i = next;
+        }
+
+        return charsUsed == 0 ? 0 : encoding.GetBytes(s.AsSpan(0, charsUsed), dest);
     }
 
     // ---- numeric (N / F): right-justified ASCII, Decimal places ----------------
