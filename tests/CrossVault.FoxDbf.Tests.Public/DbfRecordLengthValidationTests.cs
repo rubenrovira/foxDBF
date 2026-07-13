@@ -122,6 +122,11 @@ public sealed class DbfRecordLengthValidationTests
         Assert.Equal(0x30, recovered.Version.Code);
         Assert.Equal(1, recovered.RecordCount);
         Assert.Equal(42, recovered.GetRecord(0)!.Value.GetInt32("ID"));
+
+        using var forced = DbfTable.Open(path,
+            new DbfOptions { ForceVersion = 0x30 });
+        Assert.Equal(0x30, forced.Version.Code);
+        Assert.Equal(42, forced.GetRecord(0)!.Value.GetInt32("ID"));
     }
 
     private static string WriteStandardTable(MicroVfpTestSupport.TempDir dir, int declaredRecordLength)

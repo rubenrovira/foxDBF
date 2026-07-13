@@ -554,7 +554,7 @@ public sealed partial class DbfTable : IDisposable
     /// </summary>
     private static IReadOnlyList<DbfColumn> ParseColumns(Stream stream, DbfVersion version, long headerLengthBound, bool tolerantDescriptors = false)
     {
-        if (version.HasBacklink)
+        if (version.HasBacklink && !tolerantDescriptors)
         {
             long expectedTerminator = headerLengthBound - 263 - 1;
             if (expectedTerminator < version.HeaderSize)
@@ -570,6 +570,9 @@ public sealed partial class DbfTable : IDisposable
         }
 
         var scan = ParseColumnsScan(stream, version, headerLengthBound, tolerantDescriptors);
+        if (tolerantDescriptors)
+            return scan.Columns;
+
         if (scan.TerminatorOffset >= headerLengthBound)
             throw new DbfCorruptHeaderException(
                 $"Field descriptor terminator 0x0D is missing before declared HeaderLength={headerLengthBound}; " +
