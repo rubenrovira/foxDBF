@@ -99,9 +99,7 @@ public static class CompactLeaf
 
         // Cap to what can physically fit in the 488-byte entry region so a
         // crafted KeyCount cannot drive an out-of-bounds read or huge alloc.
-        int maxEntries = (IndexFile.PageSize - LeafInfo.EntryArrayOffset) / kBy;
-        if (keyCount > maxEntries)
-            keyCount = maxEntries;
+        keyCount = CapKeyCount(keyCount, kBy);
 
         byte pad = isCharacter ? (byte)0x20 : (byte)0x00;
 
@@ -172,6 +170,15 @@ public static class CompactLeaf
         }
 
         return entries;
+    }
+
+    /// <summary>Caps a declared leaf key count to the physical entry-info capacity of one page.</summary>
+    internal static int CapKeyCount(int declaredKeyCount, int bytesPerEntry)
+    {
+        if (declaredKeyCount <= 0 || bytesPerEntry <= 0)
+            return 0;
+        int maxEntries = (IndexFile.PageSize - LeafInfo.EntryArrayOffset) / bytesPerEntry;
+        return Math.Min(declaredKeyCount, maxEntries);
     }
 
     /// <summary>

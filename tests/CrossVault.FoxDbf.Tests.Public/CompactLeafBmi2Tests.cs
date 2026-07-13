@@ -467,13 +467,16 @@ public sealed class CompactLeafBmi2Tests
     [Fact]
     public void CorruptKeyCount_IsCappedToPhysicalEntryRegion()
     {
+        int physicalMaximum = IndexFile.PageSize - LeafInfo.EntryArrayOffset;
+        Assert.Equal(physicalMaximum, CompactLeaf.CapKeyCount(ushort.MaxValue, bytesPerEntry: 1));
+
         byte[] page = BuildLeaf(cRN: 4, cDC: 1, cTC: 1, kBy: 1, keyLength: 1,
             (recno: 1u, dup: 0, trail: 0, fresh: new byte[] { 0x41 }));
         BinaryPrimitives.WriteUInt16LittleEndian(page.AsSpan(2), ushort.MaxValue);
 
         var entries = CompactLeaf.Decode(page, 1, isCharacter: true, CompactLeaf.DecodePath.Scalar);
 
-        Assert.Equal(IndexFile.PageSize - LeafInfo.EntryArrayOffset, entries.Count);
+        Assert.Equal(physicalMaximum, entries.Count);
     }
 
     [Fact]
