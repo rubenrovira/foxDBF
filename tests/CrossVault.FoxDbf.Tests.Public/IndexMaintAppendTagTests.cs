@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using CrossVault.FoxDbf;
+using CrossVault.FoxDbf.Index;
 using CrossVault.FoxDbf.MicroVfp;
 using CrossVault.FoxDbf.Write;
 using Xunit;
@@ -85,6 +86,34 @@ public sealed class IndexMaintAppendTagTests
         }
 
         Assert.Equal(new[] { 2 }, IndexMaintTestSupport.Recnos(dbf, "FTAG"));
+    }
+
+    [Fact]
+    public void Incremental_updates_that_empty_a_tag_install_a_fresh_empty_leaf_root()
+    {
+        using var dir = new IndexMaintTestSupport.TempDir();
+        var cols = new[] { new DbfColumnDef("VAL", 'N', 10, 2) };
+        string dbf = IndexMaintTestSupport.CreateTable(dir.Path, "empty.dbf", cols,
+            new[] { new object?[] { 1m }, new object?[] { 2m }, new object?[] { 3m } },
+            new CdxTagDefinition("FTAG", "VAL", forExpression: "VAL > 0"));
+
+        using (var w = DbfWriter.Open(dbf))
+        {
+            w.UpdateRecord(0, new object?[] { -1m });
+            w.UpdateRecord(1, new object?[] { -2m });
+            w.UpdateRecord(2, new object?[] { -3m });
+        }
+
+        using var table = DbfTable.Open(dbf);
+        using var cdx = CdxFile.Open(Path.ChangeExtension(dbf, ".cdx"), table);
+        var tag = Assert.IsType<CdxTag>(cdx.Tag("FTAG"));
+        var root = Assert.IsType<IndexNodeHeader>(cdx.Index.ReadNodeHeader(tag.RootPageOffset));
+
+        Assert.Empty(tag.EnumerateEntries());
+        Assert.True(root.IsRoot);
+        Assert.True(root.IsLeaf);
+        Assert.Null(root.LeftSibling);
+        Assert.Null(root.RightSibling);
     }
 
     [Fact]

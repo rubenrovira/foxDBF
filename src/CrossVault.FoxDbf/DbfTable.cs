@@ -553,7 +553,21 @@ public sealed partial class DbfTable : IDisposable
     /// the prefix-sum of prior lengths.
     /// </summary>
     private static IReadOnlyList<DbfColumn> ParseColumns(Stream stream, DbfVersion version, long headerLengthBound, bool tolerantDescriptors = false)
-        => ParseColumnsScan(stream, version, headerLengthBound, tolerantDescriptors).Columns;
+    {
+        var scan = ParseColumnsScan(stream, version, headerLengthBound, tolerantDescriptors);
+        if (scan.TerminatorOffset >= headerLengthBound)
+            throw new DbfCorruptHeaderException(
+                $"Field descriptor terminator 0x0D is missing before declared HeaderLength={headerLengthBound}; " +
+                "use Recovery.Reconstruct to recover from damaged header geometry.");
+
+        stream.Seek(scan.TerminatorOffset, SeekOrigin.Begin);
+        if (stream.ReadByte() != 0x0D)
+            throw new DbfCorruptHeaderException(
+                $"Field descriptor terminator 0x0D is missing at offset {scan.TerminatorOffset} " +
+                $"before declared HeaderLength={headerLengthBound}; use Recovery.Reconstruct to recover.");
+
+        return scan.Columns;
+    }
 
     /// <summary>
     /// Core descriptor scan (plan §A4/§A12). Like <see cref="ParseColumns"/> but also

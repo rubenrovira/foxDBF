@@ -85,6 +85,21 @@ public sealed class DbfRecordLengthValidationTests
         Assert.Contains("required=12", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public void Open_missing_descriptor_terminator_throws_typed_corrupt_header_error()
+    {
+        using var dir = new MicroVfpTestSupport.TempDir("missing_descriptor_terminator");
+        string path = WriteStandardTable(dir, declaredRecordLength: 11);
+        byte[] bytes = File.ReadAllBytes(path);
+        bytes[64] = 0x00;
+        File.WriteAllBytes(path, bytes);
+
+        var ex = Assert.Throws<DbfCorruptHeaderException>(() => DbfTable.Open(path));
+
+        Assert.Contains("descriptor terminator", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("0x0D", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string WriteStandardTable(MicroVfpTestSupport.TempDir dir, int declaredRecordLength)
     {
         const int headerLength = 65;

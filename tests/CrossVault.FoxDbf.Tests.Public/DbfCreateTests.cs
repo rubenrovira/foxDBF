@@ -306,6 +306,31 @@ public sealed class DbfCreateTests
         finally { Cleanup(dir); }
     }
 
+    [Fact]
+    public void Create_append_and_open_roundtrip_nocptrans_binary_varchar_bytes()
+    {
+        string dir = FreshTempDir();
+        string dbf = Path.Combine(dir, "binaryv.dbf");
+        const string value = "\u0080\u008A\u009F\u00FF";
+        try
+        {
+            using (var w = DbfWriter.Create(dbf,
+                [new DbfColumnDef("RAW", 'V', 8, binary: true)],
+                new DbfCreateOptions { CodePage = 0x03 }))
+                w.AppendRecord(value);
+
+            using var table = DbfTable.Open(dbf, new DbfOptions { ExposeSystemColumns = true });
+            var column = table.Columns.Single(c => c.Name == "RAW");
+            var record = table.GetRecord(0)!.Value;
+
+            Assert.True(column.IsBinary);
+            Assert.Equal(new byte[] { 0x80, 0x8A, 0x9F, 0xFF },
+                record.GetRawField(column)[..4].ToArray());
+            Assert.Equal(value, record.GetString("RAW"));
+        }
+        finally { Cleanup(dir); }
+    }
+
     // ---- (7) adversarial schema rejection (typed exception) --------------------
 
     [Fact]
