@@ -475,32 +475,32 @@ public sealed partial class VfpInterpreter
             return output;
         }
 
-        int start = 0;
-        int position = 0;
-        while (position < text.Length)
+        var matchers = new AlinesKmpMatcher[delimiters.Count];
+        for (int i = 0; i < delimiters.Count; i++)
+            matchers[i] = new AlinesKmpMatcher(delimiters[i], comparison);
+
+        var matches = new AlinesMatch?[text.Length];
+        for (int position = 0; position < text.Length; position++)
         {
-            string? delimiter = null;
-            for (int i = 0; i < delimiters.Count; i++)
+            for (int i = 0; i < matchers.Length; i++)
             {
-                string candidate = delimiters[i];
-                if (position + candidate.Length <= text.Length &&
-                    text.AsSpan(position, candidate.Length).Equals(candidate.AsSpan(), comparison))
-                {
-                    delimiter = candidate;
-                    break;
-                }
-            }
+                var matcher = matchers[i];
+                if (!matcher.Advance(text[position])) continue;
 
-            if (delimiter is null)
-            {
-                position++;
-                continue;
+                int matchStart = position - matcher.Length + 1;
+                var candidate = new AlinesMatch(i, matcher.Length);
+                if (matches[matchStart] is not { } current || i < current.DelimiterIndex)
+                    matches[matchStart] = candidate;
             }
+        }
 
-            AddAlinesPart(output, text[start..position], delimiter,
-                trim, skipEmpty, keepDelimiter);
-            position += delimiter.Length;
-            start = position;
+        int start = 0;
+        for (int matchStart = 0; matchStart < matches.Length; matchStart++)
+        {
+            if (matches[matchStart] is not { } match || matchStart < start) continue;
+            AddAlinesPart(output, text[start..matchStart],
+                delimiters[match.DelimiterIndex], trim, skipEmpty, keepDelimiter);
+            start = matchStart + match.Length;
         }
 
         string tail = text[start..];
@@ -509,6 +509,72 @@ public sealed partial class VfpInterpreter
                 tail.Length == 0 && includeTrailingEmpty ? false : skipEmpty,
                 keepDelimiter);
         return output;
+    }
+
+    private readonly struct AlinesMatch
+    {
+        public AlinesMatch(int delimiterIndex, int length)
+        {
+            DelimiterIndex = delimiterIndex;
+            Length = length;
+        }
+
+        public int DelimiterIndex { get; }
+        public int Length { get; }
+    }
+
+    private sealed class AlinesKmpMatcher
+    {
+        private readonly string _pattern;
+        private readonly int[] _lps;
+        private readonly StringComparison _comparison;
+        private int _matched;
+
+        public AlinesKmpMatcher(string pattern, StringComparison comparison)
+        {
+            _pattern = pattern;
+            _comparison = comparison;
+            _lps = BuildLps(pattern, comparison);
+        }
+
+        public int Length => _pattern.Length;
+
+        public bool Advance(char value)
+        {
+            while (_matched > 0 && !CharsEqual(value, _pattern[_matched], _comparison))
+                _matched = _lps[_matched - 1];
+            if (CharsEqual(value, _pattern[_matched], _comparison)) _matched++;
+            if (_matched != _pattern.Length) return false;
+            _matched = _lps[_matched - 1];
+            return true;
+        }
+
+        private static int[] BuildLps(string pattern, StringComparison comparison)
+        {
+            var lps = new int[pattern.Length];
+            int prefixLength = 0;
+            for (int i = 1; i < pattern.Length;)
+            {
+                if (CharsEqual(pattern[i], pattern[prefixLength], comparison))
+                {
+                    lps[i++] = ++prefixLength;
+                }
+                else if (prefixLength > 0)
+                {
+                    prefixLength = lps[prefixLength - 1];
+                }
+                else
+                {
+                    lps[i++] = 0;
+                }
+            }
+            return lps;
+        }
+
+        private static bool CharsEqual(char left, char right, StringComparison comparison)
+            => comparison == StringComparison.Ordinal
+                ? left == right
+                : char.ToUpperInvariant(left) == char.ToUpperInvariant(right);
     }
 
     private static void AddAlinesPart(
