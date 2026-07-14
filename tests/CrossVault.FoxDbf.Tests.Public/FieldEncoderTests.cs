@@ -94,21 +94,74 @@ public sealed class FieldEncoderTests
         Assert.Equal(new byte[] { 0x00, 0x00, 0x00, 0x00 }, Encode(Col('I', 4), null, 4));
     }
 
-    [Fact]
-    public void I_And_AutoInc_OutOfRange_Saturates_NeverThrows()
+    [Theory]
+    [InlineData('I')]
+    [InlineData('+')]
+    public void I_And_AutoInc_TruncateFractionalNumericsTowardZero(char type)
     {
-        // A wide decimal narrowing to int64 throws OverflowException on a bare cast; the
-        // encoder must saturate to long range first (then unchecked-wrap to int32) so 'I'/'+'
-        // never throw like every other field type (never-throw §A10, MUST-FIX). We only pin
-        // "no throw, exact 4-byte width" — the wrapped value is an implementation detail.
-        var ex = Record.Exception(() =>
+        var col = Col(type, 4, 0, type == '+' ? (byte)0x08 : (byte)0);
+        Assert.Equal(12, BinaryPrimitives.ReadInt32LittleEndian(Encode(col, 12.9m, 4)));
+        Assert.Equal(-12, BinaryPrimitives.ReadInt32LittleEndian(Encode(col, -12.9m, 4)));
+        Assert.Equal(12, BinaryPrimitives.ReadInt32LittleEndian(Encode(col, 12.9d, 4)));
+        Assert.Equal(-12, BinaryPrimitives.ReadInt32LittleEndian(Encode(col, -12.9f, 4)));
+        Assert.Equal(2_147_483_647,
+            BinaryPrimitives.ReadInt32LittleEndian(Encode(col, 2_147_483_647.9m, 4)));
+        Assert.Equal(-2_147_483_647,
+            BinaryPrimitives.ReadInt32LittleEndian(Encode(col, -2_147_483_647.9m, 4)));
+    }
+
+    [Theory]
+    [InlineData('I')]
+    [InlineData('+')]
+    public void I_And_AutoInc_AcceptEveryIntegralBoxWithinRange(char type)
+    {
+        var col = Col(type, 4, 0, type == '+' ? (byte)0x08 : (byte)0);
+        (object Value, int Expected)[] cases =
+        [
+            ((short)-123, -123), ((byte)200, 200), ((sbyte)-100, -100),
+            ((uint)2_147_483_647, 2_147_483_647), ((ushort)65_000, 65_000),
+            ((ulong)2_147_483_647, 2_147_483_647), (123, 123), (123L, 123),
+        ];
+        foreach (var item in cases)
+            Assert.Equal(item.Expected,
+                BinaryPrimitives.ReadInt32LittleEndian(Encode(col, item.Value, 4)));
+    }
+
+    [Theory]
+    [InlineData('I')]
+    [InlineData('+')]
+    public void I_And_AutoInc_AcceptOnlyVfpIntegerRange(char type)
+    {
+        var col = Col(type, 4, 0, type == '+' ? (byte)0x08 : (byte)0);
+        Assert.Equal(int.MaxValue,
+            BinaryPrimitives.ReadInt32LittleEndian(Encode(col, int.MaxValue, 4)));
+        Assert.Equal(-2_147_483_647,
+            BinaryPrimitives.ReadInt32LittleEndian(Encode(col, -2_147_483_647L, 4)));
+
+        foreach (object value in new object[]
         {
-            Assert.Equal(4, Encode(Col('I', 4), decimal.MaxValue, 4).Length);
-            Assert.Equal(4, Encode(Col('I', 4), decimal.MinValue, 4).Length);
-            Assert.Equal(4, Encode(Col('+', 4, 0, 0x08), decimal.MaxValue, 4).Length);
-            Assert.Equal(4, Encode(Col('I', 4), double.MaxValue, 4).Length); // double path too
-        });
-        Assert.Null(ex);
+            int.MinValue, 2_147_483_648L, -2_147_483_648L, decimal.MaxValue,
+            double.NaN, double.PositiveInfinity, double.NegativeInfinity,
+        })
+        {
+            var error = Assert.Throws<DbfWriteException>(() => Encode(col, value, 4));
+            Assert.Equal(39, error.VfpErrorNumber);
+            Assert.Equal("Numeric overflow. Data was lost.", error.Message);
+        }
+    }
+
+    [Theory]
+    [InlineData('I')]
+    [InlineData('+')]
+    public void I_And_AutoInc_RejectStringAndBoolAsTypeMismatch(char type)
+    {
+        var col = Col(type, 4, 0, type == '+' ? (byte)0x08 : (byte)0);
+        foreach (object value in new object[] { "12", true, false })
+        {
+            var error = Assert.Throws<DbfWriteException>(() => Encode(col, value, 4));
+            Assert.Equal(9, error.VfpErrorNumber);
+            Assert.Equal("Data type mismatch.", error.Message);
+        }
     }
 
     // ---- Y (currency: round(v*10000) int64 LE) ---------------------------------

@@ -502,7 +502,46 @@ public static class FieldEncoder
         return (long)rounded;
     }
 
-    private static int ToInt32(object value) => unchecked((int)ToInt64(value));
+    private static int ToInt32(object value)
+    {
+        decimal truncated = value switch
+        {
+            decimal m => decimal.Truncate(m),
+            double d => TruncateFiniteDouble(d),
+            float f => TruncateFiniteDouble(f),
+            long l => l,
+            int i => i,
+            short s => s,
+            byte b => b,
+            sbyte sb => sb,
+            uint u => u,
+            ushort us => us,
+            ulong ul when ul <= int.MaxValue => ul,
+            ulong => throw IntegerOverflow(),
+            string or bool => throw IntegerTypeMismatch(),
+            _ => throw IntegerTypeMismatch(),
+        };
+
+        if (truncated < -2_147_483_647m || truncated > 2_147_483_647m)
+            throw IntegerOverflow();
+        return (int)truncated;
+    }
+
+    private static decimal TruncateFiniteDouble(double value)
+    {
+        if (double.IsNaN(value) || double.IsInfinity(value))
+            throw IntegerOverflow();
+        double truncated = Math.Truncate(value);
+        if (truncated < -2_147_483_647d || truncated > 2_147_483_647d)
+            throw IntegerOverflow();
+        return (decimal)truncated;
+    }
+
+    private static DbfWriteException IntegerOverflow()
+        => new("Numeric overflow. Data was lost.", 39);
+
+    private static DbfWriteException IntegerTypeMismatch()
+        => new("Data type mismatch.", 9);
 
     private static decimal SafeDecimal(object value) => value switch
     {
