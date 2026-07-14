@@ -739,7 +739,7 @@ internal sealed class SelectExecutor
         if (cats.Count == 1 && cats[0] == UnionCat.Character)
             return new SqlColumn(name, 'C', Math.Max(cols.Max(x => x.Length), 1), 0, typeof(string));
 
-        SqlColumn incompatible = cols.First(x => CatOf(x.VfpType) != CatOf(cols[0].VfpType));
+        SqlColumn incompatible = cols.First(x => char.ToUpperInvariant(x.VfpType) != first);
         throw new FoxDbfSqlException(
             $"SELECTs are not UNION compatible. Fields {cols[0].Name} and {incompatible.Name} are incompatible.")
         { VfpErrorNumber = 1851 };

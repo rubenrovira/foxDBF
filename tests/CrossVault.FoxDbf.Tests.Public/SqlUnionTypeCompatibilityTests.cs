@@ -16,6 +16,8 @@ public sealed class SqlUnionTypeCompatibilityTests : IDisposable
         Write("chars2", new DbfColumnDef("CVAL", 'C', 2), "AB");
         Write("chars6", new DbfColumnDef("CVAL", 'C', 6), "ABCDEF");
         Write("logical", new DbfColumnDef("LVAL", 'L', 1), true);
+        Write("general", new DbfColumnDef("GVAL", 'G'), new byte[] { 0x01 });
+        Write("picture", new DbfColumnDef("PVAL", 'P'), new byte[] { 0x02 });
     }
 
     public void Dispose() => _dir.Dispose();
@@ -58,6 +60,17 @@ public sealed class SqlUnionTypeCompatibilityTests : IDisposable
         var error = Assert.Throws<FoxDbfSqlException>(() => Run(sql));
         Assert.Equal(1851, error.VfpErrorNumber);
         Assert.Equal(expectedMessage, error.Message);
+    }
+
+    [Fact]
+    public void Union_GeneralAndPictureColumns_ThrowVfp1851WithActualNames()
+    {
+        var error = Assert.Throws<FoxDbfSqlException>(() => Run(
+            "SELECT GVAL FROM general UNION SELECT PVAL FROM picture"));
+        Assert.Equal(1851, error.VfpErrorNumber);
+        Assert.Equal(
+            "SELECTs are not UNION compatible. Fields GVAL and PVAL are incompatible.",
+            error.Message);
     }
 
     [Theory]
