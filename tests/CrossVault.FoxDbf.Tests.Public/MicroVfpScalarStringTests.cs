@@ -6,6 +6,7 @@ using CrossVault.FoxDbf.MicroVfp;
 using CrossVault.FoxDbf.Sql;
 using CrossVault.FoxDbf.Write;
 using System.Linq;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace CrossVault.FoxDbf.Tests;
@@ -341,5 +342,46 @@ public sealed class MicroVfpScalarStringTests
             Alines(h, "ALINES(lc, 'a||b', 0, '', '||', '')", "lc[1]", "lc[2]"));
         Assert.Equal(new[] { "", "a", "" },
             Alines(h, "ALINES(ld, '||a||||', 0, '||')", "ld[1]", "ld[2]", "ld[3]"));
+    }
+
+    [Fact]
+    public async Task Alines_LargeCrOnlyInput_Flag4_CompletesWithinBoundedTime()
+    {
+        var task = Task.Run(() =>
+        {
+            using var h = new H();
+            h.Run("lcText = REPLICATE(CHR(13), 500000)");
+            Assert.Equal(500000m, h.Num("LEN(lcText)"));
+            return h.Num("ALINES(la, lcText, 4)");
+        });
+
+        var completed = await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.True(ReferenceEquals(task, completed),
+            "ALINES did not complete within the bounded large-input budget.");
+        Assert.Equal(0m, await task);
+    }
+
+    [Fact]
+    public void Alines_EmptyExpressionAndTerminalFlagCombinations_PinCountArrayAndContent()
+    {
+        using var h = new H();
+        Assert.Equal(0m, h.Num("ALINES(la, '', 4)"));
+        Assert.Equal(1m, h.Num("ALEN(la)"));
+        Assert.Equal("", h.Str("la[1]"));
+        Assert.Equal(0m, h.Num("ALINES(le, '', 4, '||')"));
+        Assert.Equal(1m, h.Num("ALEN(le)"));
+        Assert.Equal("", h.Str("le[1]"));
+
+        Assert.Equal(new[] { "a", "b", "" },
+            Alines(h, "ALINES(lb, 'a||b||', 2 + 4, '||')", "lb[1]", "lb[2]", "lb[3]"));
+        Assert.Equal(3m, h.Num("ALEN(lb)"));
+
+        Assert.Equal(new[] { "a||", "b||" },
+            Alines(h, "ALINES(lc, 'a||b||', 4 + 16, '||')", "lc[1]", "lc[2]"));
+        Assert.Equal(2m, h.Num("ALEN(lc)"));
+
+        Assert.Equal(new[] { "a||", "b||", "" },
+            Alines(h, "ALINES(ld, 'a||b||', 2 + 4 + 16, '||')", "ld[1]", "ld[2]", "ld[3]"));
+        Assert.Equal(3m, h.Num("ALEN(ld)"));
     }
 }

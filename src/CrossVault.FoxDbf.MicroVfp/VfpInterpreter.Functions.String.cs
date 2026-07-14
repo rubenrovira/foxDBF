@@ -412,7 +412,8 @@ public sealed partial class VfpInterpreter
     /// split into array rows using whole-string delimiters. Explicit delimiters replace CRLF/CR/LF;
     /// empty explicit values are ignored and an all-empty explicit set performs no split. At each scan
     /// position the earliest delimiter wins and argument order breaks equal-offset ties. Flags: 1 trims
-    /// spaces, 2 keeps a terminal empty row, 4 omits empty rows, 8 compares OrdinalIgnoreCase, and
+    /// spaces, 2 keeps a terminal empty row even with flag 4, 4 omits non-terminal empty rows,
+    /// 8 compares OrdinalIgnoreCase, and
     /// 16 appends the matched delimiter to the preceding row.</summary>
     private int FnAlines(VfpValue[] a)
     {
@@ -475,40 +476,39 @@ public sealed partial class VfpInterpreter
         }
 
         int start = 0;
-        while (TryFindAlinesDelimiter(text, start, delimiters, comparison,
-            out int match, out string? delimiter))
+        int position = 0;
+        while (position < text.Length)
         {
-            AddAlinesPart(output, text[start..match], delimiter,
+            string? delimiter = null;
+            for (int i = 0; i < delimiters.Count; i++)
+            {
+                string candidate = delimiters[i];
+                if (position + candidate.Length <= text.Length &&
+                    text.AsSpan(position, candidate.Length).Equals(candidate.AsSpan(), comparison))
+                {
+                    delimiter = candidate;
+                    break;
+                }
+            }
+
+            if (delimiter is null)
+            {
+                position++;
+                continue;
+            }
+
+            AddAlinesPart(output, text[start..position], delimiter,
                 trim, skipEmpty, keepDelimiter);
-            start = match + delimiter!.Length;
+            position += delimiter.Length;
+            start = position;
         }
 
         string tail = text[start..];
         if (tail.Length > 0 || includeTrailingEmpty)
-            AddAlinesPart(output, tail, null, trim, skipEmpty, keepDelimiter);
+            AddAlinesPart(output, tail, null, trim,
+                tail.Length == 0 && includeTrailingEmpty ? false : skipEmpty,
+                keepDelimiter);
         return output;
-    }
-
-    private static bool TryFindAlinesDelimiter(
-        string text,
-        int start,
-        IReadOnlyList<string> delimiters,
-        StringComparison comparison,
-        out int match,
-        out string? delimiter)
-    {
-        match = -1;
-        delimiter = null;
-        for (int i = 0; i < delimiters.Count; i++)
-        {
-            int candidate = text.IndexOf(delimiters[i], start, comparison);
-            if (candidate >= 0 && (match < 0 || candidate < match))
-            {
-                match = candidate;
-                delimiter = delimiters[i];
-            }
-        }
-        return match >= 0;
     }
 
     private static void AddAlinesPart(
