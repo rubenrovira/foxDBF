@@ -551,9 +551,10 @@ internal sealed class SelectExecutor
         // extension as a fallback, but never materialize a middle branch independently.
         IntoClause? into = selects[^1].Into ?? root.Into;
 
-        // Execute each branch's core (without union-level ORDER BY / TOP / INTO) and collect every
-        // branch's column schema so the result columns can be WIDENED to the common per-column type.
-        var acc = new List<object?[]>();
+        // Execute every branch's core (without union-level ORDER BY / TOP / INTO) first. UNION
+        // compatibility is a schema-wide decision, so no rows may be accumulated or deduplicated
+        // until all branch schemas are known.
+        var branchResults = new List<SqlResult>(selects.Count);
         var branchColumns = new List<IReadOnlyList<SqlColumn>>();
         int firstCount = -1;
 
@@ -569,32 +570,39 @@ internal sealed class SelectExecutor
             };
 
             var result = Execute(core);
-            branchColumns.Add(result.Columns);
 
             // The branches union BY POSITION: every branch must have the SAME column count as the first.
             if (i == 0)
             {
                 firstCount = result.Columns.Count;
-                acc = new List<object?[]>(result.Rows);
             }
-            else
-            {
-                if (result.Columns.Count != firstCount)
-                    throw new FoxDbfSqlException(
-                        $"UNION column count mismatch: first SELECT has {firstCount} columns, branch {i + 1} has {result.Columns.Count}.");
-                acc.AddRange(result.Rows);
+            else if (result.Columns.Count != firstCount)
+                throw new FoxDbfSqlException(
+                    $"UNION column count mismatch: first SELECT has {firstCount} columns, branch {i + 1} has {result.Columns.Count}.");
 
-                // Plain UNION (not ALL) dedups the running result.
-                if (!allFlags[i - 1])
-                    acc = Distinct(acc.Select((r, _) => (r, new DummyRowContext() as IRowContext)).ToList(), _session.SqlContext())
-                        .ConvertAll(p => p.row);
-            }
+            branchResults.Add(result);
+            branchColumns.Add(result.Columns);
         }
 
         // The result schema: per-column WIDENED type across every branch (names from the FIRST select).
-        // Without widening the final coercion would force later branches into the first branch's narrower
-        // type (e.g. a decimal column truncated to int), silently corrupting data.
+        // All branch rows are coerced to this schema before any UNION DISTINCT operation, matching VFP's
+        // comparison domain (for example DateOnly and midnight DateTime compare as equal).
         var accSchema = WidenUnionSchema(branchColumns);
+        var coercedBranches = new List<List<object?[]>>(branchResults.Count);
+        foreach (var result in branchResults)
+            coercedBranches.Add(result.Rows.Select(row => CoerceRow(row, accSchema)).ToList());
+
+        // Fold each UNION link from left to right. Plain UNION deduplicates the running, already-coerced
+        // accumulator; UNION ALL leaves it untouched.
+        var acc = new List<object?[]>();
+        for (int i = 0; i < coercedBranches.Count; i++)
+        {
+            acc.AddRange(coercedBranches[i]);
+            if (i > 0 && !allFlags[i - 1])
+                acc = Distinct(acc.Select((r, _) =>
+                    (r, new DummyRowContext() as IRowContext)).ToList(), _session.SqlContext())
+                    .ConvertAll(p => p.row);
+        }
 
         // Resolve each overall ORDER BY entry to a 0-based output-column index ONCE — explicit 1-based
         // ordinal, else by matching the column NAME against the (first-select) result schema. The SAME
@@ -688,8 +696,8 @@ internal sealed class SelectExecutor
 
     /// <summary>Builds the union result schema by widening each column position across all branches:
     /// the NAME comes from the first SELECT; the TYPE is the common/widened type (integers/currency
-    /// promote to numeric/decimal, length/decimals widen to the max, incompatible mixes fall back to
-    /// character).</summary>
+    /// promote to numeric/decimal, character lengths widen to the max, and dates widen to datetime).
+    /// Other mixed categories are rejected with VFP error 1851.</summary>
     private static IReadOnlyList<SqlColumn> WidenUnionSchema(List<IReadOnlyList<SqlColumn>> branchColumns)
     {
         var first = branchColumns[0];
@@ -728,8 +736,13 @@ internal sealed class SelectExecutor
         if (cats.All(x => x is UnionCat.Date or UnionCat.DateTime))
             return new SqlColumn(name, 'T', 8, 0, typeof(DateTime));
 
-        // Incompatible mix → character fallback.
-        return new SqlColumn(name, 'C', Math.Max(cols.Max(x => x.Length), 1), 0, typeof(string));
+        if (cats.Count == 1 && cats[0] == UnionCat.Character)
+            return new SqlColumn(name, 'C', Math.Max(cols.Max(x => x.Length), 1), 0, typeof(string));
+
+        SqlColumn incompatible = cols.First(x => CatOf(x.VfpType) != CatOf(cols[0].VfpType));
+        throw new FoxDbfSqlException(
+            $"SELECTs are not UNION compatible. Fields {cols[0].Name} and {incompatible.Name} are incompatible.")
+        { VfpErrorNumber = 1851 };
     }
 
     private SqlResult Execute(SelectStatement sel)
@@ -1682,6 +1695,8 @@ internal sealed class SelectExecutor
     {
         if (v is null) return null;
         if (v.GetType() == target) return v;
+        if (target == typeof(DateTime) && v is DateOnly date)
+            return date.ToDateTime(TimeOnly.MinValue);
         if (!IsNumericBox(v)) return v;
         if (target == typeof(decimal)) return Convert.ToDecimal(v);
         if (target == typeof(double)) return Convert.ToDouble(v);
