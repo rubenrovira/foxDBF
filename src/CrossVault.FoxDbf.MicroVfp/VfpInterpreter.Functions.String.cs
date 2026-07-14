@@ -408,20 +408,20 @@ public sealed partial class VfpInterpreter
         return sb.ToString();
     }
 
-    /// <summary>ALINES(ArrayName, cExpr [, nFlags | lTrim [, cParseChar1 [, cParseChar2 …]]]): split cExpr
-    /// into lines, (re)dimension the named array to the line count, fill it row-by-row, and return the count.
-    /// Default parsing is on line breaks (CR, LF, CRLF); when one or more cParseChar are given they REPLACE
-    /// the line-break parsing (split on ANY of those single chars). The 3rd arg is overloaded (the documented
-    /// VFP quirk): logical ⇒ lTrim; numeric ⇒ nFlags (bit 1 = trim each line, bit 4 = skip empty lines);
-    /// character ⇒ it is already the first cParseChar. The array name arrives as a string (MicroVfpExprRewrite
-    /// quotes the first arg).</summary>
+    /// <summary>ALINES(ArrayName, cExpr [, nFlags | lTrim [, cParseString1 ...]]):
+    /// split into array rows using whole-string delimiters. Explicit delimiters replace CRLF/CR/LF;
+    /// empty explicit values are ignored and an all-empty explicit set performs no split. At each scan
+    /// position the earliest delimiter wins and argument order breaks equal-offset ties. Flags: 1 trims
+    /// spaces, 2 keeps a terminal empty row, 4 omits empty rows, 8 compares OrdinalIgnoreCase, and
+    /// 16 appends the matched delimiter to the preceding row.</summary>
     private int FnAlines(VfpValue[] a)
     {
         if (a.Length < 2) return 0;
         string name = a[0].AsString;
         string text = a[1].AsString;
 
-        bool trim = false, skipEmpty = false;
+        bool trim = false, includeTrailingEmpty = false, skipEmpty = false;
+        bool ignoreCase = false, keepDelimiter = false;
         int parseFrom = 2;                       // index of the first cParseChar arg (default: none).
         if (a.Length > 2)
         {
@@ -431,35 +431,94 @@ public sealed partial class VfpInterpreter
             {
                 int flags = (int)p.AsNumber;
                 trim = (flags & 1) != 0;
+                includeTrailingEmpty = (flags & 2) != 0;
                 skipEmpty = (flags & 4) != 0;
+                ignoreCase = (flags & 8) != 0;
+                keepDelimiter = (flags & 16) != 0;
                 parseFrom = 3;
             }
             // else (character) ⇒ p is already the first parse char; parseFrom stays 2.
         }
 
-        // Collect any explicit parse characters (each argument contributes its single chars).
-        var parseChars = new List<char>();
+        bool explicitDelimiters = a.Length > parseFrom;
+        var delimiters = new List<string>();
         for (int k = parseFrom; k < a.Length; k++)
-            foreach (char c in a[k].AsString) parseChars.Add(c);
+            if (a[k].AsString.Length > 0)
+                delimiters.Add(a[k].AsString);
+        if (!explicitDelimiters)
+            delimiters.AddRange(["\r\n", "\r", "\n"]);
 
-        string[] lines;
-        if (parseChars.Count > 0)
-            lines = text.Split(parseChars.ToArray());
-        else
-            lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
-
-        var outLines = new List<string>(lines.Length);
-        foreach (var raw in lines)
-        {
-            string line = trim ? raw.Trim(' ', '\t') : raw;
-            if (skipEmpty && line.Length == 0) continue;
-            outLines.Add(line);
-        }
+        var outLines = SplitAlines(text, delimiters,
+            ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal,
+            trim, includeTrailingEmpty, skipEmpty, keepDelimiter);
 
         int count = outLines.Count;
         var arr = Memory.RedimOrCreateArray(name, Math.Max(1, count), 0);
         for (int i = 0; i < count; i++) arr.Set(i + 1, null, VfpValue.Character(outLines[i]));
         return count;
+    }
+
+    private static List<string> SplitAlines(
+        string text,
+        IReadOnlyList<string> delimiters,
+        StringComparison comparison,
+        bool trim,
+        bool includeTrailingEmpty,
+        bool skipEmpty,
+        bool keepDelimiter)
+    {
+        var output = new List<string>();
+        if (delimiters.Count == 0)
+        {
+            AddAlinesPart(output, text, null, trim, skipEmpty, keepDelimiter);
+            return output;
+        }
+
+        int start = 0;
+        while (TryFindAlinesDelimiter(text, start, delimiters, comparison,
+            out int match, out string? delimiter))
+        {
+            AddAlinesPart(output, text[start..match], delimiter,
+                trim, skipEmpty, keepDelimiter);
+            start = match + delimiter!.Length;
+        }
+
+        string tail = text[start..];
+        if (tail.Length > 0 || includeTrailingEmpty)
+            AddAlinesPart(output, tail, null, trim, skipEmpty, keepDelimiter);
+        return output;
+    }
+
+    private static bool TryFindAlinesDelimiter(
+        string text,
+        int start,
+        IReadOnlyList<string> delimiters,
+        StringComparison comparison,
+        out int match,
+        out string? delimiter)
+    {
+        match = -1;
+        delimiter = null;
+        for (int i = 0; i < delimiters.Count; i++)
+        {
+            int candidate = text.IndexOf(delimiters[i], start, comparison);
+            if (candidate >= 0 && (match < 0 || candidate < match))
+            {
+                match = candidate;
+                delimiter = delimiters[i];
+            }
+        }
+        return match >= 0;
+    }
+
+    private static void AddAlinesPart(
+        List<string> output, string value, string? delimiter,
+        bool trim, bool skipEmpty, bool keepDelimiter)
+    {
+        if (trim) value = value.Trim(' ');
+        if (skipEmpty && value.Length == 0) return;
+        if (keepDelimiter && delimiter is not null) value += delimiter;
+        output.Add(value);
     }
 
     /// <summary>SYS(10, nJulianDay): a Julian-day number → date string, honouring the interpreter's date

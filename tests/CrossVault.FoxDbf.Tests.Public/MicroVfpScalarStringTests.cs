@@ -5,6 +5,7 @@ using CrossVault.FoxDbf.Expressions;
 using CrossVault.FoxDbf.MicroVfp;
 using CrossVault.FoxDbf.Sql;
 using CrossVault.FoxDbf.Write;
+using System.Linq;
 using Xunit;
 
 namespace CrossVault.FoxDbf.Tests;
@@ -251,6 +252,13 @@ public sealed class MicroVfpScalarStringTests
 
     // ─────────────────────────── ALINES ───────────────────────────
 
+    private static string[] Alines(H h, string expression, params string[] arrayReads)
+    {
+        decimal count = h.Num(expression);
+        Assert.Equal(arrayReads.Length, (int)count);
+        return arrayReads.Select(h.Str).ToArray();
+    }
+
     [Fact]
     public void Alines_SplitsIntoArrayRows_ReturnsLineCount()
     {
@@ -289,5 +297,49 @@ public sealed class MicroVfpScalarStringTests
         // parse chars REPLACE the default CR/LF parsing: a lone CR is kept inside a field.
         Assert.Equal(2m, h.Num("ALINES(le, 'a,b' + CHR(13) + 'c', ',')"));
         Assert.Equal("b" + (char)13 + "c", h.Str("le[2]"));
+    }
+
+    [Fact]
+    public void Alines_WholeStringDelimiters_UseEarliestMatchAndArgumentOrder()
+    {
+        using var h = new H();
+        Assert.Equal(new[] { "a", "", "b" },
+            Alines(h, "ALINES(la, 'a:::b', 0, '::', ':')", "la[1]", "la[2]", "la[3]"));
+        Assert.Equal(new[] { "a", "", "", "b" },
+            Alines(h, "ALINES(lb, 'a:::b', 0, ':', '::')", "lb[1]", "lb[2]", "lb[3]", "lb[4]"));
+        Assert.Equal(new[] { "<p>one", "<p>two" },
+            Alines(h, "ALINES(lc, '<p>one</p><p>two</p>', 0, '</p>')", "lc[1]", "lc[2]"));
+    }
+
+    [Fact]
+    public void Alines_Flags_ControlTrailingEmptySkipCaseTrimAndDelimiterRetention()
+    {
+        using var h = new H();
+        Assert.Equal(new[] { "a", "", "b" },
+            Alines(h, "ALINES(la, 'a||||b||', 0, '||')", "la[1]", "la[2]", "la[3]"));
+        Assert.Equal(new[] { "a", "", "b", "" },
+            Alines(h, "ALINES(lb, 'a||||b||', 2, '||')", "lb[1]", "lb[2]", "lb[3]", "lb[4]"));
+        Assert.Equal(new[] { "a", "b" },
+            Alines(h, "ALINES(lc, 'a||||b||', 4, '||')", "lc[1]", "lc[2]"));
+        Assert.Equal(new[] { "a", "b", "c" },
+            Alines(h, "ALINES(ld, 'aXXbxxc', 8, 'xx')", "ld[1]", "ld[2]", "ld[3]"));
+        Assert.Equal(new[] { "a::", "b::", "" },
+            Alines(h, "ALINES(le, 'a::b::', 18, '::')", "le[1]", "le[2]", "le[3]"));
+        Assert.Equal(new[] { "a", "\t" + "b" + "\t" },
+            Alines(h, "ALINES(lf, '  a  ||' + CHR(9) + 'b' + CHR(9), 1, '||')", "lf[1]", "lf[2]"));
+    }
+
+    [Fact]
+    public void Alines_DefaultAndExplicitEmptyDelimiterContracts_AreDistinct()
+    {
+        using var h = new H();
+        Assert.Equal(new[] { "a", "", "b" },
+            Alines(h, "ALINES(la, 'a' + CHR(13) + CHR(10) + CHR(13) + 'b')", "la[1]", "la[2]", "la[3]"));
+        Assert.Equal(new[] { "a" + (char)13 + (char)10 + "b" },
+            Alines(h, "ALINES(lb, 'a' + CHR(13) + CHR(10) + 'b', 0, '')", "lb[1]"));
+        Assert.Equal(new[] { "a", "b" },
+            Alines(h, "ALINES(lc, 'a||b', 0, '', '||', '')", "lc[1]", "lc[2]"));
+        Assert.Equal(new[] { "", "a", "" },
+            Alines(h, "ALINES(ld, '||a||||', 0, '||')", "ld[1]", "ld[2]", "ld[3]"));
     }
 }
