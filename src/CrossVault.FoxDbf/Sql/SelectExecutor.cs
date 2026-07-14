@@ -588,16 +588,14 @@ internal sealed class SelectExecutor
         // All branch rows are coerced to this schema before any UNION DISTINCT operation, matching VFP's
         // comparison domain (for example DateOnly and midnight DateTime compare as equal).
         var accSchema = WidenUnionSchema(branchColumns);
-        var coercedBranches = new List<List<object?[]>>(branchResults.Count);
-        foreach (var result in branchResults)
-            coercedBranches.Add(result.Rows.Select(row => CoerceRow(row, accSchema)).ToList());
 
-        // Fold each UNION link from left to right. Plain UNION deduplicates the running, already-coerced
-        // accumulator; UNION ALL leaves it untouched.
+        // Fold each UNION link from left to right. Coerce one branch at a time and immediately add it to
+        // the running accumulator; this avoids retaining a second complete set of coerced branch rows.
         var acc = new List<object?[]>();
-        for (int i = 0; i < coercedBranches.Count; i++)
+        for (int i = 0; i < branchResults.Count; i++)
         {
-            acc.AddRange(coercedBranches[i]);
+            foreach (var row in branchResults[i].Rows)
+                acc.Add(CoerceRow(row, accSchema));
             if (i > 0 && !allFlags[i - 1])
                 acc = Distinct(acc.Select((r, _) =>
                     (r, new DummyRowContext() as IRowContext)).ToList(), _session.SqlContext())
@@ -644,9 +642,7 @@ internal sealed class SelectExecutor
             }
         }
 
-        var finalResult = Materialize(
-            accSchema,
-            acc.Select((r, _) => (r, new DummyRowContext() as IRowContext)).ToList());
+        var finalResult = MaterializeAlreadyCoerced(accSchema, acc);
         return into is null
             ? finalResult
             : MaterializeInto(into, finalResult.Columns, finalResult.Rows.ToList());
@@ -1377,6 +1373,11 @@ internal sealed class SelectExecutor
     }
 
     // ---- materialization ------------------------------------------------------------------
+
+    /// <summary>Creates a result from rows that were already coerced to <paramref name="columns"/>.
+    /// UNION uses this after its per-branch coercion pass so each row is cloned only once.</summary>
+    private static SqlResult MaterializeAlreadyCoerced(
+        IReadOnlyList<SqlColumn> columns, List<object?[]> rows) => new(columns, rows);
 
     private static SqlResult Materialize(IReadOnlyList<SqlColumn> columns, List<(object?[] row, IRowContext rep)> pairs)
     {
