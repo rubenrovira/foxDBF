@@ -73,6 +73,8 @@ public sealed partial class DbfWriter
     /// on-disk result is byte-identical to N per-row appends, but re-reads the count ONCE, writes
     /// every row WITHOUT a per-row flush, then writes the single <c>0x1A</c> EOF + <c>SetLength</c>,
     /// stamps the header and flushes ONCE for the whole batch.
+    /// RecordEncoder encoding/conversion failures are raised during a prepare pass before any
+    /// PatchMemoPointers call or DBF/FPT mutation.
     /// </summary>
     private System.Collections.Generic.IReadOnlyList<int> AppendCoreBatch(List<object?[]> rows)
     {
@@ -130,9 +132,9 @@ public sealed partial class DbfWriter
                 aiStep.Add(ReadByteAt(descOffset + 23));
             }
 
-            // Encode + write every record sequentially. NO per-row 0x1A / SetLength / flush — the
-            // next row's data offset overwrites where the per-row path would have stamped 0x1A, and
-            // the final single EOF below lands at exactly the same byte.
+            // Prepare every record sequentially without any PatchMemoPointers/DBF/FPT mutation.
+            // The existing appended buffers are committed only after every RecordEncoder.Encode
+            // succeeds, so an encoding/conversion failure leaves both files byte-identical.
             for (int r = 0; r < n; r++)
             {
                 var positional = rows[r];
@@ -143,14 +145,21 @@ public sealed partial class DbfWriter
                 }
 
                 byte[] record = RecordEncoder.Encode(_schema, positional, deleted: false);
-                PatchMemoPointers(record, positional);
+                indices[r] = diskCount + r;
+                appended.Add((diskCount + r + 1, record));   // 1-based recno + exact written bytes
+            }
+
+            // Commit every prepared record. NO per-row 0x1A / SetLength / flush — the next row's
+            // data offset overwrites where the per-row path would have stamped 0x1A, and the final
+            // single EOF below lands at exactly the same byte.
+            for (int r = 0; r < n; r++)
+            {
+                var (_, record) = appended[r];
+                PatchMemoPointers(record, rows[r]);
 
                 long dataOffset = _headerLength + (long)(diskCount + r) * _recordLength;
                 _stream.Seek(dataOffset, SeekOrigin.Begin);
                 _stream.Write(record, 0, record.Length);
-
-                indices[r] = diskCount + r;
-                appended.Add((diskCount + r + 1, record));   // 1-based recno + exact written bytes
             }
 
             // Single 0x1A EOF + exact file length for the whole batch.
